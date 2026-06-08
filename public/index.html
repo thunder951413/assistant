@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>资料整理助手</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">M</div>
+          <div>
+            <h1>资料整理助手</h1>
+            <p>本地资料库</p>
+          </div>
+        </div>
+
+        <nav class="nav-block">
+          <button class="nav-item is-active" data-view="chat">AI 对话</button>
+          <button class="nav-item" data-view="materials">资料整理</button>
+          <button class="nav-item" data-view="import">新增资料</button>
+          <button class="nav-item" data-view="settings">设置</button>
+        </nav>
+
+        <div id="materialSidebar" class="material-sidebar" hidden>
+          <section class="source-panel">
+            <div class="panel-title">来源</div>
+            <div class="source-list">
+              <button class="source-item is-active" data-source="">全部资料</button>
+              <button class="source-item" data-source="text">文本</button>
+              <button class="source-item" data-source="web">网页</button>
+              <button class="source-item" data-source="confluence">Confluence</button>
+              <button class="source-item" data-source="jira">Jira</button>
+              <button class="source-item" data-source="github">GitHub</button>
+            </div>
+          </section>
+
+          <section class="tag-panel">
+            <div class="panel-title">标签</div>
+            <div id="tagList" class="tag-list"></div>
+          </section>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <section id="chatView" class="chat-view">
+          <div class="view-heading">
+            <h2>AI 对话</h2>
+            <p>从资料库里查找、总结和回到原文。</p>
+          </div>
+
+          <section class="chat-panel">
+            <aside class="chat-history-panel">
+              <div class="chat-history-header">
+                <h3>历史记录</h3>
+                <button type="button" id="newChatButton">新建</button>
+              </div>
+              <div id="chatHistoryList" class="chat-history-list"></div>
+            </aside>
+
+            <section class="chat-workspace">
+              <div class="chat-header">
+                <div>
+                  <h3 id="chatSessionTitle">资料库助手</h3>
+                  <p>后端会读取本地知识库，检索相关资料，再用设置里的 AI 接口回答。</p>
+                </div>
+                <div class="root-pill">
+                  <span>知识库</span>
+                  <code id="agentRoot">载入中</code>
+                </div>
+              </div>
+              <div id="chatMessages" class="chat-messages" aria-live="polite"></div>
+              <form id="chatForm" class="chat-form">
+                <input id="chatInput" placeholder="例如：auth 相关 Jira 最近有什么进展？" />
+                <button class="primary-button">发送</button>
+              </form>
+            </section>
+          </section>
+        </section>
+
+        <section id="materialsView" class="materials-view" hidden>
+          <section class="toolbar">
+            <div>
+              <h2>资料整理</h2>
+              <p id="resultCount">准备载入</p>
+            </div>
+            <div class="toolbar-actions">
+              <input id="searchInput" type="search" placeholder="搜索标题、标签、内容" />
+            </div>
+          </section>
+
+          <section class="content-grid">
+            <div class="item-list" id="itemList"></div>
+            <article class="detail-panel" id="detailPanel">
+              <div class="empty-state">选择一条资料查看内容，或新增第一条资料。</div>
+            </article>
+          </section>
+        </section>
+
+        <section id="importView" class="import-view" hidden>
+          <div class="view-heading">
+            <h2>新增资料</h2>
+            <p>拖入文件、粘贴文本或输入网页链接，先解析预览，确认后再导入资料库。</p>
+          </div>
+
+          <section class="import-layout">
+            <form id="importForm" class="import-form">
+              <div id="dropZone" class="drop-zone">
+                <strong>拖入文本文件，或直接粘贴内容</strong>
+                <span>支持纯文本、网页 URL、Jira/GitHub 页面内容。需要登录的页面可先复制正文再粘贴。</span>
+              </div>
+
+              <label>
+                原始输入
+                <textarea id="importContent" name="content" rows="12" placeholder="粘贴文本、网页链接、Jira 页面内容或 GitHub discussion 内容"></textarea>
+              </label>
+
+              <div class="form-grid">
+                <label>
+                  类型
+                  <select id="importSourceType" name="sourceType">
+                    <option value="">自动识别</option>
+                    <option value="text">文本</option>
+                    <option value="web">网页</option>
+                    <option value="confluence">Confluence</option>
+                    <option value="jira">Jira</option>
+                    <option value="github">GitHub</option>
+                  </select>
+                </label>
+
+                <label>
+                  抓取方式
+                  <select id="importFetchMode" name="fetchMode">
+                  <option value="auto">自动</option>
+                  <option value="fetch">按 URL 抓取</option>
+                  <option value="webdriver">Webdriver 抓取</option>
+                  <option value="paste">使用粘贴内容</option>
+                </select>
+              </label>
+              </div>
+
+              <label>
+                页面类型
+                <select id="importPageKind" name="pageKind">
+                  <option value="auto">自动识别</option>
+                  <option value="list">过滤页/列表页</option>
+                  <option value="content">内容页</option>
+                </select>
+              </label>
+
+              <label>
+                URL
+                <input id="importUrl" name="url" placeholder="可留空，会从输入内容里识别 URL" />
+              </label>
+
+              <div class="import-actions">
+                <button type="button" id="clearImportButton">清空</button>
+                <button type="submit" class="primary-button">解析预览</button>
+              </div>
+            </form>
+
+            <section class="preview-panel">
+              <div class="preview-header">
+                <div>
+                  <h3>解析结果</h3>
+                  <p id="previewStatus">等待输入内容。</p>
+                </div>
+                <span id="previewBadge" class="preview-badge">未解析</span>
+              </div>
+
+              <div class="confirm-fields">
+                <label>
+                  标题
+                  <input id="confirmTitle" placeholder="解析后可修改标题" />
+                </label>
+                <label>
+                  标签
+                  <input id="confirmTags" placeholder="用逗号分隔，例如 jira, backend, blocked" />
+                </label>
+              </div>
+
+              <label>
+                过滤后的内容
+                <textarea id="previewContent" rows="16" placeholder="解析后会显示可确认的正文"></textarea>
+              </label>
+
+              <section class="summary-box">
+                <div class="preview-header">
+                  <div>
+                    <h3>AI 总结</h3>
+                    <p id="summaryStatus">解析内容后可生成总结。</p>
+                  </div>
+                  <button type="button" id="summarizeButton" disabled>生成总结</button>
+                </div>
+                <textarea id="summaryContent" rows="8" placeholder="AI 总结会显示在这里，也可以手动修改后一起保存"></textarea>
+              </section>
+
+              <div class="import-actions">
+                <button type="button" id="copyPreviewButton">复制预览</button>
+                <button type="button" id="confirmImportButton" class="primary-button" disabled>确认导入</button>
+              </div>
+            </section>
+          </section>
+        </section>
+
+        <section id="settingsView" class="settings-view" hidden>
+          <div class="view-heading">
+            <h2>设置</h2>
+            <p>配置 AI 接口和资料库保存位置。</p>
+          </div>
+
+          <form id="settingsForm" class="settings-panel">
+            <section class="settings-section">
+              <h3>AI 接口</h3>
+              <p>支持 OpenAI 兼容格式，会调用 <code>/chat/completions</code>。</p>
+              <label>
+                Base URL
+                <input id="settingBaseUrl" placeholder="例如 https://api.openai.com/v1" />
+              </label>
+              <label>
+                API Key
+                <input id="settingApiKey" type="password" placeholder="保存后会隐藏显示" />
+              </label>
+              <label>
+                Model
+                <input id="settingModel" placeholder="例如 gpt-4.1-mini" />
+              </label>
+            </section>
+
+            <section class="settings-section">
+              <h3>AI 对话显示</h3>
+              <p>控制对话流中是否显示可观察的过程事件。</p>
+              <label class="inline-toggle">
+                <input id="settingShowThinking" type="checkbox" />
+                显示思考过程
+              </label>
+              <label class="inline-toggle">
+                <input id="settingShowToolCalls" type="checkbox" />
+                显示工具调用
+              </label>
+            </section>
+
+            <section class="settings-section">
+              <h3>页面来源认证</h3>
+              <p>列表页和内容页抓取会优先使用这里配置的 Cookie、Token 或 Basic 认证。</p>
+              <div id="sourceProfiles" class="source-profiles"></div>
+            </section>
+
+            <section class="settings-section">
+              <h3>Webdriver 登录</h3>
+              <p>打开一个持久化浏览器窗口，手动登录后，新增资料页选择 Webdriver 抓取即可复用登录态。</p>
+              <div class="webdriver-actions">
+                <button type="button" data-webdriver-url="https://jira.amlogic.com/issues/?filter=50724">打开 Amlogic Jira</button>
+                <button type="button" data-webdriver-url="https://confluence.amlogic.com">打开 Amlogic Confluence</button>
+                <button type="button" data-webdriver-url="https://roku.atlassian.net">打开 Roku Atlassian</button>
+                <button type="button" data-webdriver-url="https://github.ecodesamsung.com">打开 Samsung GitHub</button>
+              </div>
+              <div class="webdriver-actions">
+                <button type="button" data-save-cookie-url="https://jira.amlogic.com">保存 Jira Cookie</button>
+                <button type="button" data-save-cookie-url="https://confluence.amlogic.com">保存 Confluence Cookie</button>
+                <button type="button" data-save-cookie-url="https://roku.atlassian.net">保存 Roku Cookie</button>
+                <button type="button" data-save-cookie-url="https://github.ecodesamsung.com">保存 GitHub Cookie</button>
+              </div>
+              <p id="webdriverStatus">未启动 Webdriver 会话。</p>
+            </section>
+
+            <section class="settings-section">
+              <h3>自动刷新</h3>
+              <p>定时刷新列表型资料源，并更新列表中的内容页面，例如 Jira filter 和 GitHub notifications。</p>
+              <div id="refreshJobs" class="refresh-jobs"></div>
+              <p id="refreshJobStatus">未执行刷新任务。</p>
+            </section>
+
+            <section class="settings-section">
+              <h3>标签管理</h3>
+              <p>新增标签，或批量删除不再需要的标签。删除标签只会从资料上移除标签，不会删除资料。</p>
+              <div class="tag-manager-actions">
+                <input id="newTagInput" placeholder="输入新标签，多个标签用逗号分隔" />
+                <button type="button" id="addTagButton">新增标签</button>
+              </div>
+              <div class="tag-manager-toolbar">
+                <span id="tagManagerStatus" class="status-message">未选择标签。</span>
+                <div>
+                  <button type="button" id="selectAllTagsButton">全选</button>
+                  <button type="button" id="clearTagSelectionButton">清空</button>
+                  <button type="button" id="deleteSelectedTagsButton" class="danger-button">删除选中</button>
+                </div>
+              </div>
+              <div id="settingsTagList" class="settings-tag-list"></div>
+            </section>
+
+            <section class="settings-section">
+              <h3>资料保存</h3>
+              <p>默认保存到当前项目的 <code>knowledge-base</code> 目录。修改到外部路径时，运行环境需要对应写入权限。</p>
+              <label>
+                文档保存路径
+                <input id="settingDocumentRoot" placeholder="/path/to/knowledge-base" />
+              </label>
+              <div class="root-pill">
+                <span>当前生效路径</span>
+                <code id="activeDocumentRoot">载入中</code>
+              </div>
+            </section>
+
+            <div class="import-actions">
+              <span id="settingsStatus" class="status-message"></span>
+              <button class="primary-button">保存设置</button>
+            </div>
+          </form>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="tagDialog" class="tag-dialog">
+      <form method="dialog" id="tagDialogForm">
+        <div class="dialog-header">
+          <div>
+            <h3>编辑标签</h3>
+            <p id="tagDialogSubtitle">为当前资料选择标签。</p>
+          </div>
+          <button type="button" id="closeTagDialogButton" class="icon-button" aria-label="关闭">×</button>
+        </div>
+
+        <label>
+          手动输入
+          <div class="tag-input-row">
+            <input id="tagManualInput" placeholder="输入标签后回车或点击添加" />
+            <button type="button" id="addManualTagButton">添加</button>
+          </div>
+        </label>
+
+        <section class="tag-editor-section">
+          <div class="tag-editor-title">已选标签</div>
+          <div id="selectedTagChips" class="tag-editor-chips"></div>
+        </section>
+
+        <section class="tag-editor-section">
+          <div class="tag-editor-title">
+            <span>推荐标签</span>
+            <button type="button" id="recommendTagsButton">AI 推荐</button>
+          </div>
+          <p id="tagRecommendStatus" class="status-message">可根据文档内容生成推荐标签。</p>
+          <div id="recommendedTagChips" class="tag-editor-chips"></div>
+        </section>
+
+        <div class="dialog-actions">
+          <button type="button" id="cancelTagDialogButton">取消</button>
+          <button type="submit" class="primary-button">确定</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js"></script>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
