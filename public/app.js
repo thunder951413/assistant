@@ -5,15 +5,34 @@ const state = {
   chatSessions: [],
   activeChatId: "",
   importPreview: null,
+  refreshJobs: [],
   tagEditor: {
     item: null,
     selected: [],
     recommended: []
   },
+  batchProcess: {
+    items: [],
+    tagAssignments: [],
+    tagOptions: [],
+    selectedTags: [],
+    errors: [],
+    cancelRequested: false,
+    running: false
+  },
   settingsTags: [],
   selectedSettingsTags: new Set(),
+  supplementalEntries: [],
   updateCount: 0,
   updateOnly: false,
+  listClassification: null,
+  listClassifying: false,
+  listClassifier: {
+    categories: loadStoredListCategories()
+  },
+  subscriptionSource: "all",
+  settingsTab: "ai",
+  detailMode: localStorage.getItem("materialOrganizer.detailMode") || "processed",
   selectedId: null,
   sourceType: "",
   tag: "",
@@ -22,14 +41,22 @@ const state = {
 
 const itemList = document.querySelector("#itemList");
 const tagList = document.querySelector("#tagList");
+const updatesNewBadge = document.querySelector("#updatesNewBadge");
 const materialSidebar = document.querySelector("#materialSidebar");
+const filterTabs = [...document.querySelectorAll("[data-filter-tab]")];
+const filterPanels = [...document.querySelectorAll("[data-filter-panel]")];
 const chatView = document.querySelector("#chatView");
 const materialsView = document.querySelector("#materialsView");
 const importView = document.querySelector("#importView");
+const supplementalView = document.querySelector("#supplementalView");
+const subscriptionsView = document.querySelector("#subscriptionsView");
 const settingsView = document.querySelector("#settingsView");
 const detailPanel = document.querySelector("#detailPanel");
+const materialsTitle = document.querySelector("#materialsTitle");
 const resultCount = document.querySelector("#resultCount");
 const searchInput = document.querySelector("#searchInput");
+const classifyListButton = document.querySelector("#classifyListButton");
+const batchProcessButton = document.querySelector("#batchProcessButton");
 const agentRoot = document.querySelector("#agentRoot");
 const chatSessionTitle = document.querySelector("#chatSessionTitle");
 const chatHistoryList = document.querySelector("#chatHistoryList");
@@ -56,16 +83,31 @@ const confirmImportButton = document.querySelector("#confirmImportButton");
 const clearImportButton = document.querySelector("#clearImportButton");
 const copyPreviewButton = document.querySelector("#copyPreviewButton");
 const settingsForm = document.querySelector("#settingsForm");
+const settingsTabs = [...document.querySelectorAll("[data-settings-tab]")];
+const settingsPanels = [...document.querySelectorAll("[data-settings-panel]")];
 const settingBaseUrl = document.querySelector("#settingBaseUrl");
 const settingApiKey = document.querySelector("#settingApiKey");
 const settingModel = document.querySelector("#settingModel");
 const settingShowThinking = document.querySelector("#settingShowThinking");
 const settingShowToolCalls = document.querySelector("#settingShowToolCalls");
+const settingNotificationsEnabled = document.querySelector("#settingNotificationsEnabled");
+const notificationSourceInputs = [...document.querySelectorAll("[data-notification-source]")];
+const settingRefreshStartTime = document.querySelector("#settingRefreshStartTime");
+const settingRefreshEndTime = document.querySelector("#settingRefreshEndTime");
+const settingEmbeddingEnabled = document.querySelector("#settingEmbeddingEnabled");
+const settingEmbeddingBaseUrl = document.querySelector("#settingEmbeddingBaseUrl");
+const settingEmbeddingApiKey = document.querySelector("#settingEmbeddingApiKey");
+const settingEmbeddingModel = document.querySelector("#settingEmbeddingModel");
+const settingEmbeddingDimensions = document.querySelector("#settingEmbeddingDimensions");
+const processingPromptFields = [...document.querySelectorAll("[data-processing-prompt]")];
 const settingDocumentRoot = document.querySelector("#settingDocumentRoot");
 const activeDocumentRoot = document.querySelector("#activeDocumentRoot");
 const settingsStatus = document.querySelector("#settingsStatus");
 const sourceProfiles = document.querySelector("#sourceProfiles");
 const webdriverStatus = document.querySelector("#webdriverStatus");
+const subscriptionTabs = document.querySelector("#subscriptionTabs");
+const runAllSubscriptionsButton = document.querySelector("#runAllSubscriptionsButton");
+const saveSubscriptionsButton = document.querySelector("#saveSubscriptionsButton");
 const refreshJobs = document.querySelector("#refreshJobs");
 const refreshJobStatus = document.querySelector("#refreshJobStatus");
 const newTagInput = document.querySelector("#newTagInput");
@@ -83,9 +125,44 @@ const cancelTagDialogButton = document.querySelector("#cancelTagDialogButton");
 const tagManualInput = document.querySelector("#tagManualInput");
 const addManualTagButton = document.querySelector("#addManualTagButton");
 const selectedTagChips = document.querySelector("#selectedTagChips");
+const existingTagChips = document.querySelector("#existingTagChips");
 const recommendedTagChips = document.querySelector("#recommendedTagChips");
 const recommendTagsButton = document.querySelector("#recommendTagsButton");
 const tagRecommendStatus = document.querySelector("#tagRecommendStatus");
+const supplementalSummary = document.querySelector("#supplementalSummary");
+const supplementalList = document.querySelector("#supplementalList");
+const supplementalStatus = document.querySelector("#supplementalStatus");
+const saveSupplementalButton = document.querySelector("#saveSupplementalButton");
+const suggestSupplementalButton = document.querySelector("#suggestSupplementalButton");
+const addSupplementalEntryButton = document.querySelector("#addSupplementalEntryButton");
+const batchProcessDialog = document.querySelector("#batchProcessDialog");
+const batchProcessForm = document.querySelector("#batchProcessForm");
+const closeBatchProcessButton = document.querySelector("#closeBatchProcessButton");
+const cancelBatchProcessButton = document.querySelector("#cancelBatchProcessButton");
+const startBatchProcessButton = document.querySelector("#startBatchProcessButton");
+const applyBatchTagsButton = document.querySelector("#applyBatchTagsButton");
+const batchProcessTagsToggle = document.querySelector("#batchProcessTagsToggle");
+const batchProcessTagMode = document.querySelector("#batchProcessTagMode");
+const batchProcessForceToggle = document.querySelector("#batchProcessForceToggle");
+const batchProcessConcurrency = document.querySelector("#batchProcessConcurrency");
+const batchProcessStatus = document.querySelector("#batchProcessStatus");
+const batchProcessCount = document.querySelector("#batchProcessCount");
+const batchProcessProgress = document.querySelector("#batchProcessProgress");
+const batchProcessSubtitle = document.querySelector("#batchProcessSubtitle");
+const batchTagReview = document.querySelector("#batchTagReview");
+const batchTagGroups = document.querySelector("#batchTagGroups");
+const classifyListDialog = document.querySelector("#classifyListDialog");
+const classifyListForm = document.querySelector("#classifyListForm");
+const closeClassifyListButton = document.querySelector("#closeClassifyListButton");
+const cancelClassifyListButton = document.querySelector("#cancelClassifyListButton");
+const runClassifyListButton = document.querySelector("#runClassifyListButton");
+const classifyCategoryInput = document.querySelector("#classifyCategoryInput");
+const addClassifyCategoryButton = document.querySelector("#addClassifyCategoryButton");
+const classificationCategoryChips = document.querySelector("#classificationCategoryChips");
+const classificationStatus = document.querySelector("#classificationStatus");
+const classificationCount = document.querySelector("#classificationCount");
+const classificationProgress = document.querySelector("#classificationProgress");
+const classifyListSubtitle = document.querySelector("#classifyListSubtitle");
 
 chatForm.addEventListener("submit", sendChatMessage);
 newChatButton.addEventListener("click", () => createChatSession({ activate: true }));
@@ -95,11 +172,40 @@ clearImportButton.addEventListener("click", resetImport);
 copyPreviewButton.addEventListener("click", copyPreview);
 summarizeButton.addEventListener("click", summarizePreview);
 settingsForm.addEventListener("submit", saveSettings);
+saveSubscriptionsButton.addEventListener("click", saveSubscriptions);
+runAllSubscriptionsButton.addEventListener("click", runAllRefreshJobs);
+settingsTabs.forEach((button) => {
+  button.addEventListener("click", () => setSettingsTab(button.dataset.settingsTab));
+});
 tagDialogForm.addEventListener("submit", saveTagDialog);
 closeTagDialogButton.addEventListener("click", closeTagDialog);
 cancelTagDialogButton.addEventListener("click", closeTagDialog);
 addManualTagButton.addEventListener("click", addManualTag);
 recommendTagsButton.addEventListener("click", recommendTagsForCurrentItem);
+saveSupplementalButton.addEventListener("click", saveSupplementalContext);
+suggestSupplementalButton.addEventListener("click", suggestSupplementalContext);
+addSupplementalEntryButton.addEventListener("click", addSupplementalEntry);
+batchProcessButton.addEventListener("click", openBatchProcessDialog);
+classifyListButton.addEventListener("click", openClassifyListDialog);
+closeClassifyListButton.addEventListener("click", closeClassifyListDialog);
+cancelClassifyListButton.addEventListener("click", closeClassifyListDialog);
+addClassifyCategoryButton.addEventListener("click", addClassificationCategory);
+classifyCategoryInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    addClassificationCategory();
+  }
+});
+runClassifyListButton.addEventListener("click", classifyCurrentList);
+classifyListForm.addEventListener("submit", (event) => event.preventDefault());
+closeBatchProcessButton.addEventListener("click", closeBatchProcessDialog);
+cancelBatchProcessButton.addEventListener("click", closeBatchProcessDialog);
+startBatchProcessButton.addEventListener("click", startBatchProcess);
+applyBatchTagsButton.addEventListener("click", applyBatchTags);
+batchProcessTagsToggle.addEventListener("change", updateBatchProcessCandidates);
+batchProcessTagMode.addEventListener("change", updateBatchProcessCandidates);
+batchProcessForceToggle.addEventListener("change", updateBatchProcessCandidates);
+batchProcessForm.addEventListener("submit", (event) => event.preventDefault());
 addTagButton.addEventListener("click", addSettingsTags);
 selectAllTagsButton.addEventListener("click", () => {
   state.selectedSettingsTags = new Set(state.settingsTags.map((tag) => tag.name));
@@ -144,10 +250,14 @@ document.querySelectorAll(".source-item").forEach((button) => {
     button.classList.add("is-active");
     state.sourceType = button.dataset.source;
     state.tag = "";
-    state.updateOnly = false;
+    state.updateOnly = state.view === "updates";
     await loadItems();
     renderTags();
   });
+});
+
+filterTabs.forEach((button) => {
+  button.addEventListener("click", () => setFilterTab(button.dataset.filterTab));
 });
 
 searchInput.addEventListener("input", debounce(async () => {
@@ -157,6 +267,7 @@ searchInput.addEventListener("input", debounce(async () => {
 
 await loadAgentConfig();
 await loadSettings();
+await loadUpdateCount();
 loadChatSessions();
 renderView();
 
@@ -170,20 +281,65 @@ function renderView() {
   });
 
   chatView.hidden = state.view !== "chat";
-  materialsView.hidden = state.view !== "materials";
+  materialsView.hidden = !(state.view === "materials" || state.view === "updates");
   importView.hidden = state.view !== "import";
+  supplementalView.hidden = state.view !== "supplemental";
+  subscriptionsView.hidden = state.view !== "subscriptions";
   settingsView.hidden = state.view !== "settings";
-  materialSidebar.hidden = state.view !== "materials";
+  materialSidebar.hidden = !(state.view === "materials" || state.view === "updates");
+  materialsTitle.textContent = state.view === "updates" ? "内容更新" : "资料整理";
+  if (state.view === "settings") {
+    setSettingsTab(state.settingsTab);
+  }
+}
+
+function setFilterTab(tabName) {
+  const next = tabName === "tag" ? "tag" : "source";
+  filterTabs.forEach((button) => {
+    const active = button.dataset.filterTab === next;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  filterPanels.forEach((panel) => {
+    const active = panel.dataset.filterPanel === next;
+    panel.hidden = !active;
+    panel.classList.toggle("is-active", active);
+  });
+}
+
+function setSettingsTab(tabName) {
+  const next = ["ai", "capture", "tags", "storage", "notify"].includes(tabName) ? tabName : "ai";
+  state.settingsTab = next;
+  settingsTabs.forEach((button) => {
+    const active = button.dataset.settingsTab === next;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  settingsPanels.forEach((panel) => {
+    panel.hidden = panel.dataset.settingsPanel !== next;
+  });
 }
 
 async function switchView(view) {
   state.view = view;
+  if (view === "updates") {
+    state.updateOnly = true;
+    state.tag = "";
+  } else if (view === "materials") {
+    state.updateOnly = false;
+  }
   renderView();
-  if (state.view === "materials") {
+  if (state.view === "materials" || state.view === "updates") {
     await loadAll();
   }
   if (state.view === "settings") {
     await loadSettings();
+  }
+  if (state.view === "subscriptions") {
+    await loadSettings();
+  }
+  if (state.view === "supplemental") {
+    await loadSupplementalContext();
   }
 }
 
@@ -196,6 +352,7 @@ async function loadItems() {
 
   const { items } = await api(`/api/items?${params}`);
   state.items = items;
+  state.listClassification = null;
   renderItems();
 }
 
@@ -206,53 +363,665 @@ async function loadTags() {
   ]);
   state.tags = tags;
   state.updateCount = updatePayload.items?.length || 0;
+  renderBrandNewBadge();
   renderTags();
 }
 
+async function loadUpdateCount() {
+  try {
+    const { items } = await api("/api/items?updates=1");
+    state.updateCount = items?.length || 0;
+    renderBrandNewBadge();
+  } catch (error) {
+    console.warn("Failed to load update count:", error);
+  }
+}
+
+function renderBrandNewBadge() {
+  updatesNewBadge.hidden = !state.updateCount;
+  updatesNewBadge.title = state.updateCount ? `${state.updateCount} 条内容更新` : "";
+}
+
 function renderItems() {
-  resultCount.textContent = `${state.items.length} 条资料`;
+  const classified = state.listClassification?.groups?.length;
+  resultCount.textContent = state.updateOnly
+    ? `${state.items.length} 条有更新的资料${classified ? ` · ${state.listClassification.groups.length} 个分类` : ""}`
+    : `${state.items.length} 条资料${classified ? ` · ${state.listClassification.groups.length} 个分类` : ""}`;
+  classifyListButton.textContent = state.listClassifying
+    ? "分类中..."
+    : classified
+      ? "重新分类"
+      : "列表分类";
+  classifyListButton.disabled = state.listClassifying || !state.items.length;
 
   if (!state.items.length) {
-    itemList.innerHTML = `<div class="empty-state">还没有符合条件的资料。</div>`;
+    itemList.innerHTML = `<div class="empty-state">${state.updateOnly ? "还没有检测到内容更新。" : "还没有符合条件的资料。"}</div>`;
     return;
   }
 
-  itemList.innerHTML = state.items.map((item) => `
+  if (classified) {
+    renderClassifiedItems();
+    return;
+  }
+
+  itemList.innerHTML = state.items.map(renderItemCard).join("");
+
+  bindItemCards();
+}
+
+function renderItemCard(item) {
+  return `
     <button class="item-card ${state.selectedId === item.id ? "is-selected" : ""}" data-id="${escapeHtml(item.id)}">
       <div class="item-card-title">
         <h3>${escapeHtml(item.title)}</h3>
         ${item.contentUpdatedAt ? `<span class="update-badge">内容更新</span>` : ""}
       </div>
-      <div class="item-meta">${escapeHtml(item.sourceType)} · ${escapeHtml(formatDate(item.updatedAt))}</div>
-      ${item.contentUpdatedAt ? `<div class="item-meta">检测更新：${escapeHtml(formatDate(item.contentUpdatedAt))}</div>` : ""}
-      <div class="item-meta">${escapeHtml((item.tags || []).join(", ") || "no tags")}</div>
-      <div class="item-excerpt">${escapeHtml(item.excerpt || "")}</div>
     </button>
-  `).join("");
+  `;
+}
 
+function bindItemCards() {
   itemList.querySelectorAll(".item-card").forEach((card) => {
     card.addEventListener("click", () => selectItem(card.dataset.id));
   });
 }
 
-function renderTags() {
-  const allButton = `<button class="tag-chip ${state.tag || state.updateOnly ? "" : "is-active"}" data-tag="">全部</button>`;
-  const updateButton = `
-    <button class="tag-chip update-chip ${state.updateOnly ? "is-active" : ""}" data-updates="1">
-      内容更新 ${state.updateCount}
-    </button>
+function renderClassifiedItems() {
+  const byId = new Map(state.items.map((item) => [item.id, item]));
+  const seen = new Set();
+  const groups = (state.listClassification?.groups || []).map((group) => {
+    const items = (group.itemIds || [])
+      .map((id) => byId.get(id))
+      .filter(Boolean)
+      .filter((item) => {
+        if (seen.has(item.id)) return false;
+        seen.add(item.id);
+        return true;
+      });
+    return { ...group, items };
+  }).filter((group) => group.items.length);
+  const leftovers = state.items.filter((item) => !seen.has(item.id));
+  if (leftovers.length) {
+    groups.push({ name: "未分类", reason: "AI 分类结果中未覆盖的资料。", items: leftovers });
+  }
+
+  itemList.innerHTML = groups.map((group) => `
+    <section class="item-group">
+      <div class="item-group-header">
+        <div>
+          <strong>${escapeHtml(group.name || "未命名分类")}</strong>
+          ${group.reason ? `<p>${escapeHtml(group.reason)}</p>` : ""}
+        </div>
+        <span>${group.items.length}</span>
+      </div>
+      ${group.items.map(renderItemCard).join("")}
+    </section>
+  `).join("");
+  bindItemCards();
+}
+
+function openClassifyListDialog() {
+  if (!state.items.length) return;
+  classifyListSubtitle.textContent = `当前列表 ${state.items.length} 条资料。自定义类别后，AI 会逐条归类。`;
+  classificationStatus.textContent = "等待分类。";
+  classificationCount.textContent = `0 / ${state.items.length}`;
+  classificationProgress.value = 0;
+  classificationProgress.max = Math.max(state.items.length, 1);
+  renderClassificationCategories();
+  classifyListDialog.showModal();
+}
+
+function closeClassifyListDialog() {
+  if (state.listClassifying) return;
+  classifyListDialog.close();
+}
+
+function addClassificationCategory() {
+  const values = classifyCategoryInput.value
+    .split(/[,，\n]/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (!values.length) return;
+  state.listClassifier.categories = uniqueValues([
+    ...state.listClassifier.categories,
+    ...values
+  ]).slice(0, 24);
+  classifyCategoryInput.value = "";
+  saveStoredListCategories();
+  renderClassificationCategories();
+}
+
+function removeClassificationCategory(category) {
+  if (state.listClassifying) return;
+  state.listClassifier.categories = state.listClassifier.categories.filter((item) => item !== category);
+  saveStoredListCategories();
+  renderClassificationCategories();
+}
+
+function renderClassificationCategories() {
+  const categories = state.listClassifier.categories || [];
+  classificationCategoryChips.innerHTML = categories.length
+    ? categories.map((category) => `
+      <button type="button" class="tag-edit-chip" data-classification-category="${escapeHtml(category)}">
+        ${escapeHtml(category)}
+        <span>×</span>
+      </button>
+    `).join("")
+    : `<span class="empty-inline">还没有类别。可以手动添加，也可以留空让 AI 自动归纳。</span>`;
+  classificationCategoryChips.querySelectorAll("[data-classification-category]").forEach((button) => {
+    button.addEventListener("click", () => removeClassificationCategory(button.dataset.classificationCategory));
+  });
+}
+
+function saveStoredListCategories() {
+  localStorage.setItem("materialOrganizer.listCategories", JSON.stringify(state.listClassifier.categories || []));
+}
+
+function loadStoredListCategories() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem("materialOrganizer.listCategories") || "[]");
+    return Array.isArray(parsed) ? uniqueValues(parsed.map((item) => String(item || "").trim()).filter(Boolean)) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function classifyCurrentList() {
+  if (!state.items.length || state.listClassifying) return;
+  const categories = uniqueValues((state.listClassifier.categories || []).map((category) => category.trim()).filter(Boolean));
+  state.listClassifier.categories = categories;
+  saveStoredListCategories();
+  state.listClassifying = true;
+  runClassifyListButton.disabled = true;
+  closeClassifyListButton.disabled = true;
+  cancelClassifyListButton.disabled = true;
+  addClassifyCategoryButton.disabled = true;
+  classifyCategoryInput.disabled = true;
+  classificationStatus.textContent = categories.length
+    ? `正在按 ${categories.length} 个类别分类...`
+    : "正在让 AI 自动归纳分类...";
+  classificationCount.textContent = `0 / ${state.items.length}`;
+  classificationProgress.max = Math.max(state.items.length, 1);
+  classificationProgress.value = 0;
+  renderItems();
+  try {
+    if (categories.length) {
+      state.listClassification = await classifyCurrentListByCategory(categories);
+    } else {
+      const result = await api("/api/classify-items", {
+        method: "POST",
+        body: JSON.stringify({
+          ids: state.items.map((item) => item.id),
+          categories
+        })
+      });
+      state.listClassification = {
+        groups: result.groups || [],
+        note: result.note || ""
+      };
+    }
+    classificationProgress.value = state.items.length;
+    classificationCount.textContent = `${state.items.length} / ${state.items.length}`;
+    classificationStatus.textContent = `分类完成，生成 ${state.listClassification.groups.length} 个分类。`;
+    classifyListDialog.close();
+  } catch (error) {
+    classificationStatus.textContent = `分类失败：${error.message}`;
+  } finally {
+    state.listClassifying = false;
+    runClassifyListButton.disabled = false;
+    closeClassifyListButton.disabled = false;
+    cancelClassifyListButton.disabled = false;
+    addClassifyCategoryButton.disabled = false;
+    classifyCategoryInput.disabled = false;
+    renderItems();
+  }
+}
+
+async function classifyCurrentListByCategory(categories) {
+  const assignments = [];
+  const errors = [];
+  let completed = 0;
+  for (const item of state.items) {
+    classificationStatus.textContent = `正在分类：${item.title}`;
+    try {
+      const result = await api("/api/classify-item", {
+        method: "POST",
+        body: JSON.stringify({
+          id: item.id,
+          categories
+        })
+      });
+      assignments.push({
+        id: item.id,
+        category: result.category || "未分类",
+        reason: result.reason || ""
+      });
+    } catch (error) {
+      errors.push({ id: item.id, title: item.title, error: error.message });
+      assignments.push({
+        id: item.id,
+        category: "未分类",
+        reason: `分类失败：${error.message}`
+      });
+    }
+    completed += 1;
+    classificationProgress.value = completed;
+    classificationCount.textContent = `${completed} / ${state.items.length}`;
+  }
+  return buildClassificationFromAssignments(assignments, categories, errors);
+}
+
+function buildClassificationFromAssignments(assignments, categories, errors = []) {
+  const categorySet = new Set(categories);
+  const groupsByName = new Map([...categories, "未分类"].map((category) => [category, {
+    name: category,
+    itemIds: [],
+    reason: ""
+  }]));
+  for (const assignment of assignments) {
+    const name = categorySet.has(assignment.category) ? assignment.category : "未分类";
+    const group = groupsByName.get(name) || groupsByName.get("未分类");
+    group.itemIds.push(assignment.id);
+    if (!group.reason && assignment.reason) group.reason = assignment.reason;
+  }
+  return {
+    groups: [...groupsByName.values()].filter((group) => group.itemIds.length),
+    note: errors.length ? `${errors.length} 条资料分类失败，已放入未分类。` : ""
+  };
+}
+
+function renderUpdateSnippet(summary) {
+  if (!summary) return "";
+  const added = Array.isArray(summary.added) ? summary.added : [];
+  const removed = Array.isArray(summary.removed) ? summary.removed : [];
+  const primary = added[0] || removed[0] || "";
+  if (!primary) return "";
+  const prefix = added[0] ? "新增" : "删除";
+  return `
+    <div class="update-snippet">
+      <strong>${prefix}</strong>
+      <span>${escapeHtml(primary)}</span>
+    </div>
   `;
+}
+
+function renderUpdateSummary(summary, isActiveUpdate) {
+  if (!summary || (!isActiveUpdate && !summary.added?.length && !summary.removed?.length)) return "";
+  const added = Array.isArray(summary.added) ? summary.added : [];
+  const removed = Array.isArray(summary.removed) ? summary.removed : [];
+  const aiSummaryHtml = summary.aiSummary
+    ? `<div class="ai-update-summary"><strong>AI 总结</strong><p>${escapeHtml(summary.aiSummary)}</p></div>`
+    : "";
+  const addedHtml = added.length
+    ? `<div><strong>新增内容</strong><ul>${added.slice(0, 12).map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul></div>`
+    : "";
+  const removedHtml = removed.length
+    ? `<div><strong>删除内容</strong><ul>${removed.slice(0, 12).map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul></div>`
+    : "";
+  const emptyHtml = !addedHtml && !removedHtml ? `<p>更新时间或页面结构发生变化，正文没有检测到可展示的段落差异。</p>` : "";
+  return `
+    <section class="update-summary">
+      <div class="update-summary-head">
+        <h3>更新摘要</h3>
+        <span>${escapeHtml(formatDate(summary.generatedAt || ""))}</span>
+      </div>
+      <div class="item-meta">长度变化：${Number(summary.lengthDelta || 0) >= 0 ? "+" : ""}${escapeHtml(String(summary.lengthDelta || 0))} 字符${summary.sourceUpdatedAt ? ` · 来源更新时间：${escapeHtml(summary.sourceUpdatedAt)}` : ""}</div>
+      ${aiSummaryHtml}
+      ${emptyHtml}
+      ${addedHtml}
+      ${removedHtml}
+    </section>
+  `;
+}
+
+function openBatchProcessDialog() {
+  state.batchProcess = {
+    items: [],
+    tagAssignments: [],
+    tagOptions: [],
+    selectedTags: [],
+    errors: [],
+    cancelRequested: false,
+    running: false
+  };
+  batchProcessForceToggle.checked = false;
+  batchProcessForceToggle.disabled = false;
+  batchProcessProgress.value = 0;
+  batchProcessTagsToggle.checked = false;
+  batchProcessTagsToggle.disabled = false;
+  batchProcessTagMode.value = "batch";
+  batchProcessTagMode.disabled = false;
+  batchProcessConcurrency.value = batchProcessConcurrency.value || "2";
+  batchProcessConcurrency.disabled = false;
+  startBatchProcessButton.hidden = false;
+  startBatchProcessButton.textContent = "开始处理";
+  cancelBatchProcessButton.textContent = "关闭";
+  cancelBatchProcessButton.disabled = false;
+  closeBatchProcessButton.disabled = false;
+  applyBatchTagsButton.hidden = true;
+  batchTagReview.hidden = true;
+  batchTagGroups.innerHTML = "";
+  updateBatchProcessCandidates();
+  batchProcessDialog.showModal();
+}
+
+function updateBatchProcessCandidates() {
+  if (state.batchProcess.running) return;
+  const force = batchProcessForceToggle.checked;
+  const includeTags = batchProcessTagsToggle.checked;
+  const tagMode = batchProcessTagMode.value;
+  const contentCandidates = state.items.filter((item) => item.pageKind !== "list" && (force || !item.hasProcessed));
+  const tagOnlyCandidates = includeTags && tagMode === "batch"
+    ? state.items.filter((item) => item.pageKind !== "list")
+    : [];
+  const candidates = uniqueItemsById([...contentCandidates, ...tagOnlyCandidates]);
+  state.batchProcess.items = candidates;
+  state.batchProcess.contentIds = new Set(contentCandidates.map((item) => item.id));
+  state.batchProcess.tagScopeIds = new Set((tagMode === "batch" ? tagOnlyCandidates : contentCandidates).map((item) => item.id));
+  batchProcessSubtitle.textContent = describeBatchProcessPlan(force, includeTags, tagMode, contentCandidates.length, state.batchProcess.tagScopeIds.size);
+  batchProcessStatus.textContent = candidates.length ? "等待开始。" : "没有需要处理的资料。";
+  batchProcessCount.textContent = `0 / ${candidates.length}`;
+  batchProcessProgress.max = Math.max(1, candidates.length);
+  batchProcessProgress.value = 0;
+  startBatchProcessButton.disabled = candidates.length === 0;
+}
+
+function describeBatchProcessPlan(force, includeTags, tagMode, contentCount, tagCount) {
+  const contentText = force
+    ? `重新处理 ${contentCount} 条资料`
+    : contentCount
+      ? `处理 ${contentCount} 条未整理资料`
+      : "不重新处理正文";
+  if (!includeTags) return contentCount ? `将${contentText}。` : "当前列表没有未整理资料。";
+  const tagText = tagMode === "batch"
+    ? `并对当前列表 ${tagCount} 条资料统一整理标签`
+    : `并对 ${tagCount} 条未整理资料单独整理标签`;
+  if (!contentCount && tagCount) return `将${tagText}。`;
+  return `将${contentText}，${tagText}。`;
+}
+
+function uniqueItemsById(items) {
+  const seen = new Set();
+  return items.filter((item) => {
+    if (seen.has(item.id)) return false;
+    seen.add(item.id);
+    return true;
+  });
+}
+
+function closeBatchProcessDialog() {
+  if (state.batchProcess.running) {
+    stopBatchProcess();
+    return;
+  }
+  batchProcessDialog.close();
+}
+
+function stopBatchProcess() {
+  if (!state.batchProcess.running) return;
+  state.batchProcess.cancelRequested = true;
+  batchProcessStatus.textContent = "正在停止，已开始的请求完成后会结束。";
+  cancelBatchProcessButton.disabled = true;
+  closeBatchProcessButton.disabled = true;
+}
+
+async function startBatchProcess() {
+  const items = state.batchProcess.items || [];
+  if (!items.length || state.batchProcess.running) return;
+  state.batchProcess.running = true;
+  state.batchProcess.cancelRequested = false;
+  state.batchProcess.tagAssignments = [];
+  state.batchProcess.tagOptions = [];
+  state.batchProcess.selectedTags = [];
+  state.batchProcess.errors = [];
+  const includeTags = batchProcessTagsToggle.checked;
+  const tagMode = batchProcessTagMode.value;
+  const concurrency = Math.min(8, Math.max(1, Number(batchProcessConcurrency.value || 2) || 2));
+  batchProcessTagsToggle.disabled = true;
+  batchProcessTagMode.disabled = true;
+  batchProcessForceToggle.disabled = true;
+  batchProcessConcurrency.disabled = true;
+  startBatchProcessButton.disabled = true;
+  cancelBatchProcessButton.textContent = "停止处理";
+  cancelBatchProcessButton.disabled = false;
+  closeBatchProcessButton.disabled = false;
+  applyBatchTagsButton.hidden = true;
+  batchTagReview.hidden = true;
+  batchTagGroups.innerHTML = "";
+  batchProcessProgress.max = items.length;
+  batchProcessProgress.value = 0;
+
+  let completed = 0;
+  let cursor = 0;
+  const processOne = async (item) => {
+    if (state.batchProcess.cancelRequested) return;
+    const needsContentProcessing = state.batchProcess.contentIds?.has(item.id);
+    batchProcessStatus.textContent = needsContentProcessing ? `正在处理：${item.title}` : `准备标签：${item.title}`;
+    try {
+      let titledItem = { metadata: item };
+      let processedItem = { metadata: item };
+      if (needsContentProcessing) {
+        const titleResponse = await api(`/api/items/${encodeURIComponent(item.id)}/recommend-title`, { method: "POST" });
+        titledItem = titleResponse.item;
+        const processResponse = await api(`/api/items/${encodeURIComponent(item.id)}/process`, { method: "POST" });
+        processedItem = processResponse.item;
+      }
+      state.batchProcess.tagAssignments.push({
+        id: item.id,
+        title: processedItem?.metadata?.title || titledItem?.metadata?.title || item.title,
+        currentTags: processedItem?.metadata?.tags || item.tags || [],
+        recommendedTags: []
+      });
+    } catch (error) {
+      state.batchProcess.errors.push({ id: item.id, title: item.title, error: error.message });
+      state.batchProcess.tagAssignments.push({
+        id: item.id,
+        title: item.title,
+        currentTags: item.tags || [],
+        recommendedTags: [],
+        error: error.message
+      });
+    }
+    completed += 1;
+    batchProcessProgress.value = completed;
+    batchProcessCount.textContent = `${completed} / ${items.length}`;
+  };
+
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (cursor < items.length) {
+      if (state.batchProcess.cancelRequested) break;
+      const item = items[cursor];
+      cursor += 1;
+      await processOne(item);
+    }
+  });
+  batchProcessStatus.textContent = `处理中，并发 ${Math.min(concurrency, items.length)} 个...`;
+  await Promise.all(workers);
+
+  state.batchProcess.running = false;
+  const wasCancelled = state.batchProcess.cancelRequested;
+  startBatchProcessButton.hidden = true;
+  batchProcessTagsToggle.disabled = false;
+  batchProcessTagMode.disabled = false;
+  batchProcessForceToggle.disabled = false;
+  batchProcessConcurrency.disabled = false;
+  cancelBatchProcessButton.textContent = "关闭";
+  cancelBatchProcessButton.disabled = false;
+  closeBatchProcessButton.disabled = false;
+  if (includeTags && !wasCancelled) {
+    await buildBatchTagOptions(tagMode);
+  }
+  const errorCount = state.batchProcess.errors.length;
+  batchProcessStatus.textContent = wasCancelled
+    ? `已停止，完成 ${completed} / ${items.length}。`
+    : errorCount
+    ? `处理完成，${errorCount} 条失败。`
+    : includeTags
+      ? "处理完成。请选择要保留的标签。"
+      : "处理完成。";
+  if (includeTags || errorCount) {
+    renderBatchTagReview();
+    applyBatchTagsButton.hidden = !includeTags;
+  }
+  await loadItems();
+  if (state.selectedId) {
+    await selectItem(state.selectedId);
+  }
+}
+
+async function buildBatchTagOptions(tagMode) {
+  const scopeIds = state.batchProcess.tagScopeIds || new Set();
+  const assignments = (state.batchProcess.tagAssignments || [])
+    .filter((assignment) => !assignment.error && scopeIds.has(assignment.id));
+  if (!assignments.length) return;
+  let batchTags = [];
+  batchProcessStatus.textContent = tagMode === "batch"
+    ? "正在根据全部文档统一生成标签..."
+    : "正在为未整理文档单独生成标签...";
+  try {
+    if (tagMode === "batch") {
+      const result = await api("/api/batch-recommend-tags", {
+        method: "POST",
+        body: JSON.stringify({ ids: assignments.map((assignment) => assignment.id) })
+      });
+      batchTags = uniqueValues(result.tags || []);
+      const assignmentById = new Map((result.assignments || []).map((assignment) => [assignment.id, assignment.tags || []]));
+      for (const assignment of assignments) {
+        assignment.recommendedTags = uniqueValues(assignmentById.get(assignment.id) || []);
+      }
+    } else {
+      for (const assignment of assignments) {
+        const result = await api(`/api/items/${encodeURIComponent(assignment.id)}/recommend-tags`, { method: "POST" });
+        assignment.recommendedTags = uniqueValues(result.tags || []);
+      }
+    }
+    const countByTag = new Map();
+    for (const assignment of assignments) {
+      for (const tag of assignment.recommendedTags || []) {
+        countByTag.set(tag, (countByTag.get(tag) || 0) + 1);
+      }
+    }
+    const allTags = uniqueValues([
+      ...batchTags,
+      ...assignments.flatMap((assignment) => assignment.recommendedTags || [])
+    ]);
+    state.batchProcess.tagOptions = allTags
+      .map((name) => ({ name, count: countByTag.get(name) || 0 }))
+      .filter((option) => option.count > 0)
+      .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+    state.batchProcess.selectedTags = state.batchProcess.tagOptions.map((option) => option.name);
+  } catch (error) {
+    state.batchProcess.errors.push({ id: "batch-tags", title: "批量标签生成", error: error.message });
+    state.batchProcess.tagAssignments.push({
+      id: "batch-tags",
+      title: "批量标签生成",
+      currentTags: [],
+      recommendedTags: [],
+      error: error.message
+    });
+  }
+}
+
+function renderBatchTagReview() {
+  const assignments = state.batchProcess.tagAssignments || [];
+  const tagOptions = state.batchProcess.tagOptions || [];
+  const selectedTags = state.batchProcess.selectedTags || [];
+  const failed = assignments.filter((assignment) => assignment.error);
+  batchTagReview.hidden = false;
+  batchTagGroups.innerHTML = tagOptions.length || failed.length
+    ? `
+      ${tagOptions.length ? `
+        <section class="batch-tag-group">
+          <div>
+            <strong>标签筛选</strong>
+            <p class="item-meta">重复标签只显示一次；括号中是将被应用到的文档数量。</p>
+          </div>
+          <div class="tag-editor-chips">
+            ${tagOptions.map((option) => `
+              <button type="button" class="tag-edit-chip ${selectedTags.includes(option.name) ? "is-selected" : ""}" data-batch-tag="${escapeHtml(option.name)}">
+                ${escapeHtml(option.name)}
+                <span>${escapeHtml(String(option.count))}</span>
+              </button>
+            `).join("")}
+          </div>
+        </section>
+      ` : `<div class="empty-inline">没有生成推荐标签。</div>`}
+      ${failed.length ? `
+        <section class="batch-tag-group">
+          <strong>处理失败</strong>
+          ${failed.map((group) => `<p class="status-message">${escapeHtml(group.title)}：${escapeHtml(group.error)}</p>`).join("")}
+        </section>
+      ` : ""}
+    `
+    : `<div class="empty-inline">没有生成推荐标签。</div>`;
+
+  batchTagGroups.querySelectorAll("[data-batch-tag]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const tag = button.dataset.batchTag;
+      if (state.batchProcess.selectedTags.includes(tag)) {
+        state.batchProcess.selectedTags = state.batchProcess.selectedTags.filter((candidate) => candidate !== tag);
+      } else {
+        state.batchProcess.selectedTags.push(tag);
+      }
+      renderBatchTagReview();
+    });
+  });
+}
+
+async function applyBatchTags() {
+  const selected = new Set(state.batchProcess.selectedTags || []);
+  const groups = (state.batchProcess.tagAssignments || []).filter((group) => !group.error);
+  applyBatchTagsButton.disabled = true;
+  applyBatchTagsButton.textContent = "应用中...";
+  try {
+    for (const group of groups) {
+      const keptGeneratedTags = (group.recommendedTags || []).filter((tag) => selected.has(tag));
+      const tags = uniqueValues([...(group.currentTags || []), ...keptGeneratedTags]);
+      await api(`/api/items/${encodeURIComponent(group.id)}/tags`, {
+        method: "PATCH",
+        body: JSON.stringify({ tags })
+      });
+    }
+    batchProcessStatus.textContent = "标签已应用。";
+    await loadAll();
+    if (state.selectedId) await selectItem(state.selectedId);
+  } catch (error) {
+    batchProcessStatus.textContent = error.message;
+  } finally {
+    applyBatchTagsButton.disabled = false;
+    applyBatchTagsButton.textContent = "应用标签";
+  }
+}
+
+function extractMarkdownSection(documentText, marker) {
+  const source = String(documentText || "");
+  const markerLine = `\n${marker}\n\n`;
+  const index = source.indexOf(markerLine);
+  if (index !== -1) return unwrapMarkdownFence(source.slice(index + markerLine.length).trim());
+  const compactMarker = `${marker}\n\n`;
+  if (source.startsWith(compactMarker)) return unwrapMarkdownFence(source.slice(compactMarker.length).trim());
+  return unwrapMarkdownFence(source.trim());
+}
+
+function unwrapMarkdownFence(markdown) {
+  const source = String(markdown || "").trim();
+  const match = source.match(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```\s*$/i);
+  return match ? match[1].trim() : source;
+}
+
+function renderTags() {
+  const allButton = `<button class="tag-chip ${state.tag ? "" : "is-active"}" data-tag="">全部</button>`;
   const tagButtons = state.tags.map((tag) => `
     <button class="tag-chip ${state.tag === tag.name ? "is-active" : ""}" data-tag="${escapeHtml(tag.name)}">
       ${escapeHtml(tag.name)} ${tag.count}
     </button>
   `).join("");
 
-  tagList.innerHTML = allButton + updateButton + tagButtons;
+  tagList.innerHTML = allButton + tagButtons;
   tagList.querySelectorAll(".tag-chip").forEach((chip) => {
     chip.addEventListener("click", async () => {
-      state.updateOnly = chip.dataset.updates === "1";
-      state.tag = state.updateOnly ? "" : chip.dataset.tag;
+      state.updateOnly = state.view === "updates";
+      state.tag = chip.dataset.tag;
       await loadItems();
       renderTags();
     });
@@ -264,27 +1033,145 @@ async function selectItem(id) {
   renderItems();
   const { item } = await api(`/api/items/${encodeURIComponent(id)}`);
   renderDetail(item);
+  if (item.metadata.contentUpdatedAt) {
+    await acknowledgeSelectedItemUpdate(id);
+  }
+}
+
+async function acknowledgeSelectedItemUpdate(id) {
+  try {
+    const { item } = await api(`/api/items/${encodeURIComponent(id)}/ack-update`, { method: "POST" });
+    if (state.selectedId !== id) return;
+    const index = state.items.findIndex((candidate) => candidate.id === id);
+    if (index !== -1) {
+      if (state.updateOnly) {
+        state.items.splice(index, 1);
+      } else {
+        state.items[index] = {
+          ...state.items[index],
+          contentUpdatedAt: "",
+          updateAcknowledgedAt: item.metadata.updateAcknowledgedAt || ""
+        };
+      }
+      renderItems();
+    }
+    await loadTags();
+    await loadUpdateCount();
+  } catch (error) {
+    console.warn("Failed to acknowledge item update:", error);
+  }
 }
 
 function renderDetail(item) {
   const metadata = item.metadata;
+  const hasProcessed = Boolean(item.processedDocument?.trim());
+  const showProcessed = state.detailMode === "processed";
+  const rawDocument = extractMarkdownSection(item.document, "## Content");
+  const processedDocument = extractMarkdownSection(item.processedDocument || "", "## AI Organized Content");
+  const displayedDocument = showProcessed && hasProcessed ? processedDocument : rawDocument;
+  const modeNote = showProcessed && !hasProcessed
+    ? `<div class="detail-note">当前资料还没有 AI 整理版，已临时显示原文。点击“生成整理”后可切换查看整理后的内容。</div>`
+    : showProcessed && metadata.processedStale
+      ? `<div class="detail-note">原文刷新后发生过变化，当前 AI 整理版可能不是最新。点击“更新整理”可重新生成。</div>`
+    : "";
+  const updateSummary = renderUpdateSummary(metadata.updateSummary, metadata.contentUpdatedAt);
   detailPanel.innerHTML = `
     <div class="detail-title">
-      <div>
-        <h2>${escapeHtml(metadata.title)}</h2>
-        <div class="item-meta">${escapeHtml(metadata.sourceType)} · ${escapeHtml(metadata.url || "local input")}</div>
+      <div class="title-editor">
+        <div id="detailTitleWrap" class="title-input-wrap">
+          <input id="detailTitleInput" value="${escapeHtml(metadata.title)}" />
+          <span id="detailTitleMarquee" class="title-marquee-text" aria-hidden="true">${escapeHtml(metadata.title)}</span>
+        </div>
       </div>
       <div class="detail-actions">
+        <div class="title-editor-actions">
+          <button id="saveTitleButton" type="button">保存标题</button>
+          <button id="generateTitleButton" type="button">AI 生成标题</button>
+        </div>
+        <div class="detail-display-control ${hasProcessed ? "" : "is-unavailable"}">
+          <span>显示模式</span>
+          <label class="detail-mode-switch">
+            <span class="mode-choice ${state.detailMode === "raw" ? "is-selected" : ""}">${state.detailMode === "raw" ? "🟢 " : ""}原始内容</span>
+            <input id="detailModeSwitch" type="checkbox" ${state.detailMode === "processed" ? "checked" : ""} ${hasProcessed ? "" : "disabled"} />
+            <span class="switch-track" aria-hidden="true"></span>
+            <span class="mode-choice ${state.detailMode === "processed" ? "is-selected" : ""}">${state.detailMode === "processed" ? "🟢 " : ""}已整理</span>
+          </label>
+        </div>
+        <button id="processItemButton">${hasProcessed ? "重新生成整理" : "生成 AI 整理"}</button>
         <button id="editTagsButton">标签</button>
         <button id="refreshButton">刷新</button>
         <button id="deleteItemButton" class="danger-button">删除</button>
+      </div>
+      <div class="detail-meta-block">
+        <div class="item-meta">${escapeHtml(metadata.sourceType)} · ${escapeHtml(metadata.url || "local input")}</div>
+        ${metadata.processedAt ? `<div class="item-meta">AI 整理：${escapeHtml(formatDate(metadata.processedAt))} · ${escapeHtml(metadata.processedModel || "")}</div>` : ""}
       </div>
     </div>
     <div class="item-meta">标签：${escapeHtml((metadata.tags || []).join(", ") || "no tags")}</div>
     ${metadata.contentUpdatedAt ? `<div class="item-meta">内容更新：${escapeHtml(formatDate(metadata.contentUpdatedAt))}</div>` : ""}
     <hr />
-    <div class="detail-doc markdown-body">${renderMarkdown(item.document)}</div>
+    ${modeNote}
+    ${updateSummary}
+    <div class="detail-doc markdown-body">${renderMarkdown(displayedDocument)}</div>
   `;
+  setupDetailTitleMarquee();
+
+  document.querySelector("#detailModeSwitch").addEventListener("change", (event) => {
+    state.detailMode = event.target.checked ? "processed" : "raw";
+    localStorage.setItem("materialOrganizer.detailMode", state.detailMode);
+    renderDetail(item);
+  });
+
+  document.querySelector("#saveTitleButton").addEventListener("click", async () => {
+    const input = document.querySelector("#detailTitleInput");
+    const button = document.querySelector("#saveTitleButton");
+    button.disabled = true;
+    button.textContent = "保存中...";
+    try {
+      const { item: nextItem } = await api(`/api/items/${encodeURIComponent(metadata.id)}/title`, {
+        method: "PATCH",
+        body: JSON.stringify({ title: input.value })
+      });
+      renderDetail(nextItem);
+      await loadItems();
+    } catch (error) {
+      alert(error.message);
+      button.disabled = false;
+      button.textContent = "保存标题";
+    }
+  });
+
+  document.querySelector("#generateTitleButton").addEventListener("click", async () => {
+    const button = document.querySelector("#generateTitleButton");
+    button.disabled = true;
+    button.textContent = "生成中...";
+    try {
+      const { item: nextItem } = await api(`/api/items/${encodeURIComponent(metadata.id)}/recommend-title`, { method: "POST" });
+      renderDetail(nextItem);
+      await loadItems();
+    } catch (error) {
+      alert(error.message);
+      button.disabled = false;
+      button.textContent = "AI 生成标题";
+    }
+  });
+
+  document.querySelector("#processItemButton").addEventListener("click", async () => {
+    const button = document.querySelector("#processItemButton");
+    button.disabled = true;
+    button.textContent = "整理中...";
+    try {
+      const { item: nextItem } = await api(`/api/items/${encodeURIComponent(metadata.id)}/process`, { method: "POST" });
+      state.detailMode = "processed";
+      localStorage.setItem("materialOrganizer.detailMode", state.detailMode);
+      renderDetail(nextItem);
+      await loadItems();
+    } catch (error) {
+      alert(error.message);
+      button.disabled = false;
+      button.textContent = hasProcessed ? "重新生成整理" : "生成 AI 整理";
+    }
+  });
 
   document.querySelector("#editTagsButton").addEventListener("click", () => openTagDialog(item));
 
@@ -312,12 +1199,44 @@ function renderDetail(item) {
   });
 }
 
-function openTagDialog(item) {
+function setupDetailTitleMarquee() {
+  const wrap = document.querySelector("#detailTitleWrap");
+  const input = document.querySelector("#detailTitleInput");
+  const marquee = document.querySelector("#detailTitleMarquee");
+  if (!wrap || !input || !marquee) return;
+
+  const update = () => {
+    marquee.textContent = input.value || "Untitled material";
+    wrap.classList.remove("is-overflowing");
+    wrap.style.setProperty("--title-scroll-distance", "0px");
+    requestAnimationFrame(() => {
+      const overflow = marquee.scrollWidth - wrap.clientWidth;
+      if (overflow > 8) {
+        wrap.style.setProperty("--title-scroll-distance", `${overflow + 24}px`);
+        wrap.classList.add("is-overflowing");
+      }
+    });
+  };
+
+  wrap.addEventListener("click", () => input.focus());
+  input.addEventListener("input", update);
+  input.addEventListener("focus", () => wrap.classList.add("is-editing"));
+  input.addEventListener("blur", () => {
+    wrap.classList.remove("is-editing");
+    update();
+  });
+  update();
+}
+
+async function openTagDialog(item) {
   state.tagEditor = {
     item,
     selected: [...(item.metadata.tags || [])],
     recommended: []
   };
+  if (!state.tags.length) {
+    await loadTags();
+  }
   tagDialogSubtitle.textContent = item.metadata.title;
   tagManualInput.value = "";
   tagRecommendStatus.textContent = "可根据文档内容生成推荐标签。";
@@ -332,6 +1251,7 @@ function closeTagDialog() {
 function renderTagDialog() {
   const selected = state.tagEditor.selected || [];
   const recommended = state.tagEditor.recommended || [];
+  const existing = state.tags || [];
 
   selectedTagChips.innerHTML = selected.length
     ? selected.map((tag) => `
@@ -341,6 +1261,15 @@ function renderTagDialog() {
         </button>
       `).join("")
     : `<div class="empty-inline">还没有选择标签。</div>`;
+
+  existingTagChips.innerHTML = existing.length
+    ? existing.map((tag) => `
+        <button type="button" class="tag-edit-chip ${selected.includes(tag.name) ? "is-selected" : ""}" data-toggle-existing-tag="${escapeHtml(tag.name)}">
+          ${escapeHtml(tag.name)}
+          <small>${escapeHtml(String(tag.count || 0))}</small>
+        </button>
+      `).join("")
+    : `<div class="empty-inline">资料库里还没有已有标签。</div>`;
 
   recommendedTagChips.innerHTML = recommended.length
     ? recommended.map((tag) => `
@@ -359,6 +1288,10 @@ function renderTagDialog() {
 
   recommendedTagChips.querySelectorAll("[data-toggle-tag]").forEach((button) => {
     button.addEventListener("click", () => toggleSelectedTag(button.dataset.toggleTag));
+  });
+
+  existingTagChips.querySelectorAll("[data-toggle-existing-tag]").forEach((button) => {
+    button.addEventListener("click", () => toggleSelectedTag(button.dataset.toggleExistingTag));
   });
 }
 
@@ -438,11 +1371,190 @@ async function loadSettings() {
   settingModel.value = settings.ai.model || "";
   settingShowThinking.checked = settings.chat?.showThinking !== false;
   settingShowToolCalls.checked = settings.chat?.showToolCalls !== false;
+  settingNotificationsEnabled.checked = settings.notifications?.enabled !== false;
+  for (const input of notificationSourceInputs) {
+    input.checked = settings.notifications?.sources?.[input.dataset.notificationSource] !== false;
+  }
+  settingRefreshStartTime.value = settings.refreshSchedule?.startTime || "08:00";
+  settingRefreshEndTime.value = settings.refreshSchedule?.endTime || "20:00";
+  settingEmbeddingEnabled.checked = Boolean(settings.embedding?.enabled);
+  settingEmbeddingBaseUrl.value = settings.embedding?.baseUrl || "";
+  settingEmbeddingApiKey.value = settings.embedding?.apiKey || "";
+  settingEmbeddingModel.value = settings.embedding?.model || "";
+  settingEmbeddingDimensions.value = settings.embedding?.dimensions || "";
+  for (const field of processingPromptFields) {
+    field.value = settings.processingPrompts?.[field.dataset.processingPrompt] || "";
+  }
   settingDocumentRoot.value = settings.documentRoot || "";
   activeDocumentRoot.textContent = settings.activeDocumentRoot || settings.documentRoot || "";
   renderSourceProfiles(settings.sources || {});
   renderRefreshJobs(settings.refreshJobs || []);
   await loadSettingsTags();
+}
+
+async function loadSupplementalContext() {
+  supplementalStatus.textContent = "正在载入补充资料...";
+  try {
+    const { entries, path } = await api("/api/supplemental-context");
+    state.supplementalEntries = normalizeSupplementalEntriesClient(entries || []);
+    renderSupplementalEntries();
+    supplementalStatus.textContent = `保存位置：${path}`;
+  } catch (error) {
+    supplementalStatus.textContent = error.message;
+  }
+}
+
+async function saveSupplementalContext() {
+  saveSupplementalButton.disabled = true;
+  supplementalStatus.textContent = "正在保存补充资料...";
+  try {
+    syncSupplementalEntriesFromDom();
+    const { entries, path } = await api("/api/supplemental-context", {
+      method: "PATCH",
+      body: JSON.stringify({ entries: state.supplementalEntries })
+    });
+    state.supplementalEntries = normalizeSupplementalEntriesClient(entries || []);
+    renderSupplementalEntries();
+    supplementalStatus.textContent = `已保存：${path}`;
+  } catch (error) {
+    supplementalStatus.textContent = error.message;
+  } finally {
+    saveSupplementalButton.disabled = false;
+  }
+}
+
+async function suggestSupplementalContext() {
+  suggestSupplementalButton.disabled = true;
+  supplementalStatus.textContent = "正在分析现有资料...";
+  try {
+    syncSupplementalEntriesFromDom();
+    const { entries } = await api("/api/supplemental-context/suggest", {
+      method: "POST",
+      body: JSON.stringify({ existingEntries: state.supplementalEntries })
+    });
+    const before = state.supplementalEntries.length;
+    state.supplementalEntries = mergeSupplementalEntries(state.supplementalEntries, entries || []);
+    renderSupplementalEntries();
+    const added = state.supplementalEntries.length - before;
+    supplementalStatus.textContent = added
+      ? `已加入 ${added} 个候选项，请逐条补充说明后保存。`
+      : "没有发现新的候选项。";
+  } catch (error) {
+    supplementalStatus.textContent = error.message;
+  } finally {
+    suggestSupplementalButton.disabled = false;
+  }
+}
+
+function renderSupplementalEntries() {
+  const entries = state.supplementalEntries || [];
+  const completeCount = entries.filter((entry) => entry.explanation.trim()).length;
+  const pendingCount = entries.length - completeCount;
+  supplementalSummary.innerHTML = entries.length
+    ? `
+        <span>全部 ${entries.length}</span>
+        <span>已说明 ${completeCount}</span>
+        <span>未说明 ${pendingCount}</span>
+      `
+    : `<span>还没有补充项</span>`;
+  supplementalList.innerHTML = entries.length
+    ? entries.map((entry) => renderSupplementalEntry(entry)).join("")
+    : `<div class="empty-state">点击“新增条目”，或让 AI 从已有资料中分析候选项。</div>`;
+
+  supplementalList.querySelectorAll("[data-supplemental-field]").forEach((field) => {
+    field.addEventListener("input", () => {
+      const entry = state.supplementalEntries.find((candidate) => candidate.id === field.dataset.entryId);
+      if (!entry) return;
+      entry[field.dataset.supplementalField] = field.value;
+      if (field.dataset.supplementalField === "explanation") {
+        renderSupplementalEntryStatus(field.dataset.entryId);
+      }
+    });
+  });
+  supplementalList.querySelectorAll("[data-delete-supplemental]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.supplementalEntries = state.supplementalEntries.filter((entry) => entry.id !== button.dataset.deleteSupplemental);
+      renderSupplementalEntries();
+    });
+  });
+}
+
+function renderSupplementalEntry(entry) {
+  const isComplete = Boolean(entry.explanation.trim());
+  return `
+    <section class="supplemental-entry ${isComplete ? "is-complete" : ""}" data-entry-id="${escapeHtml(entry.id)}">
+      <div class="supplemental-entry-header">
+        <input data-entry-id="${escapeHtml(entry.id)}" data-supplemental-field="term" value="${escapeHtml(entry.term)}" placeholder="术语、缩写或项目名">
+        <input data-entry-id="${escapeHtml(entry.id)}" data-supplemental-field="category" value="${escapeHtml(entry.category)}" placeholder="分类">
+        <span class="supplemental-entry-status">${isComplete ? "已说明" : "未说明"}</span>
+        <button class="supplemental-entry-delete" type="button" data-delete-supplemental="${escapeHtml(entry.id)}">删除</button>
+      </div>
+      <div class="supplemental-entry-reason">
+        <input data-entry-id="${escapeHtml(entry.id)}" data-supplemental-field="reason" value="${escapeHtml(entry.reason)}" placeholder="为什么需要补充说明">
+      </div>
+      <textarea data-entry-id="${escapeHtml(entry.id)}" data-supplemental-field="explanation" placeholder="在这里填写你的解释。只有填写了说明的条目会进入 AI 处理上下文。">${escapeHtml(entry.explanation)}</textarea>
+    </section>
+  `;
+}
+
+function renderSupplementalEntryStatus(id) {
+  const entry = state.supplementalEntries.find((candidate) => candidate.id === id);
+  const section = supplementalList.querySelector(`[data-entry-id="${CSS.escape(id)}"]`);
+  if (!entry || !section) return;
+  const isComplete = Boolean(entry.explanation.trim());
+  section.classList.toggle("is-complete", isComplete);
+  const status = section.querySelector(".supplemental-entry-status");
+  if (status) status.textContent = isComplete ? "已说明" : "未说明";
+  const completeCount = state.supplementalEntries.filter((candidate) => candidate.explanation.trim()).length;
+  const pendingCount = state.supplementalEntries.length - completeCount;
+  supplementalSummary.innerHTML = `
+    <span>全部 ${state.supplementalEntries.length}</span>
+    <span>已说明 ${completeCount}</span>
+    <span>未说明 ${pendingCount}</span>
+  `;
+}
+
+function syncSupplementalEntriesFromDom() {
+  supplementalList.querySelectorAll("[data-supplemental-field]").forEach((field) => {
+    const entry = state.supplementalEntries.find((candidate) => candidate.id === field.dataset.entryId);
+    if (entry) entry[field.dataset.supplementalField] = field.value;
+  });
+}
+
+function addSupplementalEntry() {
+  syncSupplementalEntriesFromDom();
+  state.supplementalEntries.unshift({
+    id: `manual-${Date.now()}`,
+    term: "",
+    category: "待确认",
+    reason: "",
+    explanation: ""
+  });
+  renderSupplementalEntries();
+  const firstInput = supplementalList.querySelector("[data-supplemental-field='term']");
+  firstInput?.focus();
+}
+
+function normalizeSupplementalEntriesClient(entries) {
+  return (entries || []).map((entry, index) => ({
+    id: String(entry.id || `entry-${index}-${Date.now()}`),
+    term: String(entry.term || "").trim(),
+    category: String(entry.category || "待确认").trim() || "待确认",
+    reason: String(entry.reason || "").trim(),
+    explanation: String(entry.explanation || "").trim()
+  })).filter((entry) => entry.term || entry.reason || entry.explanation);
+}
+
+function mergeSupplementalEntries(current, incoming) {
+  const merged = normalizeSupplementalEntriesClient(current);
+  const seen = new Set(merged.map((entry) => entry.term.toLowerCase()).filter(Boolean));
+  for (const entry of normalizeSupplementalEntriesClient(incoming)) {
+    const key = entry.term.toLowerCase();
+    if (key && seen.has(key)) continue;
+    seen.add(key);
+    merged.push(entry);
+  }
+  return merged;
 }
 
 async function sendChatMessage(event) {
@@ -495,7 +1607,7 @@ async function sendChatMessage(event) {
           assistantMessage = appendMessage("assistant", "");
         }
         assistantText += event.text || "";
-        assistantMessage.querySelector(".message-body").textContent = assistantText;
+        setMessageBody(assistantMessage, "assistant", assistantText);
         chatMessages.scrollTop = chatMessages.scrollHeight;
       },
       done: (answer) => {
@@ -505,7 +1617,7 @@ async function sendChatMessage(event) {
         if (!assistantMessage) {
           assistantMessage = appendMessage("assistant", finalText);
         } else {
-          assistantMessage.querySelector(".message-body").textContent = finalText;
+          setMessageBody(assistantMessage, "assistant", finalText);
         }
         session.messages.push({ role: "assistant", text: finalText, at: new Date().toISOString() });
       },
@@ -547,10 +1659,22 @@ function appendMessage(role, text, meta = {}) {
       <div class="message-body"></div>
     `;
   }
-  message.querySelector(".message-body").textContent = text;
+  setMessageBody(message, role, text);
   chatMessages.append(message);
   chatMessages.scrollTop = chatMessages.scrollHeight;
   return message;
+}
+
+function setMessageBody(message, role, text) {
+  const body = message.querySelector(".message-body");
+  if (!body) return;
+  if (role === "assistant") {
+    body.classList.add("markdown-body");
+    body.innerHTML = renderMarkdown(text);
+  } else {
+    body.classList.remove("markdown-body");
+    body.textContent = text;
+  }
 }
 
 function toggleEventMessage(message) {
@@ -767,12 +1891,13 @@ async function previewImport(event) {
       ? ` 检测到 ${preview.linkedItems.length} 个内容链接，确认导入后会同步导入这些内容页。`
       : "";
     const refreshJobNote = preview.refreshJob
-      ? ` 已加入定时刷新：${preview.refreshJob.name}（默认${preview.refreshJob.enabled ? "开启" : "关闭"}，可在设置页点击立即刷新）。`
+      ? ` 已加入订阅管理：${preview.refreshJob.name}（默认${preview.refreshJob.enabled ? "开启" : "关闭"}，可在订阅管理页点击立即刷新）。`
       : "";
     previewStatus.textContent = `${preview.parseNote} 内容长度 ${preview.contentLength} 字符。${linkedNote}${refreshJobNote}${duplicateNote}`;
     summaryStatus.textContent = "可以生成 AI 总结，或手动填写总结。";
     previewBadge.textContent = preview.existingItem ? "已存在" : (preview.parseStatus === "ready" ? "可导入" : "需确认");
-    confirmImportButton.disabled = !preview.extractedContent.trim() || Boolean(preview.existingItem);
+    confirmImportButton.textContent = preview.existingItem ? "查看已有资料" : "确认导入";
+    confirmImportButton.disabled = !preview.extractedContent.trim() && !preview.existingItem;
     summarizeButton.disabled = !preview.extractedContent.trim();
   } catch (error) {
     previewStatus.textContent = error.message;
@@ -786,6 +1911,14 @@ async function confirmImport() {
   if (!state.importPreview) return;
 
   const preview = state.importPreview;
+  if (preview.existingItem?.id) {
+    const existingId = preview.existingItem.id;
+    resetImport();
+    await switchView("materials");
+    await selectItem(existingId);
+    return;
+  }
+
   const item = await api("/api/items", {
     method: "POST",
     body: JSON.stringify({
@@ -820,6 +1953,7 @@ function resetImport() {
   previewStatus.textContent = "等待输入内容。";
   summaryStatus.textContent = "解析内容后可生成总结。";
   previewBadge.textContent = "未解析";
+  confirmImportButton.textContent = "确认导入";
   confirmImportButton.disabled = true;
   summarizeButton.disabled = true;
 }
@@ -860,6 +1994,19 @@ async function saveSettings(event) {
           showThinking: settingShowThinking.checked,
           showToolCalls: settingShowToolCalls.checked
         },
+        notifications: collectNotificationSettings(),
+        refreshSchedule: {
+          startTime: settingRefreshStartTime.value,
+          endTime: settingRefreshEndTime.value
+        },
+        embedding: {
+          enabled: settingEmbeddingEnabled.checked,
+          baseUrl: settingEmbeddingBaseUrl.value,
+          apiKey: settingEmbeddingApiKey.value === "********" ? undefined : settingEmbeddingApiKey.value,
+          model: settingEmbeddingModel.value,
+          dimensions: Number(settingEmbeddingDimensions.value || 0)
+        },
+        processingPrompts: collectProcessingPrompts(),
         documentRoot: settingDocumentRoot.value,
         sources: collectSourceProfiles(),
         refreshJobs: collectRefreshJobs()
@@ -869,6 +2016,20 @@ async function saveSettings(event) {
     settingApiKey.value = settings.ai.apiKey;
     settingShowThinking.checked = settings.chat?.showThinking !== false;
     settingShowToolCalls.checked = settings.chat?.showToolCalls !== false;
+    settingNotificationsEnabled.checked = settings.notifications?.enabled !== false;
+    for (const input of notificationSourceInputs) {
+      input.checked = settings.notifications?.sources?.[input.dataset.notificationSource] !== false;
+    }
+    settingRefreshStartTime.value = settings.refreshSchedule?.startTime || "08:00";
+    settingRefreshEndTime.value = settings.refreshSchedule?.endTime || "20:00";
+    settingEmbeddingEnabled.checked = Boolean(settings.embedding?.enabled);
+    settingEmbeddingApiKey.value = settings.embedding?.apiKey || "";
+    settingEmbeddingBaseUrl.value = settings.embedding?.baseUrl || "";
+    settingEmbeddingModel.value = settings.embedding?.model || "";
+    settingEmbeddingDimensions.value = settings.embedding?.dimensions || "";
+    for (const field of processingPromptFields) {
+      field.value = settings.processingPrompts?.[field.dataset.processingPrompt] || field.value;
+    }
     agentRoot.textContent = settings.activeDocumentRoot;
     settingsStatus.textContent = "设置已保存。";
     renderRefreshJobs(settings.refreshJobs || []);
@@ -876,6 +2037,23 @@ async function saveSettings(event) {
   } catch (error) {
     settingsStatus.textContent = error.message;
   }
+}
+
+function collectProcessingPrompts() {
+  return Object.fromEntries(processingPromptFields.map((field) => [
+    field.dataset.processingPrompt,
+    field.value
+  ]));
+}
+
+function collectNotificationSettings() {
+  return {
+    enabled: settingNotificationsEnabled.checked,
+    sources: Object.fromEntries(notificationSourceInputs.map((input) => [
+      input.dataset.notificationSource,
+      input.checked
+    ]))
+  };
 }
 
 async function loadSettingsTags() {
@@ -897,11 +2075,14 @@ function renderSettingsTags() {
 
   settingsTagList.innerHTML = state.settingsTags.length
     ? state.settingsTags.map((tag) => `
-        <label class="settings-tag-row">
-          <input type="checkbox" data-settings-tag="${escapeHtml(tag.name)}" ${state.selectedSettingsTags.has(tag.name) ? "checked" : ""} />
-          <span>${escapeHtml(tag.name)}</span>
+        <div class="settings-tag-row">
+          <label class="settings-tag-check">
+            <input type="checkbox" data-settings-tag="${escapeHtml(tag.name)}" ${state.selectedSettingsTags.has(tag.name) ? "checked" : ""} />
+            <span>${escapeHtml(tag.name)}</span>
+          </label>
           <small>${escapeHtml(tag.count)} 条资料</small>
-        </label>
+          <button type="button" data-rename-settings-tag="${escapeHtml(tag.name)}">改名</button>
+        </div>
       `).join("")
     : `<div class="empty-inline">还没有标签。</div>`;
 
@@ -914,6 +2095,9 @@ function renderSettingsTags() {
       }
       renderSettingsTags();
     });
+  });
+  settingsTagList.querySelectorAll("[data-rename-settings-tag]").forEach((button) => {
+    button.addEventListener("click", () => renameSettingsTag(button.dataset.renameSettingsTag));
   });
 }
 
@@ -962,6 +2146,37 @@ async function deleteSelectedSettingsTags() {
   }
 }
 
+async function renameSettingsTag(oldTag) {
+  const tag = state.settingsTags.find((item) => item.name === oldTag);
+  const nextName = prompt(`将标签“${oldTag}”改名为：`, oldTag);
+  if (nextName === null) return;
+  const normalized = slugTagClient(nextName);
+  if (!normalized || normalized === oldTag) return;
+  const exists = state.settingsTags.some((item) => item.name === normalized && item.name !== oldTag);
+  const ok = exists
+    ? confirm(`标签“${normalized}”已存在。继续会把“${oldTag}”合并到这个标签，并更新 ${tag?.count || 0} 条资料。`)
+    : confirm(`确认将“${oldTag}”改名为“${normalized}”？会更新 ${tag?.count || 0} 条资料。`);
+  if (!ok) return;
+
+  tagManagerStatus.textContent = "正在改名标签...";
+  try {
+    const wasSelected = state.selectedSettingsTags.has(oldTag);
+    const result = await api("/api/tags", {
+      method: "PATCH",
+      body: JSON.stringify({ from: oldTag, to: normalized })
+    });
+    state.selectedSettingsTags.delete(oldTag);
+    if (wasSelected) state.selectedSettingsTags.add(result.newTag);
+    state.settingsTags = result.tags || [];
+    await loadTags();
+    await loadItems();
+    renderSettingsTags();
+    tagManagerStatus.textContent = `已将 ${result.oldTag} 改名为 ${result.newTag}，影响 ${result.touchedItems.length} 条资料。`;
+  } catch (error) {
+    tagManagerStatus.textContent = error.message;
+  }
+}
+
 async function openWebdriver(url) {
   webdriverStatus.textContent = "正在打开登录浏览器...";
   try {
@@ -994,7 +2209,8 @@ function renderSourceProfiles(profiles) {
     "confluence.amlogic.com": "Amlogic Confluence",
     "jira.amlogic.com": "Amlogic Jira",
     "roku.atlassian.net": "Roku Atlassian",
-    "github.ecodesamsung.com": "Samsung GitHub"
+    "github.ecodesamsung.com": "Samsung GitHub",
+    "teams.microsoft.com": "Microsoft Teams"
   };
   sourceProfiles.innerHTML = Object.entries(profiles).map(([hostname, profile]) => `
     <section class="source-profile" data-hostname="${escapeHtml(hostname)}">
@@ -1010,6 +2226,10 @@ function renderSourceProfiles(profiles) {
           <option value="basic" ${profile.authMode === "basic" ? "selected" : ""}>用户名密码 / Basic</option>
           <option value="bearer" ${profile.authMode === "bearer" ? "selected" : ""}>Bearer Token</option>
         </select>
+      </label>
+      <label class="checkbox-row">
+        <input data-field="webdriverHeadless" type="checkbox" ${profile.webdriverHeadless ? "checked" : ""} />
+        <span>后台抓取使用无头浏览器</span>
       </label>
       <label data-auth-field="basic">
         用户名
@@ -1043,7 +2263,7 @@ function collectSourceProfiles() {
     const hostname = section.dataset.hostname;
     profiles[hostname] = {};
     section.querySelectorAll("[data-field]").forEach((field) => {
-      profiles[hostname][field.dataset.field] = field.value;
+      profiles[hostname][field.dataset.field] = field.type === "checkbox" ? field.checked : field.value;
     });
   });
   return profiles;
@@ -1057,19 +2277,28 @@ function updateAuthFields(section) {
 }
 
 function renderRefreshJobs(jobs) {
-  if (!jobs.length) {
+  state.refreshJobs = jobs || [];
+  renderSubscriptionTabs();
+  const visibleJobs = state.subscriptionSource === "all"
+    ? state.refreshJobs
+    : state.refreshJobs.filter((job) => sourceTypeForSubscription(job) === state.subscriptionSource);
+
+  if (!visibleJobs.length) {
     refreshJobs.innerHTML = `<div class="empty-state">还没有刷新任务。</div>`;
     return;
   }
 
-  refreshJobs.innerHTML = jobs.map((job) => `
+  refreshJobs.innerHTML = visibleJobs.map((job) => `
     <section class="refresh-job" data-id="${escapeHtml(job.id)}">
       <div class="refresh-job-title">
         <label class="inline-toggle">
           <input data-field="enabled" type="checkbox" ${job.enabled ? "checked" : ""} />
           <strong>${escapeHtml(job.name)}</strong>
         </label>
-        <button type="button" data-run-job="${escapeHtml(job.id)}">${job.running ? "运行中" : "立即刷新"}</button>
+        <div class="refresh-job-actions">
+          <button type="button" data-run-job="${escapeHtml(job.id)}">${job.running ? "运行中" : "立即刷新"}</button>
+          <button type="button" class="danger-button" data-delete-job="${escapeHtml(job.id)}">删除</button>
+        </div>
       </div>
       <label>
         Filter URL
@@ -1077,7 +2306,7 @@ function renderRefreshJobs(jobs) {
       </label>
       <div class="settings-grid">
         <label>
-          间隔分钟
+          刷新间隔分钟
           <input data-field="intervalMinutes" type="number" min="5" value="${escapeHtml(job.intervalMinutes || 60)}" />
         </label>
         <label>
@@ -1090,7 +2319,7 @@ function renderRefreshJobs(jobs) {
         <input data-field="tags" value="${escapeHtml((job.tags || []).join(", "))}" />
       </label>
       <div class="item-meta">
-        状态：${escapeHtml(job.running ? "running" : job.status || "idle")} · 上次刷新：${escapeHtml(job.lastRunAt ? formatDate(job.lastRunAt) : "未刷新")}
+        状态：${escapeHtml(formatRefreshStatus(job.running ? "running" : job.status || "idle"))} · 上次刷新：${escapeHtml(job.lastRunAt ? formatDate(job.lastRunAt) : "未刷新")}
       </div>
       ${job.lastError ? `<div class="item-meta">错误：${escapeHtml(job.lastError)}</div>` : ""}
       ${job.lastResult ? `<div class="item-meta">结果：更新 ${escapeHtml(job.lastResult.updatedItemCount ?? job.lastResult.updatedIssueCount ?? 0)} / ${escapeHtml(job.lastResult.linkCount ?? job.lastResult.issueCount ?? 0)} 个内容页，跳过 ${escapeHtml(job.lastResult.skippedItemCount || 0)} 个</div>` : ""}
@@ -1102,10 +2331,81 @@ function renderRefreshJobs(jobs) {
   refreshJobs.querySelectorAll("[data-run-job]").forEach((button) => {
     button.addEventListener("click", () => runRefreshJob(button.dataset.runJob));
   });
+  refreshJobs.querySelectorAll("[data-delete-job]").forEach((button) => {
+    button.addEventListener("click", () => deleteRefreshJob(button.dataset.deleteJob));
+  });
+}
+
+function renderSubscriptionTabs() {
+  const counts = new Map([["all", state.refreshJobs.length]]);
+  for (const job of state.refreshJobs) {
+    const sourceType = sourceTypeForSubscription(job);
+    counts.set(sourceType, (counts.get(sourceType) || 0) + 1);
+  }
+  const sources = ["all", "jira", "github", "teams", "confluence", "web"];
+  const visibleSources = sources.filter((source) => source === "all" || counts.has(source));
+  if (!visibleSources.includes(state.subscriptionSource)) {
+    state.subscriptionSource = "all";
+  }
+  subscriptionTabs.innerHTML = visibleSources.map((source) => `
+    <button
+      type="button"
+      role="tab"
+      class="subscription-tab ${state.subscriptionSource === source ? "is-active" : ""}"
+      aria-selected="${state.subscriptionSource === source ? "true" : "false"}"
+      data-subscription-source="${escapeHtml(source)}"
+    >
+      ${escapeHtml(subscriptionSourceLabel(source))} ${escapeHtml(String(counts.get(source) || 0))}
+    </button>
+  `).join("");
+  subscriptionTabs.querySelectorAll("[data-subscription-source]").forEach((button) => {
+    button.addEventListener("click", () => {
+      syncRefreshJobsFromDom();
+      state.subscriptionSource = button.dataset.subscriptionSource;
+      renderRefreshJobs(state.refreshJobs);
+    });
+  });
+}
+
+function sourceTypeForSubscription(job) {
+  const url = String(job.url || "").toLowerCase();
+  if (url.includes("jira") || url.includes("atlassian.net")) return "jira";
+  if (url.includes("github")) return "github";
+  if (url.includes("teams.microsoft") || url.includes("teams.cloud.microsoft")) return "teams";
+  if (url.includes("confluence")) return "confluence";
+  return "web";
+}
+
+function subscriptionSourceLabel(source) {
+  return {
+    all: "全部",
+    confluence: "Confluence",
+    jira: "Jira",
+    github: "GitHub",
+    teams: "Teams",
+    web: "网页"
+  }[source] || source;
+}
+
+function formatRefreshStatus(status) {
+  return {
+    idle: "空闲",
+    running: "运行中",
+    failed: "失败",
+    unreachable: "网络不可达"
+  }[status] || status;
 }
 
 function collectRefreshJobs() {
-  return [...refreshJobs.querySelectorAll(".refresh-job")].map((section) => {
+  syncRefreshJobsFromDom();
+  return state.refreshJobs.map((job) => ({
+    ...job,
+    tags: job.tags || []
+  }));
+}
+
+function syncRefreshJobsFromDom() {
+  const visible = [...refreshJobs.querySelectorAll(".refresh-job")].map((section) => {
     const valueOf = (field) => section.querySelector(`[data-field="${field}"]`);
     return {
       id: section.dataset.id,
@@ -1119,17 +2419,107 @@ function collectRefreshJobs() {
       pageKind: valueOf("pageKind")?.value || "list"
     };
   });
+  if (!visible.length) return;
+  const byId = new Map(visible.map((job) => [job.id, job]));
+  state.refreshJobs = state.refreshJobs.map((job) => byId.has(job.id) ? { ...job, ...byId.get(job.id) } : job);
+}
+
+async function saveSubscriptions() {
+  saveSubscriptionsButton.disabled = true;
+  runAllSubscriptionsButton.disabled = true;
+  refreshJobStatus.textContent = "正在保存订阅设置...";
+  try {
+    const { settings } = await api("/api/settings", {
+      method: "PATCH",
+      body: JSON.stringify({
+        refreshJobs: collectRefreshJobs()
+      })
+    });
+    renderRefreshJobs(settings.refreshJobs || []);
+    refreshJobStatus.textContent = "订阅设置已保存。";
+  } catch (error) {
+    refreshJobStatus.textContent = error.message;
+  } finally {
+    saveSubscriptionsButton.disabled = false;
+    runAllSubscriptionsButton.disabled = false;
+  }
 }
 
 async function runRefreshJob(id) {
+  syncRefreshJobsFromDom();
   refreshJobStatus.textContent = "正在刷新过滤页和列表中的内容页...";
   try {
     const { result, jobs } = await api(`/api/refresh-jobs/${encodeURIComponent(id)}/run`, { method: "POST" });
     renderRefreshJobs(jobs || []);
     refreshJobStatus.textContent = `刷新完成：更新 ${result.updatedItemCount ?? result.updatedIssueCount ?? 0} / ${result.linkCount ?? result.issueCount ?? 0} 个内容页，跳过 ${result.skippedItemCount || 0} 个，失败 ${result.errorCount} 个。`;
-    if (state.view === "materials") {
+    if (state.view === "materials" || state.view === "updates") {
       await loadAll();
+    } else {
+      await loadUpdateCount();
     }
+  } catch (error) {
+    refreshJobStatus.textContent = error.message;
+    await loadSettings();
+  }
+}
+
+async function runAllRefreshJobs() {
+  syncRefreshJobsFromDom();
+  const jobsToRun = state.subscriptionSource === "all"
+    ? state.refreshJobs
+    : state.refreshJobs.filter((job) => sourceTypeForSubscription(job) === state.subscriptionSource);
+  if (!jobsToRun.length) {
+    refreshJobStatus.textContent = "当前分类下没有可刷新的订阅。";
+    return;
+  }
+
+  runAllSubscriptionsButton.disabled = true;
+  saveSubscriptionsButton.disabled = true;
+  let updated = 0;
+  let total = 0;
+  let skipped = 0;
+  let failed = 0;
+  let completed = 0;
+  try {
+    for (const job of jobsToRun) {
+      completed += 1;
+      refreshJobStatus.textContent = `正在刷新 ${completed} / ${jobsToRun.length}：${job.name || job.id}`;
+      try {
+        const { result, jobs } = await api(`/api/refresh-jobs/${encodeURIComponent(job.id)}/run`, { method: "POST" });
+        renderRefreshJobs(jobs || []);
+        updated += Number(result.updatedItemCount ?? result.updatedIssueCount ?? 0);
+        total += Number(result.linkCount ?? result.issueCount ?? 0);
+        skipped += Number(result.skippedItemCount || 0);
+        failed += Number(result.errorCount || 0);
+      } catch (error) {
+        failed += 1;
+        refreshJobStatus.textContent = `${job.name || job.id} 刷新失败：${error.message}`;
+      }
+    }
+    refreshJobStatus.textContent = `全部刷新完成：更新 ${updated} / ${total} 个内容页，跳过 ${skipped} 个，失败 ${failed} 个。`;
+    if (state.view === "materials" || state.view === "updates") {
+      await loadAll();
+    } else {
+      await loadUpdateCount();
+    }
+  } finally {
+    runAllSubscriptionsButton.disabled = false;
+    saveSubscriptionsButton.disabled = false;
+  }
+}
+
+async function deleteRefreshJob(id) {
+  syncRefreshJobsFromDom();
+  const section = refreshJobs.querySelector(`.refresh-job[data-id="${CSS.escape(id)}"]`);
+  const name = section?.querySelector("strong")?.textContent || id;
+  const ok = confirm(`删除自动刷新任务“${name}”？这不会删除已经导入的资料。`);
+  if (!ok) return;
+
+  refreshJobStatus.textContent = "正在删除自动刷新任务...";
+  try {
+    const { jobs } = await api(`/api/refresh-jobs/${encodeURIComponent(id)}`, { method: "DELETE" });
+    renderRefreshJobs(jobs || []);
+    refreshJobStatus.textContent = "自动刷新任务已删除。";
   } catch (error) {
     refreshJobStatus.textContent = error.message;
     await loadSettings();

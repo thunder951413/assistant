@@ -2,6 +2,7 @@ import http from "node:http";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
 import { chromium } from "playwright";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -119,10 +120,25 @@ async function handleApi(req, res, url) {
     return;
   }
 
-  if (req.method === "PATCH" && url.pathname.endsWith("/tags")) {
+  if (req.method === "PATCH" && url.pathname.startsWith("/api/items/") && url.pathname.endsWith("/tags")) {
     const id = decodeURIComponent(url.pathname.split("/")[3] || "");
     const body = await readBody(req);
     const item = await updateTags(id, body.tags || []);
+    sendJson(res, 200, { item });
+    return;
+  }
+
+  if (req.method === "PATCH" && url.pathname.endsWith("/title")) {
+    const id = decodeURIComponent(url.pathname.split("/")[3] || "");
+    const body = await readBody(req);
+    const item = await updateTitle(id, body.title || "");
+    sendJson(res, 200, { item });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname.endsWith("/recommend-title")) {
+    const id = decodeURIComponent(url.pathname.split("/")[3] || "");
+    const item = await updateTitleWithAi(id);
     sendJson(res, 200, { item });
     return;
   }
@@ -131,6 +147,41 @@ async function handleApi(req, res, url) {
     const id = decodeURIComponent(url.pathname.split("/")[3] || "");
     const recommendations = await recommendTagsForItem(id);
     sendJson(res, 200, recommendations);
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/batch-recommend-tags") {
+    const body = await readBody(req);
+    const recommendations = await recommendTagsForItems(body.ids || []);
+    sendJson(res, 200, recommendations);
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/classify-items") {
+    const body = await readBody(req);
+    const classification = await classifyItems(body.ids || [], body.categories || []);
+    sendJson(res, 200, classification);
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/classify-item") {
+    const body = await readBody(req);
+    const classification = await classifyItem(body.id || "", body.categories || []);
+    sendJson(res, 200, classification);
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname.endsWith("/process")) {
+    const id = decodeURIComponent(url.pathname.split("/")[3] || "");
+    const item = await processItemWithAi(id);
+    sendJson(res, 200, { item });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname.endsWith("/ack-update")) {
+    const id = decodeURIComponent(url.pathname.split("/")[3] || "");
+    const item = await acknowledgeItemUpdate(id);
+    sendJson(res, 200, { item });
     return;
   }
 
@@ -150,6 +201,13 @@ async function handleApi(req, res, url) {
     const body = await readBody(req);
     const tags = await addManualTags(body.tags || body.tag || []);
     sendJson(res, 200, { tags });
+    return;
+  }
+
+  if (req.method === "PATCH" && url.pathname === "/api/tags") {
+    const body = await readBody(req);
+    const result = await renameTag(body.from || body.oldTag || "", body.to || body.newTag || "");
+    sendJson(res, 200, result);
     return;
   }
 
@@ -189,6 +247,41 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (req.method === "GET" && url.pathname === "/api/supplemental-context") {
+    const entries = await readSupplementalEntries();
+    sendJson(res, 200, {
+      entries,
+      content: renderSupplementalMarkdown(entries),
+      path: supplementalContextPath(),
+      entriesPath: supplementalEntriesPath()
+    });
+    return;
+  }
+
+  if (req.method === "PATCH" && url.pathname === "/api/supplemental-context") {
+    const body = await readBody(req);
+    const entries = Array.isArray(body.entries)
+      ? await saveSupplementalEntries(body.entries)
+      : await saveSupplementalContext(body.content || "");
+    sendJson(res, 200, {
+      entries,
+      content: renderSupplementalMarkdown(entries),
+      path: supplementalContextPath(),
+      entriesPath: supplementalEntriesPath()
+    });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/supplemental-context/suggest") {
+    const body = await readBody(req);
+    const entries = await suggestSupplementalContext(body.existingEntries || []);
+    sendJson(res, 200, {
+      entries,
+      suggestion: renderSupplementalMarkdown(entries)
+    });
+    return;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/settings") {
     sendJson(res, 200, { settings: publicSettings() });
     return;
@@ -208,6 +301,14 @@ async function handleApi(req, res, url) {
     const id = decodeURIComponent(url.pathname.split("/")[3] || "");
     const result = await runRefreshJobById(id, { force: true });
     sendJson(res, 200, { result, jobs: publicRefreshJobs() });
+    return;
+  }
+
+  if (req.method === "DELETE" && url.pathname.startsWith("/api/refresh-jobs/")) {
+    const id = decodeURIComponent(url.pathname.split("/")[3] || "");
+    const jobs = await deleteRefreshJob(id);
+    startRefreshScheduler();
+    sendJson(res, 200, { jobs });
     return;
   }
 
@@ -239,7 +340,8 @@ async function handleApi(req, res, url) {
 
 async function createItem(input) {
   const now = new Date().toISOString();
-  const sourceType = normalizeSourceType(input.sourceType, input.url);
+  const itemUrl = canonicalizeMaterialUrl(input.url || "");
+  const sourceType = normalizeSourceType(input.sourceType, itemUrl || input.url);
   const tags = normalizeTags(input.tags);
   let title = cleanText(input.title || "");
   let rawContent = cleanText(input.rawContent || input.content || "");
@@ -250,12 +352,12 @@ async function createItem(input) {
   const summary = cleanText(input.summary || "");
   let comments = normalizeComments(input.comments);
 
-  if (!rawContent && input.url && (sourceType === "web" || sourceType === "jira" || sourceType === "github" || sourceType === "confluence")) {
-    const fetched = await fetchUrl(input.url);
+  if (!rawContent && itemUrl && (sourceType === "web" || sourceType === "jira" || sourceType === "github" || sourceType === "confluence" || sourceType === "teams")) {
+    const fetched = sourceType === "teams" ? await fetchUrlWithWebdriver(itemUrl) : await fetchUrl(itemUrl);
     rawContent = fetched.raw;
     extractedContent = fetched.text;
     rawFileName = "raw.html";
-    title = title || fetched.title || input.url;
+    title = title || fetched.title || itemUrl;
     lastFetchedAt = now;
     sourceUpdatedAt = sourceUpdatedAt || fetched.sourceUpdatedAt || "";
     comments = normalizeComments(fetched.comments);
@@ -270,7 +372,7 @@ async function createItem(input) {
     id,
     title,
     sourceType,
-    url: input.url || null,
+    url: itemUrl || null,
     tags,
     createdAt: now,
     updatedAt: now,
@@ -305,6 +407,14 @@ async function createItem(input) {
       await fs.writeFile(path.join(itemDir, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
       await fs.writeFile(path.join(itemDir, "document.md"), renderDocument(metadata, extractedContent, summary), "utf8");
     }
+  } else if (metadata.sourceType === "teams" && metadata.url) {
+    metadata.refreshJob = await ensureRefreshJobForContentUrl(metadata.url, {
+      title,
+      sourceType,
+      fetchMode: metadata.fetchMode || "webdriver"
+    });
+    await fs.writeFile(path.join(itemDir, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+    await fs.writeFile(path.join(itemDir, "document.md"), renderDocument(metadata, extractedContent, summary), "utf8");
   }
   await rebuildIndexes();
 
@@ -315,8 +425,9 @@ async function previewSource(input) {
   const now = new Date().toISOString();
   const pasted = cleanText(input.content || "");
   const detectedUrl = cleanText(input.url || detectUrl(pasted));
-  const existingItem = detectedUrl ? await findItemByUrl(detectedUrl) : null;
-  const sourceType = normalizeSourceType(input.sourceType, detectedUrl);
+  const canonicalDetectedUrl = canonicalizeMaterialUrl(detectedUrl);
+  const existingItem = canonicalDetectedUrl ? await findItemByUrl(canonicalDetectedUrl) : null;
+  const sourceType = normalizeSourceType(input.sourceType, canonicalDetectedUrl || detectedUrl);
   let title = cleanText(input.title || "");
   let rawContent = pasted;
   let extractedContent = pasted;
@@ -327,12 +438,43 @@ async function previewSource(input) {
   let linkedItems = [];
   let refreshJob = null;
 
-  if (detectedUrl && shouldFetchForPreview(input, pasted)) {
+  if (existingItem) {
+    const existing = await readItem(existingItem.id);
+    const existingBody = extractBodyFromDocument(existing.document).trim();
+    return {
+      title: existing.metadata.title,
+      sourceType: existing.metadata.sourceType,
+      url: existing.metadata.url || canonicalDetectedUrl || detectedUrl || null,
+      rawContent: existingBody,
+      extractedContent: existingBody,
+      rawFileName: existing.metadata.rawFileName || "raw.html",
+      lastFetchedAt: existing.metadata.lastFetchedAt || "",
+      existingItem: {
+        id: existing.metadata.id,
+        title: existing.metadata.title,
+        sourceType: existing.metadata.sourceType,
+        url: existing.metadata.url,
+        updatedAt: existing.metadata.updatedAt,
+        lastFetchedAt: existing.metadata.lastFetchedAt
+      },
+      comments: existing.comments || [],
+      sourceUpdatedAt: existing.metadata.sourceUpdatedAt || "",
+      linkedItems: [],
+      refreshJob: existing.metadata.refreshJob || null,
+      parseStatus: "ready",
+      parseNote: "检测到该页面已经在资料库中，当前显示已有内容预览。",
+      contentLength: existingBody.length,
+      pageKind: existing.metadata.pageKind || resolvePageKind(canonicalDetectedUrl, input.pageKind || "auto"),
+      fetchMode: existing.metadata.fetchMode || input.fetchMode || "auto"
+    };
+  }
+
+  if (canonicalDetectedUrl && shouldFetchForPreview(input, pasted)) {
     try {
-      const fetched = input.fetchMode === "webdriver"
-        ? await fetchUrlWithWebdriver(detectedUrl, { pageKind: input.pageKind || "auto" })
-        : await fetchUrl(detectedUrl, { pageKind: input.pageKind || "auto" });
-      title = title || fetched.title || detectedUrl;
+      const fetched = input.fetchMode === "webdriver" || sourceType === "teams"
+        ? await fetchUrlWithWebdriver(canonicalDetectedUrl, { pageKind: input.pageKind || "auto" })
+        : await fetchUrl(canonicalDetectedUrl, { pageKind: input.pageKind || "auto" });
+      title = title || fetched.title || canonicalDetectedUrl;
       rawContent = fetched.raw;
       extractedContent = fetched.text;
       rawFileName = "raw.html";
@@ -340,41 +482,47 @@ async function previewSource(input) {
       input.sourceUpdatedAt = fetched.sourceUpdatedAt || "";
       input.comments = fetched.comments || [];
       parseNote = "网页内容已抓取并过滤为可读文本。";
-      linkedItems = extractPreviewLinkedItems(rawContent, detectedUrl, sourceType, input.pageKind || "auto");
+      linkedItems = extractPreviewLinkedItems(rawContent, canonicalDetectedUrl, sourceType, input.pageKind || "auto");
     } catch (error) {
-      title = title || detectedUrl;
-      rawContent = pasted || detectedUrl;
+      title = title || canonicalDetectedUrl;
+      rawContent = pasted || canonicalDetectedUrl;
       extractedContent = pasted || `无法直接抓取该页面。可以粘贴页面正文后再解析。\n\n错误：${error.message}`;
       parseStatus = "needs-review";
       parseNote = "页面可能需要登录或 webdriver。当前保留你粘贴的内容供确认。";
     }
-  } else if (detectedUrl && looksLikeHtml(pasted)) {
-    const adapter = detectSourceAdapter(detectedUrl);
-    const extracted = extractByAdapter(pasted, detectedUrl, adapter, input.pageKind || "auto");
-    title = title || extracted.title || detectedUrl;
+  } else if (canonicalDetectedUrl && looksLikeHtml(pasted)) {
+    const adapter = detectSourceAdapter(canonicalDetectedUrl);
+    const extracted = extractByAdapter(pasted, canonicalDetectedUrl, adapter, input.pageKind || "auto");
+    title = title || extracted.title || canonicalDetectedUrl;
     rawContent = pasted;
     extractedContent = extracted.text;
     rawFileName = "raw.html";
     input.comments = extracted.comments || [];
     input.sourceUpdatedAt = extracted.sourceUpdatedAt || "";
-    linkedItems = extractPreviewLinkedItems(rawContent, detectedUrl, sourceType, input.pageKind || "auto");
+    linkedItems = extractPreviewLinkedItems(rawContent, canonicalDetectedUrl, sourceType, input.pageKind || "auto");
     parseNote = "已按对应站点规则解析粘贴的 HTML 内容。";
   }
 
   title = title || inferTitle(extractedContent) || "Untitled material";
-  const resolvedPageKind = resolvePageKind(detectedUrl, input.pageKind || "auto");
-  if (detectedUrl && resolvedPageKind === "list") {
-    refreshJob = await ensureRefreshJobForListUrl(detectedUrl, {
+  const resolvedPageKind = resolvePageKind(canonicalDetectedUrl, input.pageKind || "auto");
+  if (canonicalDetectedUrl && resolvedPageKind === "list") {
+    refreshJob = await ensureRefreshJobForListUrl(canonicalDetectedUrl, {
       title,
       sourceType,
       fetchMode: input.fetchMode || "auto"
+    });
+  } else if (canonicalDetectedUrl && sourceType === "teams") {
+    refreshJob = await ensureRefreshJobForContentUrl(canonicalDetectedUrl, {
+      title,
+      sourceType,
+      fetchMode: input.fetchMode || "webdriver"
     });
   }
 
   return {
     title,
     sourceType,
-    url: detectedUrl || null,
+    url: canonicalDetectedUrl || detectedUrl || null,
     rawContent,
     extractedContent,
     rawFileName,
@@ -506,13 +654,24 @@ async function refreshItem(id) {
   const sourceChanged = nextSourceUpdatedAt
     && normalizeSourceUpdatedAt(nextSourceUpdatedAt) !== normalizeSourceUpdatedAt(item.metadata.sourceUpdatedAt || "");
   const contentChanged = previousBody !== currentBody;
+  const hasUpdate = Boolean(sourceChanged || contentChanged);
+  const updateSummary = hasUpdate
+    ? await buildUpdateSummaryWithAi(previousBody, currentBody, {
+      generatedAt: now,
+      sourceUpdatedAt: nextSourceUpdatedAt,
+      title: item.metadata.title || fetched.title,
+      sourceType: item.metadata.sourceType
+    })
+    : item.metadata.updateSummary || null;
   const metadata = {
     ...item.metadata,
     title: item.metadata.title || fetched.title,
     updatedAt: now,
     lastFetchedAt: now,
     sourceUpdatedAt: nextSourceUpdatedAt,
-    contentUpdatedAt: sourceChanged || contentChanged ? now : item.metadata.contentUpdatedAt || "",
+    contentUpdatedAt: hasUpdate ? now : item.metadata.contentUpdatedAt || "",
+    updateSummary,
+    processedStale: hasUpdate && item.metadata.processedAt ? true : item.metadata.processedStale || false,
     refreshNote: {
       previousDocumentLength: previousLength,
       currentDocumentLength: fetched.text.length,
@@ -531,19 +690,20 @@ async function refreshItem(id) {
 }
 
 async function fetchForMetadata(metadata) {
-  if (metadata.fetchMode === "webdriver" || metadata.sourceType === "jira") {
+  if (metadata.fetchMode === "webdriver" || metadata.sourceType === "jira" || metadata.sourceType === "teams") {
     return fetchUrlWithWebdriver(metadata.url, { pageKind: metadata.pageKind || "auto" });
   }
   return fetchUrl(metadata.url, { pageKind: metadata.pageKind || "auto" });
 }
 
 async function upsertFetchedItem(input) {
-  const existing = await findItemByUrl(input.url);
+  const itemUrl = canonicalizeMaterialUrl(input.url || "");
+  const existing = await findItemByUrl(itemUrl);
   if (!existing) {
     return createItem({
       title: input.title,
       sourceType: input.sourceType,
-      url: input.url,
+      url: itemUrl,
       tags: input.tags,
       rawContent: input.raw,
       extractedContent: input.text,
@@ -575,16 +735,27 @@ async function upsertFetchedItem(input) {
   const sourceChanged = nextSourceUpdatedAt
     && normalizeSourceUpdatedAt(nextSourceUpdatedAt) !== normalizeSourceUpdatedAt(item.metadata.sourceUpdatedAt || "");
   const contentChanged = previousBody !== currentBody;
+  const hasUpdate = Boolean(sourceChanged || contentChanged);
+  const updateSummary = hasUpdate
+    ? await buildUpdateSummaryWithAi(previousBody, currentBody, {
+      generatedAt: input.fetchedAt,
+      sourceUpdatedAt: nextSourceUpdatedAt,
+      title: input.title || item.metadata.title,
+      sourceType: input.sourceType || item.metadata.sourceType
+    })
+    : item.metadata.updateSummary || null;
   const metadata = {
     ...item.metadata,
     title: input.title || item.metadata.title,
     sourceType: input.sourceType || item.metadata.sourceType,
-    url: input.url,
-    tags: mergeTags(item.metadata.tags || [], input.tags || []),
+    url: itemUrl,
+    tags: item.metadata.tags || [],
     updatedAt: input.fetchedAt,
     lastFetchedAt: input.fetchedAt,
     sourceUpdatedAt: nextSourceUpdatedAt,
-    contentUpdatedAt: sourceChanged || contentChanged ? input.fetchedAt : item.metadata.contentUpdatedAt || "",
+    contentUpdatedAt: hasUpdate ? input.fetchedAt : item.metadata.contentUpdatedAt || "",
+    updateSummary,
+    processedStale: hasUpdate && item.metadata.processedAt ? true : item.metadata.processedStale || false,
     rawFileName: item.metadata.rawFileName || "raw.html",
     pageKind: input.pageKind || item.metadata.pageKind || null,
     fetchMode: input.fetchMode || item.metadata.fetchMode || null,
@@ -619,26 +790,166 @@ async function findItemByUrl(url) {
 
 function shouldSkipContentRefresh(existingMetadata, listUpdatedAt) {
   if (!existingMetadata || !listUpdatedAt || !existingMetadata.sourceUpdatedAt) return false;
-  const existingTime = Date.parse(existingMetadata.sourceUpdatedAt);
+  if (isSameRelativeSourceDay(existingMetadata.sourceUpdatedAt, existingMetadata.lastFetchedAt, listUpdatedAt)) return true;
+  const existingTime = parseSourceUpdatedAt(existingMetadata.sourceUpdatedAt, existingMetadata.lastFetchedAt);
   const listTime = Date.parse(listUpdatedAt);
   if (!Number.isNaN(existingTime) && !Number.isNaN(listTime)) {
-    return existingTime >= listTime;
+    return existingTime >= listTime || Math.abs(existingTime - listTime) <= 60 * 1000;
   }
-  return normalizeSourceUpdatedAt(existingMetadata.sourceUpdatedAt) === normalizeSourceUpdatedAt(listUpdatedAt);
+  return normalizeSourceUpdatedAt(existingMetadata.sourceUpdatedAt, existingMetadata.lastFetchedAt) === normalizeSourceUpdatedAt(listUpdatedAt);
 }
 
-function normalizeSourceUpdatedAt(value) {
+function buildUpdateSummary(previousText, currentText, options = {}) {
+  const previousLines = comparableContentLines(previousText);
+  const currentLines = comparableContentLines(currentText);
+  const previousSet = new Set(previousLines.map((line) => line.key));
+  const currentSet = new Set(currentLines.map((line) => line.key));
+  const added = currentLines
+    .filter((line) => !previousSet.has(line.key))
+    .map((line) => line.text)
+    .slice(0, 30);
+  const removed = previousLines
+    .filter((line) => !currentSet.has(line.key))
+    .map((line) => line.text)
+    .slice(0, 30);
+
+  return {
+    generatedAt: options.generatedAt || new Date().toISOString(),
+    sourceUpdatedAt: cleanText(options.sourceUpdatedAt || ""),
+    previousLength: String(previousText || "").length,
+    currentLength: String(currentText || "").length,
+    lengthDelta: String(currentText || "").length - String(previousText || "").length,
+    added,
+    removed,
+    addedCount: added.length,
+    removedCount: removed.length
+  };
+}
+
+async function buildUpdateSummaryWithAi(previousText, currentText, options = {}) {
+  const summary = buildUpdateSummary(previousText, currentText, options);
+  if (!settings.ai?.baseUrl || !settings.ai?.apiKey || !settings.ai?.model) {
+    return summary;
+  }
+  try {
+    const aiSummary = await summarizeUpdateWithOpenAICompatible(previousText, currentText, summary, options);
+    return {
+      ...summary,
+      aiSummary,
+      aiSummaryModel: settings.ai.model,
+      aiSummaryGeneratedAt: new Date().toISOString()
+    };
+  } catch (error) {
+    return {
+      ...summary,
+      aiSummaryError: error.message
+    };
+  }
+}
+
+async function summarizeUpdateWithOpenAICompatible(previousText, currentText, summary, options = {}) {
+  const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${settings.ai.apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: settings.ai.model,
+      temperature: 0.2,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "你是资料库更新分析助手。",
+            "请用中文总结这次资料更新，重点说明新增信息、删除/变化的信息、影响、下一步或需要关注的问题。",
+            "保持简洁，输出 3 到 6 条要点，不要复述完整原文。"
+          ].join("\n")
+        },
+        {
+          role: "user",
+          content: [
+            `标题：${options.title || ""}`,
+            `来源：${options.sourceType || ""}`,
+            `来源更新时间：${summary.sourceUpdatedAt || ""}`,
+            `长度变化：${summary.lengthDelta}`,
+            "",
+            "检测到的新增内容：",
+            (summary.added || []).slice(0, 20).map((line) => `- ${line}`).join("\n") || "无",
+            "",
+            "检测到的删除内容：",
+            (summary.removed || []).slice(0, 20).map((line) => `- ${line}`).join("\n") || "无",
+            "",
+            "更新前内容片段：",
+            String(previousText || "").slice(0, 6000),
+            "",
+            "更新后内容片段：",
+            String(currentText || "").slice(0, 9000)
+          ].join("\n")
+        }
+      ]
+    })
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`AI 更新总结失败：${response.status} ${text.slice(0, 300)}`);
+  const payload = JSON.parse(text);
+  return cleanText(payload.choices?.[0]?.message?.content || "");
+}
+
+function comparableContentLines(text) {
+  return String(text || "")
+    .split(/\n+/)
+    .map((line) => cleanText(line.replace(/^[-*#>`\s]+/, "")))
+    .filter((line) => line.length >= 3)
+    .filter((line) => !/^(source|adapter|url|updated|source updated|latest message):/i.test(line))
+    .map((text) => ({
+      text,
+      key: text.toLowerCase().replace(/\s+/g, " ")
+    }));
+}
+
+function isSameRelativeSourceDay(existingValue, referenceDate, listValue) {
+  if (!/^(today|yesterday)$/i.test(cleanText(existingValue))) return false;
+  const existingTime = parseSourceUpdatedAt(existingValue, referenceDate);
+  const listTime = Date.parse(listValue);
+  if (Number.isNaN(existingTime) || Number.isNaN(listTime)) return false;
+  return toDateKey(existingTime) === toDateKey(listTime);
+}
+
+function toDateKey(timestamp) {
+  const date = new Date(timestamp);
+  return `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`;
+}
+
+function normalizeSourceUpdatedAt(value, referenceDate = "") {
   const clean = cleanText(value);
   if (!clean) return "";
-  const parsed = Date.parse(clean);
+  const parsed = parseSourceUpdatedAt(clean, referenceDate);
   if (!Number.isNaN(parsed)) return new Date(parsed).toISOString();
   return clean.toLowerCase().replace(/\s+/g, " ");
 }
 
+function parseSourceUpdatedAt(value, referenceDate = "") {
+  const clean = cleanText(value);
+  if (!clean) return Number.NaN;
+  const parsed = Date.parse(clean);
+  if (!Number.isNaN(parsed)) return parsed;
+
+  const reference = Date.parse(referenceDate);
+  if (Number.isNaN(reference)) return Number.NaN;
+  const referenceDay = new Date(reference);
+  referenceDay.setHours(0, 0, 0, 0);
+  if (/^yesterday$/i.test(clean)) return referenceDay.getTime() - 24 * 60 * 60 * 1000;
+  if (/^today$/i.test(clean)) return referenceDay.getTime();
+  return Number.NaN;
+}
+
 async function ensureRefreshJobForListUrl(url, options = {}) {
-  const adapter = detectSourceAdapter(url);
-  if (resolvePageKind(url, "auto") !== "list") return null;
-  const normalizedUrl = normalizeUrlForMatch(url);
+  const canonicalUrl = canonicalizeMaterialUrl(url);
+  const adapter = detectSourceAdapter(canonicalUrl);
+  if (resolvePageKind(canonicalUrl, "auto") !== "list") return null;
+  const normalizedUrl = normalizeUrlForMatch(canonicalUrl);
   const existing = (settings.refreshJobs || []).find((job) => normalizeUrlForMatch(job.url) === normalizedUrl);
   if (existing) {
     return {
@@ -653,13 +964,13 @@ async function ensureRefreshJobForListUrl(url, options = {}) {
   }
 
   const job = normalizeRefreshJob({
-    id: defaultRefreshJobIdForListUrl(url, adapter),
-    name: defaultRefreshJobNameForListUrl(url, options.title),
-    url,
+    id: defaultRefreshJobIdForListUrl(canonicalUrl, adapter),
+    name: defaultRefreshJobNameForListUrl(canonicalUrl, options.title),
+    url: canonicalUrl,
     enabled: false,
     intervalMinutes: 60,
     maxItems: 50,
-    tags: defaultRefreshTagsForListUrl(url, adapter),
+    tags: defaultRefreshTagsForListUrl(canonicalUrl, adapter),
     fetchMode: defaultRefreshFetchModeForAdapter(adapter, options.fetchMode),
     pageKind: "list",
     status: "idle",
@@ -685,6 +996,70 @@ async function ensureRefreshJobForListUrl(url, options = {}) {
     maxItems: job.maxItems,
     created: true
   };
+}
+
+async function ensureRefreshJobForContentUrl(url, options = {}) {
+  const canonicalUrl = canonicalizeMaterialUrl(url);
+  const adapter = detectSourceAdapter(canonicalUrl);
+  const normalizedUrl = normalizeUrlForMatch(canonicalUrl);
+  const existing = (settings.refreshJobs || []).find((job) => normalizeUrlForMatch(job.url) === normalizedUrl);
+  if (existing) {
+    return {
+      id: existing.id,
+      name: existing.name,
+      url: existing.url,
+      enabled: Boolean(existing.enabled),
+      intervalMinutes: existing.intervalMinutes,
+      maxItems: existing.maxItems,
+      created: false
+    };
+  }
+
+  const job = normalizeRefreshJob({
+    id: defaultRefreshJobIdForContentUrl(canonicalUrl, adapter),
+    name: defaultRefreshJobNameForContentUrl(canonicalUrl, options.title),
+    url: canonicalUrl,
+    enabled: false,
+    intervalMinutes: 60,
+    maxItems: 1,
+    tags: [],
+    fetchMode: defaultRefreshFetchModeForAdapter(adapter, options.fetchMode),
+    pageKind: "content",
+    status: "idle",
+    lastRunAt: "",
+    lastStartedAt: "",
+    lastError: "",
+    lastResult: null
+  }, {});
+
+  settings = {
+    ...settings,
+    refreshJobs: mergeRefreshJobs(settings.refreshJobs || [], [job])
+  };
+  await fs.mkdir(configDir, { recursive: true });
+  await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+
+  return {
+    id: job.id,
+    name: job.name,
+    url: job.url,
+    enabled: job.enabled,
+    intervalMinutes: job.intervalMinutes,
+    maxItems: job.maxItems,
+    created: true
+  };
+}
+
+function defaultRefreshJobIdForContentUrl(url, adapter) {
+  if (adapter.sourceType === "teams") return `${slugify(adapter.hostname)}-conversation-${slugify(url).slice(0, 64)}`;
+  return `${slugify(adapter.hostname || adapter.sourceType)}-content-${slugify(url).slice(0, 64)}`;
+}
+
+function defaultRefreshJobNameForContentUrl(url, title) {
+  const adapter = detectSourceAdapter(url);
+  if (title && title !== url) return `${title} refresh`;
+  if (adapter.sourceType === "teams") return "Teams conversation refresh";
+  return "Content refresh";
 }
 
 function defaultRefreshJobIdForListUrl(url, adapter) {
@@ -713,21 +1088,12 @@ function defaultRefreshJobNameForListUrl(url, title) {
 }
 
 function defaultRefreshTagsForListUrl(url, adapter) {
-  const tags = [adapter.sourceType, `${adapter.sourceType}-filter`];
-  try {
-    const parsed = new URL(url);
-    const query = parsed.searchParams.get("query") || "";
-    const reason = query.match(/reason:([^\s]+)/i)?.[1];
-    if (reason) tags.push(reason);
-  } catch {
-    // Tags are best-effort.
-  }
-  return normalizeTags(tags);
+  return [];
 }
 
 function defaultRefreshFetchModeForAdapter(adapter, requestedMode) {
   if (requestedMode === "fetch" || requestedMode === "webdriver") return requestedMode;
-  return adapter.sourceType === "jira" ? "webdriver" : "fetch";
+  return adapter.sourceType === "jira" || adapter.sourceType === "teams" ? "webdriver" : "fetch";
 }
 
 async function importLinkedItemsFromList(input) {
@@ -749,11 +1115,11 @@ async function importLinkedItemsFromList(input) {
         title: fetched.title || link.title || link.key || contentUrl,
         sourceType: adapter.sourceType,
         url: fetched.url ? normalizeContentFetchUrl(fetched.url, adapter) : contentUrl,
-        tags: mergeTags(input.tags || [], [adapter.sourceType, link.key || link.number ? `${link.key || link.number}`.toLowerCase() : "content"]),
+        tags: normalizeTags(input.tags || []),
         raw: fetched.raw,
         text: fetched.text,
         comments: fetched.comments || [],
-        sourceUpdatedAt: fetched.sourceUpdatedAt || listUpdatedAt,
+        sourceUpdatedAt: listUpdatedAt || fetched.sourceUpdatedAt,
         fetchedAt: new Date().toISOString(),
         pageKind: "content",
         fetchMode,
@@ -798,6 +1164,103 @@ async function updateTags(id, tags) {
   return readItem(id);
 }
 
+async function updateTitle(id, title) {
+  const item = await readItem(id);
+  const nextTitle = cleanText(title).slice(0, 180);
+  if (!nextTitle) throw new Error("标题不能为空。");
+  const metadata = {
+    ...item.metadata,
+    title: nextTitle,
+    updatedAt: new Date().toISOString()
+  };
+  await fs.writeFile(path.join(itemsDir, id, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+  await fs.writeFile(path.join(itemsDir, id, "document.md"), renderDocument(metadata, extractBodyFromDocument(item.document), extractSummaryFromDocument(item.document)), "utf8");
+  await rebuildIndexes();
+  return readItem(id);
+}
+
+async function updateTitleWithAi(id) {
+  const item = await readItem(id);
+  const title = settings.ai?.baseUrl && settings.ai?.apiKey && settings.ai?.model
+    ? await recommendTitleWithOpenAICompatible(item)
+    : recommendTitleLocally(item);
+  return updateTitle(id, title);
+}
+
+async function recommendTitleWithOpenAICompatible(item) {
+  const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
+  const endpoint = `${baseUrl}/chat/completions`;
+  const body = extractBodyFromDocument(item.document).trim().slice(0, 12000);
+  const supplemental = await supplementalPromptBlock();
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${settings.ai.apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: settings.ai.model,
+      temperature: 0.2,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "你是知识库资料标题生成助手。",
+            "根据资料正文生成一个便于检索的中文标题，主要描述内容涉及的核心对象、问题或主题。",
+            "要求：不要复述冗长原始标题；不要使用 Markdown；不要加引号；长度控制在 12 到 40 个中文字符左右。",
+            supplemental
+          ].join("\n")
+        },
+        {
+          role: "user",
+          content: [
+            `来源类型：${item.metadata.sourceType || "unknown"}`,
+            `原标题：${item.metadata.title || ""}`,
+            "",
+            "正文：",
+            body
+          ].join("\n")
+        }
+      ]
+    })
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`AI 标题生成失败：${response.status} ${text.slice(0, 300)}`);
+  const data = JSON.parse(text);
+  return cleanGeneratedTitle(data.choices?.[0]?.message?.content || "");
+}
+
+function recommendTitleLocally(item) {
+  const body = extractBodyFromDocument(item.document);
+  const lines = body.split(/\n+/)
+    .map((line) => cleanText(line.replace(/^[-#*>`\s]+/, "")))
+    .filter((line) => line.length >= 6 && !/^source:|^adapter:|^url:/i.test(line));
+  return cleanGeneratedTitle(lines[0] || item.metadata.title || "未命名资料");
+}
+
+function cleanGeneratedTitle(title) {
+  return cleanText(String(title || "")
+    .replace(/^#+\s*/, "")
+    .replace(/^["'“”‘’]+|["'“”‘’]+$/g, "")
+    .replace(/^标题[:：]\s*/i, ""))
+    .slice(0, 180) || "未命名资料";
+}
+
+async function acknowledgeItemUpdate(id) {
+  const item = await readItem(id);
+  if (!item.metadata.contentUpdatedAt) return item;
+
+  const metadata = {
+    ...item.metadata,
+    contentUpdatedAt: "",
+    updateAcknowledgedAt: new Date().toISOString()
+  };
+  await fs.writeFile(path.join(itemsDir, id, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+  await fs.writeFile(path.join(itemsDir, id, "document.md"), renderDocument(metadata, extractBodyFromDocument(item.document), extractSummaryFromDocument(item.document)), "utf8");
+  await rebuildIndexes();
+  return readItem(id);
+}
+
 async function recommendTagsForItem(id) {
   const item = await readItem(id);
   const allTags = (await listTags()).map((tag) => tag.name);
@@ -832,8 +1295,386 @@ async function recommendTagsForItem(id) {
   };
 }
 
+async function recommendTagsForItems(ids) {
+  const uniqueIds = [...new Set((ids || []).map((id) => cleanText(id)).filter(Boolean))].slice(0, 80);
+  if (!uniqueIds.length) return { tags: [], assignments: [] };
+  const items = [];
+  for (const id of uniqueIds) {
+    try {
+      items.push(await readItem(id));
+    } catch {
+      // Ignore deleted or invalid items in a long-running batch.
+    }
+  }
+  const allTags = (await listTags()).map((tag) => tag.name);
+  const result = settings.ai?.baseUrl && settings.ai?.apiKey && settings.ai?.model
+    ? await recommendBatchTagsWithOpenAICompatible(items, allTags)
+    : recommendBatchTagsLocally(items, allTags);
+  return normalizeBatchTagRecommendations(result, items, allTags);
+}
+
+async function recommendBatchTagsWithOpenAICompatible(items, allTags) {
+  const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
+  const supplemental = await supplementalPromptBlock();
+  const documents = items.map((item) => {
+    const processed = item.processedDocument
+      ? extractProcessedBodyFromDocument(item.processedDocument)
+      : "";
+    const source = processed || extractBodyFromDocument(item.document);
+    return [
+      `ID: ${item.metadata.id}`,
+      `标题: ${item.metadata.title}`,
+      `来源: ${item.metadata.sourceType}`,
+      `当前标签: ${(item.metadata.tags || []).join(", ") || "none"}`,
+      "内容:",
+      source.slice(0, 3500)
+    ].join("\n");
+  }).join("\n\n---\n\n");
+
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${settings.ai.apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: settings.ai.model,
+      temperature: 0.1,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "你是资料库批量标签分类助手。",
+            "请根据一批文档的整体主题、来源、状态、问题类型和行动项，设计统一的标签池，并给每篇文档分配适合的标签。",
+            "优先复用已有标签；同义标签必须合并，只保留一种写法。",
+            "标签使用小写短词、数字或连字符，不要包含空格。",
+            "不要给每篇文档都创造独有标签；优先生成能横向分类多篇文档的标签。",
+            "只返回 JSON，格式为 {\"tags\":[\"tag-a\"],\"assignments\":[{\"id\":\"item-id\",\"tags\":[\"tag-a\"]}]}。",
+            supplemental
+          ].filter(Boolean).join("\n")
+        },
+        {
+          role: "user",
+          content: [
+            `资料库已有标签：${allTags.join(", ") || "none"}`,
+            "",
+            "待分类文档：",
+            documents
+          ].join("\n")
+        }
+      ]
+    })
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`AI 批量标签推荐失败：${response.status} ${text.slice(0, 300)}`);
+  const payload = JSON.parse(text);
+  return parseJsonObjectFromText(payload.choices?.[0]?.message?.content || "");
+}
+
+function recommendBatchTagsLocally(items, allTags) {
+  const assignments = items.map((item) => {
+    const content = [
+      item.metadata.title,
+      item.processedDocument || item.document
+    ].join("\n");
+    return {
+      id: item.metadata.id,
+      tags: recommendTagsLocally(content, allTags, item.metadata.tags || [])
+    };
+  });
+  return {
+    tags: uniqueValues(assignments.flatMap((assignment) => assignment.tags)),
+    assignments
+  };
+}
+
+function normalizeBatchTagRecommendations(result, items, allTags) {
+  const itemIds = new Set(items.map((item) => item.metadata.id));
+  const knownTags = new Map(allTags.map((tag) => [tag.toLowerCase(), tag]));
+  const canonicalize = (tags) => normalizeTags(tags || []).map((tag) => knownTags.get(tag.toLowerCase()) || tag);
+  const assignments = (result.assignments || [])
+    .filter((assignment) => itemIds.has(assignment.id))
+    .map((assignment) => ({
+      id: assignment.id,
+      tags: uniqueValues(canonicalize(assignment.tags)).slice(0, 12)
+    }));
+  const assignedIds = new Set(assignments.map((assignment) => assignment.id));
+  for (const item of items) {
+    if (!assignedIds.has(item.metadata.id)) {
+      assignments.push({ id: item.metadata.id, tags: [] });
+    }
+  }
+  const tags = uniqueValues([
+    ...canonicalize(result.tags || []),
+    ...assignments.flatMap((assignment) => assignment.tags)
+  ]).slice(0, 40);
+  return { tags, assignments };
+}
+
+async function classifyItems(ids, categories = []) {
+  const uniqueIds = [...new Set((ids || []).map((id) => cleanText(id)).filter(Boolean))].slice(0, 120);
+  const normalizedCategories = normalizeClassificationCategories(categories);
+  const items = [];
+  for (const id of uniqueIds) {
+    try {
+      items.push(await readItem(id));
+    } catch {
+      // Ignore items deleted while a list classification request is running.
+    }
+  }
+  if (!items.length) return { groups: [], note: "当前列表没有可分类的资料。" };
+  const result = settings.ai?.baseUrl && settings.ai?.apiKey && settings.ai?.model
+    ? await classifyItemsWithOpenAICompatible(items, normalizedCategories)
+    : classifyItemsLocally(items, normalizedCategories);
+  return normalizeItemClassification(result, items, normalizedCategories);
+}
+
+async function classifyItem(id, categories = []) {
+  const normalizedCategories = normalizeClassificationCategories(categories);
+  if (!normalizedCategories.length) {
+    throw new Error("请先提供分类类别。");
+  }
+  const item = await readItem(cleanText(id));
+  if (!settings.ai?.baseUrl || !settings.ai?.apiKey || !settings.ai?.model) {
+    return classifyItemLocally(item, normalizedCategories);
+  }
+  return classifyItemWithOpenAICompatible(item, normalizedCategories);
+}
+
+async function classifyItemsWithOpenAICompatible(items, categories = []) {
+  const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
+  const supplemental = await supplementalPromptBlock();
+  const documents = items.map((item) => {
+    const processed = item.processedDocument
+      ? extractProcessedBodyFromDocument(item.processedDocument)
+      : "";
+    const source = processed || extractBodyFromDocument(item.document);
+    return [
+      `ID: ${item.metadata.id}`,
+      `标题: ${item.metadata.title}`,
+      `来源: ${item.metadata.sourceType || "unknown"}`,
+      `标签: ${(item.metadata.tags || []).join(", ") || "none"}`,
+      "内容摘要:",
+      source.slice(0, 1800)
+    ].join("\n");
+  }).join("\n\n---\n\n");
+
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${settings.ai.apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: settings.ai.model,
+      temperature: 0.1,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "你是资料库列表分类助手。",
+            categories.length
+              ? "用户已经给出固定类别。你必须逐条阅读资料，并且只把资料分配到这些类别中；不能新增类别。确实不适合任何类别时才放到“未分类”。"
+              : "请把当前资料列表按主题、项目、问题类型或工作流分成适合浏览的分类。",
+            categories.length ? "" : "分类数量通常为 3 到 10 个；避免每篇文档单独一个分类。",
+            "每个资料 ID 最多出现一次，尽量覆盖所有资料。",
+            "分类名要短且清晰，适合显示在左侧列表。",
+            "只返回 JSON，格式为 {\"groups\":[{\"name\":\"分类名\",\"itemIds\":[\"item-id\"],\"reason\":\"分类依据\"}]}。",
+            supplemental
+          ].filter(Boolean).join("\n")
+        },
+        {
+          role: "user",
+          content: [
+            `当前列表共有 ${items.length} 条资料。`,
+            categories.length ? `可用类别：${categories.join("、")}、未分类` : "",
+            "",
+            documents
+          ].filter(Boolean).join("\n")
+        }
+      ]
+    })
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`AI 列表分类失败：${response.status} ${text.slice(0, 300)}`);
+  const payload = JSON.parse(text);
+  return parseJsonObjectFromText(payload.choices?.[0]?.message?.content || "");
+}
+
+async function classifyItemWithOpenAICompatible(item, categories) {
+  const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
+  const supplemental = await supplementalPromptBlock();
+  const processed = item.processedDocument
+    ? extractProcessedBodyFromDocument(item.processedDocument)
+    : "";
+  const source = processed || extractBodyFromDocument(item.document);
+
+  let response;
+  try {
+    response = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${settings.ai.apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: settings.ai.model,
+        temperature: 0.1,
+        messages: [
+          {
+            role: "system",
+            content: [
+              "你是资料库单条资料分类助手。",
+              "请阅读资料内容，并且只从用户提供的类别中选择一个最合适的类别。",
+              "如果资料确实不适合任何类别，返回“未分类”。不能新增类别，不能改写类别名。",
+              "只返回 JSON，格式为 {\"category\":\"类别名\",\"reason\":\"一句话分类依据\"}。",
+              supplemental
+            ].filter(Boolean).join("\n")
+          },
+          {
+            role: "user",
+            content: [
+              `可用类别：${categories.join("、")}、未分类`,
+              `ID: ${item.metadata.id}`,
+              `标题: ${item.metadata.title}`,
+              `来源: ${item.metadata.sourceType || "unknown"}`,
+              `标签: ${(item.metadata.tags || []).join(", ") || "none"}`,
+              "",
+              "内容：",
+              source.slice(0, 5000)
+            ].join("\n")
+          }
+        ]
+      })
+    });
+  } catch (error) {
+    throw new Error(`AI 单条分类请求失败：${error.message}`);
+  }
+
+  const text = await response.text();
+  if (!response.ok) throw new Error(`AI 单条分类失败：${response.status} ${text.slice(0, 300)}`);
+  const payload = JSON.parse(text);
+  const parsed = parseJsonObjectFromText(payload.choices?.[0]?.message?.content || "");
+  return normalizeSingleClassification(parsed, item, categories);
+}
+
+function classifyItemLocally(item, categories) {
+  const content = [
+    item.metadata.title,
+    item.metadata.sourceType,
+    ...(item.metadata.tags || []),
+    extractBodyFromDocument(item.document).slice(0, 2000)
+  ].join("\n").toLowerCase();
+  const matchedCategory = categories.find((category) => content.includes(category.toLowerCase()));
+  return {
+    id: item.metadata.id,
+    category: matchedCategory || "未分类",
+    reason: matchedCategory ? "按类别关键词本地匹配。" : "未配置 AI，且未命中类别关键词。"
+  };
+}
+
+function classifyItemsLocally(items, categories = []) {
+  const groupsByName = new Map();
+  for (const item of items) {
+    const tags = item.metadata.tags || [];
+    const content = [
+      item.metadata.title,
+      item.metadata.sourceType,
+      ...(item.metadata.tags || []),
+      extractBodyFromDocument(item.document).slice(0, 1200)
+    ].join("\n").toLowerCase();
+    const matchedCategory = categories.find((category) => content.includes(category.toLowerCase()));
+    const name = matchedCategory || tags[0] || sourceTypeLabel(item.metadata.sourceType) || "未分类";
+    if (!groupsByName.has(name)) {
+      groupsByName.set(name, {
+        name,
+        itemIds: [],
+        reason: categories.length
+          ? "未配置 AI，当前按类别关键词本地匹配。"
+          : tags[0] ? "按已有标签分组。" : "未配置 AI，按来源类型分组。"
+      });
+    }
+    groupsByName.get(name).itemIds.push(item.metadata.id);
+  }
+  return {
+    groups: [...groupsByName.values()],
+    note: categories.length
+      ? "未配置 AI 接口，当前按自定义类别关键词本地匹配。"
+      : "未配置 AI 接口，当前按标签或来源本地分类。"
+  };
+}
+
+function sourceTypeLabel(sourceType) {
+  const labels = {
+    text: "文本",
+    web: "网页",
+    confluence: "Confluence",
+    jira: "Jira",
+    github: "GitHub",
+    teams: "Teams"
+  };
+  return labels[sourceType] || sourceType || "";
+}
+
+function normalizeClassificationCategories(categories) {
+  return uniqueValues((categories || [])
+    .map((category) => cleanText(category).slice(0, 40))
+    .filter(Boolean))
+    .slice(0, 24);
+}
+
+function normalizeSingleClassification(result, item, categories) {
+  const categoryByLower = new Map(categories.map((category) => [category.toLowerCase(), category]));
+  const rawCategory = cleanText(result.category || result.name || "").slice(0, 40);
+  const category = categoryByLower.get(rawCategory.toLowerCase()) || (rawCategory === "未分类" ? "未分类" : "未分类");
+  return {
+    id: item.metadata.id,
+    category,
+    reason: cleanText(result.reason || "").slice(0, 120)
+  };
+}
+
+function normalizeItemClassification(result, items, categories = []) {
+  const itemIds = new Set(items.map((item) => item.metadata.id));
+  const categoryByLower = new Map(categories.map((category) => [category.toLowerCase(), category]));
+  const assigned = new Set();
+  const groupsByName = new Map();
+  const addGroupItems = (name, itemIds, reason = "") => {
+    if (!groupsByName.has(name)) {
+      groupsByName.set(name, { name, itemIds: [], reason });
+    }
+    const group = groupsByName.get(name);
+    group.itemIds.push(...itemIds);
+    if (!group.reason && reason) group.reason = reason;
+  };
+  for (const group of result.groups || []) {
+    const ids = uniqueValues((group.itemIds || group.items || [])
+      .map((id) => cleanText(typeof id === "string" ? id : id?.id))
+      .filter((id) => itemIds.has(id) && !assigned.has(id)));
+    if (!ids.length) continue;
+    ids.forEach((id) => assigned.add(id));
+    const rawName = cleanText(group.name || group.title || "未命名分类").slice(0, 40) || "未命名分类";
+    const name = categories.length
+      ? categoryByLower.get(rawName.toLowerCase()) || (rawName === "未分类" ? "未分类" : "未分类")
+      : rawName;
+    addGroupItems(name, ids, cleanText(group.reason || "").slice(0, 120));
+  }
+  const leftovers = items.map((item) => item.metadata.id).filter((id) => !assigned.has(id));
+  if (leftovers.length) {
+    addGroupItems("未分类", leftovers, "分类结果中未覆盖的资料。");
+  }
+  return {
+    groups: [...groupsByName.values()].map((group) => ({
+      ...group,
+      itemIds: uniqueValues(group.itemIds)
+    })),
+    note: result.note || ""
+  };
+}
+
 async function recommendTagsWithOpenAICompatible({ content, allTags, currentTags }) {
   const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
+  const supplemental = await supplementalPromptBlock();
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers: {
@@ -852,7 +1693,8 @@ async function recommendTagsWithOpenAICompatible({ content, allTags, currentTags
             "优先复用已有标签，只有已有标签明显不合适时才创建新标签。",
             "避免同义但写法不同的标签，例如已有 github 就不要新建 github-issue，已有 jira 就不要新建 jira-ticket。",
             "标签使用小写短词、数字或连字符，不要包含空格。",
-            "只返回 JSON，格式为 {\"tags\":[\"tag-a\",\"tag-b\"]}。"
+            "只返回 JSON，格式为 {\"tags\":[\"tag-a\",\"tag-b\"]}。",
+            supplemental
           ].join("\n")
         },
         {
@@ -892,6 +1734,20 @@ function parseTagsFromAiText(text) {
   return text.split(/[,\n]/).map((tag) => tag.replace(/^[-*\d.\s]+/, "").trim());
 }
 
+function parseJsonObjectFromText(text) {
+  const raw = String(text || "");
+  const jsonText = raw.match(/\{[\s\S]*\}/)?.[0] || raw;
+  try {
+    return JSON.parse(jsonText);
+  } catch {
+    return {};
+  }
+}
+
+function uniqueValues(values) {
+  return [...new Set((values || []).filter(Boolean))];
+}
+
 function recommendTagsLocally(content, allTags, currentTags) {
   const lowerContent = content.toLowerCase();
   const matchedExisting = allTags.filter((tag) => lowerContent.includes(tag.toLowerCase())).slice(0, 8);
@@ -920,6 +1776,101 @@ function normalizeRecommendedTags(tags, allTags, currentTags = []) {
   }).slice(0, 10);
 }
 
+async function processItemWithAi(id) {
+  const item = await readItem(id);
+  if (!settings.ai?.baseUrl || !settings.ai?.apiKey || !settings.ai?.model) {
+    throw new Error("请先在设置页配置 AI 接口后再生成整理版。");
+  }
+
+  const prompt = resolveProcessingPrompt(item.metadata.sourceType);
+  const processedText = unwrapMarkdownFence(await processDocumentWithOpenAICompatible(item, prompt));
+  const now = new Date().toISOString();
+  const metadata = {
+    ...item.metadata,
+    processedAt: now,
+    processedModel: settings.ai.model,
+    processedPromptSource: item.metadata.sourceType || "default",
+    processedStale: false,
+    updatedAt: now
+  };
+  const itemDir = path.join(itemsDir, id);
+  await fs.writeFile(path.join(itemDir, "processed.md"), renderProcessedDocument(metadata, processedText), "utf8");
+  await fs.writeFile(path.join(itemDir, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+  await rebuildIndexes();
+  return readItem(id);
+}
+
+async function processDocumentWithOpenAICompatible(item, prompt) {
+  const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
+  const endpoint = `${baseUrl}/chat/completions`;
+  const supplemental = await supplementalPromptBlock();
+  const sourceBody = extractBodyFromDocument(item.document).trim();
+  const summary = extractSummaryFromDocument(item.document).trim();
+  const comments = (item.comments || [])
+    .map((comment) => [
+      comment.author ? `Author: ${comment.author}` : "",
+      comment.createdAt ? `Time: ${comment.createdAt}` : "",
+      comment.body || ""
+    ].filter(Boolean).join("\n"))
+    .join("\n\n---\n\n");
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${settings.ai.apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: settings.ai.model,
+      temperature: 0.2,
+      messages: [
+        {
+          role: "system",
+          content: [
+            prompt,
+            "",
+            "输出要求：",
+            "- 使用中文。",
+            "- 输出 Markdown。",
+            "- 只整理资料内容，不编造原文没有的信息。",
+            "- 如果信息不足或状态不明确，要明确写出“不明确”。",
+            "- 保留关键原始标识，例如 Jira key、GitHub issue/PR 编号、URL、时间、人名。",
+            supplemental
+          ].join("\n")
+        },
+        {
+          role: "user",
+          content: [
+            `标题：${item.metadata.title}`,
+            `来源类型：${item.metadata.sourceType}`,
+            `URL：${item.metadata.url || "local input"}`,
+            `标签：${(item.metadata.tags || []).join(", ") || "none"}`,
+            `最后抓取：${item.metadata.lastFetchedAt || "not fetched"}`,
+            `来源更新时间：${item.metadata.sourceUpdatedAt || "unknown"}`,
+            "",
+            summary ? `已有摘要：\n${summary}\n` : "",
+            "原始提取内容：",
+            sourceBody.slice(0, 28000),
+            comments ? `\n\n评论/对话结构化内容：\n${comments.slice(0, 12000)}` : ""
+          ].join("\n")
+        }
+      ]
+    })
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`AI 整理失败：${response.status} ${text.slice(0, 300)}`);
+  }
+
+  const payload = await response.json();
+  const text = payload.choices?.[0]?.message?.content?.trim();
+  if (!text) {
+    throw new Error("AI 接口没有返回可用整理结果。");
+  }
+  return text;
+}
+
 async function readItem(id) {
   if (!id || id.includes("..") || id.includes("/")) {
     throw new Error("Invalid item id.");
@@ -928,9 +1879,11 @@ async function readItem(id) {
   const itemDir = path.join(itemsDir, id);
   const metadata = JSON.parse(await fs.readFile(path.join(itemDir, "metadata.json"), "utf8"));
   const document = await fs.readFile(path.join(itemDir, "document.md"), "utf8");
+  const processedPath = path.join(itemDir, "processed.md");
+  const processedDocument = await exists(processedPath) ? await fs.readFile(processedPath, "utf8") : "";
   const commentsPath = path.join(itemDir, "comments.jsonl");
   const comments = await readJsonLines(commentsPath);
-  return { metadata, document, comments };
+  return { metadata, document, processedDocument, comments };
 }
 
 async function deleteItem(id) {
@@ -956,7 +1909,9 @@ async function listItems(filters = {}) {
     if (!(await exists(metadataPath))) continue;
     const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
     const document = await fs.readFile(path.join(itemsDir, id, "document.md"), "utf8");
-    const searchText = `${metadata.title} ${(metadata.tags || []).join(" ")} ${document}`.toLowerCase();
+    const processedPath = path.join(itemsDir, id, "processed.md");
+    const processedDocument = await exists(processedPath) ? await fs.readFile(processedPath, "utf8") : "";
+    const searchText = `${metadata.title} ${(metadata.tags || []).join(" ")} ${processedDocument} ${document}`.toLowerCase();
 
     if (!isTruthyFilter(filters.includeLists) && metadata.pageKind === "list") continue;
     if (filters.tag && !(metadata.tags || []).includes(filters.tag)) continue;
@@ -966,7 +1921,8 @@ async function listItems(filters = {}) {
 
     items.push({
       ...metadata,
-      excerpt: summarizeExcerpt(document)
+      hasProcessed: Boolean(processedDocument),
+      excerpt: summarizeExcerpt(processedDocument || document)
     });
   }
 
@@ -995,7 +1951,7 @@ async function buildAskContext(question) {
   const selected = results.slice(0, 6).map((result) => result.item);
   const sourceLines = selected.map((item) => {
     const itemPath = `knowledge-base/items/${item.id}`;
-    return `- ${item.title} (${item.sourceType}, tags: ${(item.tags || []).join(", ") || "none"})\n  - metadata: ${itemPath}/metadata.json\n  - document: ${itemPath}/document.md\n  - comments: ${itemPath}/comments.jsonl\n  - url: ${item.url || "local input"}\n  - last fetched: ${item.lastFetchedAt || "not fetched"}`;
+    return `- ${item.title} (${item.sourceType}, tags: ${(item.tags || []).join(", ") || "none"})\n  - metadata: ${itemPath}/metadata.json\n  - processed: ${itemPath}/processed.md（如果存在，优先阅读）\n  - document: ${itemPath}/document.md\n  - comments: ${itemPath}/comments.jsonl\n  - url: ${item.url || "local input"}\n  - last fetched: ${item.lastFetchedAt || "not fetched"}`;
   });
 
   const prompt = `请基于当前项目目录里的 knowledge-base 回答这个问题：
@@ -1007,7 +1963,7 @@ ${sourceLines.join("\n") || "- knowledge-base/indexes/by-updated.json\n- knowled
 
 回答要求：
 - 先给结论，再列关键依据。
-- 需要查原文时读取 document.md、comments.jsonl 和 raw 文件。
+- 优先读取 processed.md；需要查原文时读取 document.md、comments.jsonl 和 raw 文件。
 - 引用资料时带上 item id、URL 和 lastFetchedAt。
 - 如果资料可能过期，明确提醒。`;
 
@@ -1079,10 +2035,12 @@ URL: ${source.url || "local input"}
 标签: ${(source.tags || []).join(", ") || "none"}
 最后抓取: ${source.lastFetchedAt || "not fetched"}
 文件: ${source.paths.document}
+整理版: ${source.paths.processed || "not generated"}
 
 内容:
 ${result.context}`;
   }).join("\n\n---\n\n");
+  const supplemental = await supplementalPromptBlock();
   const endpointHost = safeHostname(endpoint) || baseUrl;
   const requestTrace = [
     ...trace,
@@ -1105,7 +2063,10 @@ ${result.context}`;
       messages: [
         {
           role: "system",
-          content: "你是本地知识库问答助手。只能基于提供的资料回答；如果资料不足，要明确说不知道。回答使用中文。结论在前，并在关键依据处引用资料 ID、URL 或文件路径。"
+          content: [
+            "你是本地知识库问答助手。只能基于提供的资料回答；如果资料不足，要明确说不知道。回答使用中文。结论在前，并在关键依据处引用资料 ID、URL 或文件路径。",
+            supplemental
+          ].filter(Boolean).join("\n\n")
         },
         {
           role: "user",
@@ -1203,6 +2164,7 @@ async function streamWithOpenAICompatible(question, results, sources, res) {
   const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
   const endpoint = `${baseUrl}/chat/completions`;
   const context = buildOpenAIContext(results);
+  const supplemental = await supplementalPromptBlock();
   sendSse(res, "trace", {
     type: "tool",
     title: "调用 AI 接口",
@@ -1222,7 +2184,10 @@ async function streamWithOpenAICompatible(question, results, sources, res) {
       messages: [
         {
           role: "system",
-          content: "你是本地知识库问答助手。只能基于提供的资料回答；如果资料不足，要明确说不知道。回答使用中文。结论在前，并在关键依据处引用资料 ID、URL 或文件路径。"
+          content: [
+            "你是本地知识库问答助手。只能基于提供的资料回答；如果资料不足，要明确说不知道。回答使用中文。结论在前，并在关键依据处引用资料 ID、URL 或文件路径。",
+            supplemental
+          ].filter(Boolean).join("\n\n")
         },
         {
           role: "user",
@@ -1303,50 +2268,346 @@ function parseOpenAIStreamPayloads(chunk) {
 
 async function searchKnowledgeBase(query, limit = 8) {
   const terms = tokenizeQuery(query);
+  const desiredLimit = Math.max(1, Number(limit) || 8);
+  const embeddingEnabled = isEmbeddingEnabled();
   const dirs = await safeReaddir(itemsDir);
   const results = [];
 
   for (const id of dirs) {
-    const itemDir = path.join(itemsDir, id);
-    const metadataPath = path.join(itemDir, "metadata.json");
-    const documentPath = path.join(itemDir, "document.md");
-    if (!(await exists(metadataPath)) || !(await exists(documentPath))) continue;
-
-    const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
-    const document = await fs.readFile(documentPath, "utf8");
-    const commentsPath = path.join(itemDir, "comments.jsonl");
-    const comments = await readJsonLines(commentsPath);
-    const commentsText = comments.map((comment) => JSON.stringify(comment)).join("\n");
-    const haystack = `${metadata.title}\n${(metadata.tags || []).join(" ")}\n${metadata.sourceType}\n${metadata.url || ""}\n${document}\n${commentsText}`.toLowerCase();
+    const material = await readMaterialForSearch(id);
+    if (!material) continue;
+    const { metadata, document, processedDocument, commentsText, paths } = material;
+    const haystack = `${metadata.title}\n${(metadata.tags || []).join(" ")}\n${metadata.sourceType}\n${metadata.url || ""}\n${processedDocument}\n${document}\n${commentsText}`.toLowerCase();
     const score = scoreKnowledgeMatch(haystack, terms, metadata);
 
     if (score > 0 || !terms.length) {
       results.push({
         score,
+        keywordScore: score,
+        vectorScore: 0,
         item: {
           ...metadata,
-          paths: {
-            metadata: path.join(itemDir, "metadata.json"),
-            document: documentPath,
-            comments: commentsPath,
-            raw: path.join(itemDir, metadata.rawFileName || "raw.txt")
-          }
+          paths
         },
-        context: buildKnowledgeContext(document, commentsText, terms)
+        context: buildKnowledgeContext(processedDocument || document, commentsText, terms)
       });
     }
   }
 
-  if (!results.length && terms.length) {
-    for (const id of dirs) {
-      const fallback = await readKnowledgeSearchResult(id, 0, []);
-      if (fallback) results.push(fallback);
+  if (!embeddingEnabled) {
+    const sorted = results
+      .sort((a, b) => b.score - a.score || String(b.item.updatedAt).localeCompare(String(a.item.updatedAt)));
+    return diversifyKnowledgeResults(sorted, desiredLimit, terms);
+  }
+
+  try {
+    const vectorResults = await searchKnowledgeBaseByEmbedding(query, terms, desiredLimit * 2);
+    const merged = mergeKnowledgeResults(results, vectorResults);
+    return diversifyKnowledgeResults(merged, desiredLimit, terms);
+  } catch (error) {
+    console.error("Embedding search failed, falling back to keyword search:", error);
+    const sorted = results
+      .sort((a, b) => b.score - a.score || String(b.item.updatedAt).localeCompare(String(a.item.updatedAt)));
+    return diversifyKnowledgeResults(sorted, desiredLimit, terms);
+  }
+}
+
+async function readMaterialForSearch(id) {
+  const itemDir = path.join(itemsDir, id);
+  const metadataPath = path.join(itemDir, "metadata.json");
+  const documentPath = path.join(itemDir, "document.md");
+  if (!(await exists(metadataPath)) || !(await exists(documentPath))) return null;
+
+  const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
+  const document = await fs.readFile(documentPath, "utf8");
+  const processedPath = path.join(itemDir, "processed.md");
+  const processedDocument = await exists(processedPath) ? await fs.readFile(processedPath, "utf8") : "";
+  const commentsPath = path.join(itemDir, "comments.jsonl");
+  const comments = await readJsonLines(commentsPath);
+  const commentsText = comments.map((comment) => JSON.stringify(comment)).join("\n");
+  return {
+    metadata,
+    document,
+    processedDocument,
+    commentsText,
+    paths: {
+      metadata: metadataPath,
+      document: documentPath,
+      processed: processedDocument ? processedPath : "",
+      comments: commentsPath,
+      raw: path.join(itemDir, metadata.rawFileName || "raw.txt")
+    }
+  };
+}
+
+function diversifyKnowledgeResults(results, limit, terms) {
+  if (!results.length) return [];
+  if (!terms.length) return results.slice(0, limit);
+
+  const selected = [];
+  const seen = new Set();
+  const bySource = new Map();
+  for (const result of results) {
+    const sourceType = result.item.sourceType || "unknown";
+    if (!bySource.has(sourceType)) bySource.set(sourceType, []);
+    bySource.get(sourceType).push(result);
+  }
+
+  for (const group of bySource.values()) {
+    const candidate = group[0];
+    if (!candidate || seen.has(candidate.item.id)) continue;
+    selected.push(candidate);
+    seen.add(candidate.item.id);
+    if (selected.length >= limit) return selected;
+  }
+
+  for (const result of results) {
+    if (seen.has(result.item.id)) continue;
+    selected.push(result);
+    seen.add(result.item.id);
+    if (selected.length >= limit) break;
+  }
+
+  return selected.sort((a, b) => b.score - a.score || String(b.item.updatedAt).localeCompare(String(a.item.updatedAt)));
+}
+
+async function searchKnowledgeBaseByEmbedding(query, terms, limit) {
+  const cleanQuery = cleanText(query);
+  if (!cleanQuery) return [];
+  const index = await ensureEmbeddingIndex();
+  if (!index.records.length) return [];
+
+  const queryVector = await createEmbedding(cleanQuery);
+  const bestByItem = new Map();
+  for (const record of index.records) {
+    const vectorScore = cosineSimilarity(queryVector, record.vector);
+    if (!Number.isFinite(vectorScore)) continue;
+    const previous = bestByItem.get(record.itemId);
+    if (!previous || vectorScore > previous.vectorScore) {
+      bestByItem.set(record.itemId, { record, vectorScore });
     }
   }
 
-  return results
-    .sort((a, b) => b.score - a.score || String(b.item.updatedAt).localeCompare(String(a.item.updatedAt)))
-    .slice(0, Math.max(1, Number(limit) || 8));
+  const candidates = [...bestByItem.values()]
+    .filter((candidate) => candidate.vectorScore > 0.2)
+    .sort((a, b) => b.vectorScore - a.vectorScore)
+    .slice(0, Math.max(1, limit));
+
+  const results = [];
+  for (const candidate of candidates) {
+    const material = await readMaterialForSearch(candidate.record.itemId);
+    if (!material) continue;
+    const { metadata, document, processedDocument, commentsText, paths } = material;
+    results.push({
+      score: candidate.vectorScore * 20,
+      keywordScore: 0,
+      vectorScore: candidate.vectorScore,
+      item: {
+        ...metadata,
+        paths
+      },
+      context: buildVectorKnowledgeContext(candidate.record.text, processedDocument || document, commentsText, terms)
+    });
+  }
+  return results;
+}
+
+function mergeKnowledgeResults(keywordResults, vectorResults) {
+  const merged = new Map();
+  for (const result of [...keywordResults, ...vectorResults]) {
+    const id = result.item.id;
+    const previous = merged.get(id);
+    if (!previous) {
+      merged.set(id, result);
+      continue;
+    }
+    const keywordScore = Math.max(previous.keywordScore || 0, result.keywordScore || 0);
+    const vectorScore = Math.max(previous.vectorScore || 0, result.vectorScore || 0);
+    merged.set(id, {
+      ...previous,
+      keywordScore,
+      vectorScore,
+      score: keywordScore + vectorScore * 20,
+      context: result.vectorScore > (previous.vectorScore || 0) ? result.context : previous.context
+    });
+  }
+  return [...merged.values()]
+    .sort((a, b) => b.score - a.score || String(b.item.updatedAt).localeCompare(String(a.item.updatedAt)));
+}
+
+function isEmbeddingEnabled() {
+  return Boolean(
+    settings.embedding?.enabled
+    && settings.embedding?.baseUrl
+    && settings.embedding?.apiKey
+    && settings.embedding?.model
+  );
+}
+
+function embeddingIndexPath() {
+  return path.join(indexesDir, "embeddings.json");
+}
+
+function embeddingConfigKey() {
+  return [
+    settings.embedding?.baseUrl || "",
+    settings.embedding?.model || "",
+    Number(settings.embedding?.dimensions || 0) || ""
+  ].join("|");
+}
+
+async function ensureEmbeddingIndex() {
+  await fs.mkdir(indexesDir, { recursive: true });
+  const currentManifest = await buildEmbeddingManifest();
+  const filePath = embeddingIndexPath();
+  if (await exists(filePath)) {
+    try {
+      const saved = JSON.parse(await fs.readFile(filePath, "utf8"));
+      if (
+        saved.configKey === embeddingConfigKey()
+        && JSON.stringify(saved.manifest || []) === JSON.stringify(currentManifest)
+        && Array.isArray(saved.records)
+      ) {
+        return saved;
+      }
+    } catch {
+      // Rebuild malformed embedding indexes.
+    }
+  }
+
+  const rebuilt = await rebuildEmbeddingIndex(currentManifest);
+  await fs.writeFile(filePath, `${JSON.stringify(rebuilt)}\n`, "utf8");
+  return rebuilt;
+}
+
+async function buildEmbeddingManifest() {
+  const dirs = await safeReaddir(itemsDir);
+  const manifest = [];
+  for (const id of dirs) {
+    const material = await readMaterialForSearch(id);
+    if (!material) continue;
+    if (material.metadata.pageKind === "list") continue;
+    manifest.push({
+      id,
+      updatedAt: material.metadata.updatedAt || "",
+      processedAt: material.metadata.processedAt || "",
+      sourceUpdatedAt: material.metadata.sourceUpdatedAt || ""
+    });
+  }
+  return manifest.sort((a, b) => a.id.localeCompare(b.id));
+}
+
+async function rebuildEmbeddingIndex(manifest) {
+  const records = [];
+  for (const entry of manifest) {
+    const material = await readMaterialForSearch(entry.id);
+    if (!material) continue;
+    const chunks = chunkMaterialForEmbedding(material).slice(0, 20);
+    if (!chunks.length) continue;
+    const vectors = await createEmbeddings(chunks.map((chunk) => chunk.text));
+    for (let index = 0; index < chunks.length; index += 1) {
+      records.push({
+        itemId: entry.id,
+        chunkId: chunks[index].id,
+        sourceType: material.metadata.sourceType,
+        title: material.metadata.title,
+        text: chunks[index].text,
+        vector: vectors[index] || []
+      });
+    }
+  }
+  return {
+    version: 1,
+    configKey: embeddingConfigKey(),
+    generatedAt: new Date().toISOString(),
+    manifest,
+    records
+  };
+}
+
+function chunkMaterialForEmbedding(material) {
+  const metadata = material.metadata;
+  const base = material.processedDocument || material.document;
+  const body = extractBodyFromDocument(base).trim();
+  const header = [
+    `标题：${metadata.title}`,
+    `来源：${metadata.sourceType}`,
+    `URL：${metadata.url || "local input"}`,
+    `标签：${(metadata.tags || []).join(", ") || "none"}`
+  ].join("\n");
+  const text = `${header}\n\n${body}`.replace(/\n{3,}/g, "\n\n");
+  const paragraphs = text.split(/\n{2,}/).map((part) => part.trim()).filter(Boolean);
+  const chunks = [];
+  let current = "";
+  for (const paragraph of paragraphs) {
+    if ((current + "\n\n" + paragraph).length > 1200 && current) {
+      chunks.push(current);
+      current = paragraph;
+    } else {
+      current = current ? `${current}\n\n${paragraph}` : paragraph;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks.map((chunk, index) => ({
+    id: `${metadata.id || "item"}-${index + 1}`,
+    text: chunk.slice(0, 1800)
+  }));
+}
+
+async function createEmbedding(text) {
+  const vectors = await createEmbeddings([text]);
+  return vectors[0] || [];
+}
+
+async function createEmbeddings(inputs) {
+  if (!inputs.length) return [];
+  const baseUrl = settings.embedding.baseUrl.replace(/\/+$/, "");
+  const response = await fetch(`${baseUrl}/embeddings`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${settings.embedding.apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: settings.embedding.model,
+      input: inputs,
+      ...(Number(settings.embedding.dimensions) > 0 ? { dimensions: Number(settings.embedding.dimensions) } : {})
+    })
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Embedding 生成失败：${response.status} ${text.slice(0, 300)}`);
+  }
+
+  const payload = await response.json();
+  const data = Array.isArray(payload.data) ? payload.data : [];
+  return data
+    .sort((a, b) => Number(a.index || 0) - Number(b.index || 0))
+    .map((item) => Array.isArray(item.embedding) ? item.embedding.map(Number) : []);
+}
+
+function cosineSimilarity(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || !a.length || a.length !== b.length) return 0;
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let index = 0; index < a.length; index += 1) {
+    dot += a[index] * b[index];
+    normA += a[index] * a[index];
+    normB += b[index] * b[index];
+  }
+  return normA && normB ? dot / (Math.sqrt(normA) * Math.sqrt(normB)) : 0;
+}
+
+function buildVectorKnowledgeContext(bestChunk, document, commentsText, terms) {
+  const keywordContext = buildKnowledgeContext(document, commentsText, terms);
+  return [
+    "语义命中片段：",
+    bestChunk,
+    keywordContext ? "\n关键词相关片段：" : "",
+    keywordContext
+  ].filter(Boolean).join("\n").slice(0, 6000);
 }
 
 async function readKnowledgeSearchResult(id, score, terms) {
@@ -1357,6 +2618,8 @@ async function readKnowledgeSearchResult(id, score, terms) {
 
   const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
   const document = await fs.readFile(documentPath, "utf8");
+  const processedPath = path.join(itemDir, "processed.md");
+  const processedDocument = await exists(processedPath) ? await fs.readFile(processedPath, "utf8") : "";
   const commentsPath = path.join(itemDir, "comments.jsonl");
   const comments = await readJsonLines(commentsPath);
   const commentsText = comments.map((comment) => JSON.stringify(comment)).join("\n");
@@ -1367,11 +2630,12 @@ async function readKnowledgeSearchResult(id, score, terms) {
       paths: {
         metadata: metadataPath,
         document: documentPath,
+        processed: processedDocument ? processedPath : "",
         comments: commentsPath,
         raw: path.join(itemDir, metadata.rawFileName || "raw.txt")
       }
     },
-    context: buildKnowledgeContext(document, commentsText, terms)
+    context: buildKnowledgeContext(processedDocument || document, commentsText, terms)
   };
 }
 
@@ -1396,7 +2660,7 @@ function buildLocalKnowledgeAnswer(question, results) {
 
   const sources = results.map((result, index) => {
     const item = result.item;
-    return `${index + 1}. ${item.title} (${item.id})\n   来源：${item.sourceType} · ${item.url || "local input"}\n   最后抓取：${item.lastFetchedAt || "not fetched"}\n   文件：${item.paths.document}\n   相关片段：${result.context.slice(0, 420).replace(/\n/g, " ")}`;
+    return `${index + 1}. ${item.title} (${item.id})\n   来源：${item.sourceType} · ${item.url || "local input"}\n   最后抓取：${item.lastFetchedAt || "not fetched"}\n   文件：${item.paths.processed || item.paths.document}\n   相关片段：${result.context.slice(0, 420).replace(/\n/g, " ")}`;
   }).join("\n\n");
 
   return `我在本地知识库里找到了这些相关资料。当前未配置 AI 接口，所以先返回可追溯的检索结果；配置 OpenAI 兼容接口后会直接基于这些内容生成回答。\n\n问题：${question}\n\n${sources}`;
@@ -1434,9 +2698,20 @@ function scoreKnowledgeMatch(haystack, terms, metadata) {
 function tokenizeQuery(query) {
   const lower = cleanText(query).toLowerCase();
   const asciiTerms = lower.match(/[a-z0-9._/-]{2,}/g) || [];
-  const cjkTerms = lower.match(/[\p{Script=Han}]{2,}/gu) || [];
+  const cjkPhrases = lower.match(/[\p{Script=Han}]{2,}/gu) || [];
+  const cjkTerms = cjkPhrases.flatMap((phrase) => {
+    const terms = [phrase];
+    for (let index = 0; index < phrase.length - 1; index += 1) {
+      const term = phrase.slice(index, index + 2);
+      if (!/[的了和是有在与及或这那哪]/u.test(term)) terms.push(term);
+    }
+    return terms;
+  });
   const shortTerms = lower.split(/\s+/).filter((term) => term.length >= 2);
-  return [...new Set([...asciiTerms, ...cjkTerms, ...shortTerms])].slice(0, 24);
+  const stopTerms = new Set(["有关", "相关", "内容", "资料", "信息", "什么", "哪些", "一下", "这个", "那个"]);
+  return [...new Set([...asciiTerms, ...cjkTerms, ...shortTerms])]
+    .filter((term) => !stopTerms.has(term) && !(/^[\p{Script=Han}]+$/u.test(term) && term.length > 8))
+    .slice(0, 32);
 }
 
 async function listTags() {
@@ -1466,6 +2741,55 @@ async function addManualTags(tags) {
   await writeManualTags([...new Set([...manualTags, ...nextTags])]);
   await rebuildIndexes();
   return listTags();
+}
+
+async function renameTag(from, to) {
+  const [oldTag] = normalizeTags([from]);
+  const [newTag] = normalizeTags([to]);
+  if (!oldTag || !newTag) {
+    throw new Error("请输入有效的原标签和新标签。");
+  }
+  if (oldTag === newTag) {
+    return { oldTag, newTag, touchedItems: [], tags: await listTags() };
+  }
+
+  const touchedItems = [];
+  const dirs = await safeReaddir(itemsDir);
+  for (const id of dirs) {
+    const metadataPath = path.join(itemsDir, id, "metadata.json");
+    const documentPath = path.join(itemsDir, id, "document.md");
+    if (!(await exists(metadataPath)) || !(await exists(documentPath))) continue;
+
+    const item = await readItem(id);
+    const previousTags = item.metadata.tags || [];
+    if (!previousTags.includes(oldTag)) continue;
+
+    const nextTags = uniqueValues(previousTags.map((tag) => tag === oldTag ? newTag : tag));
+    const metadata = {
+      ...item.metadata,
+      tags: nextTags,
+      updatedAt: new Date().toISOString()
+    };
+    await fs.writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+    await fs.writeFile(documentPath, renderDocument(metadata, extractBodyFromDocument(item.document), extractSummaryFromDocument(item.document)), "utf8");
+    touchedItems.push({ id, title: metadata.title });
+  }
+
+  const manualTags = await readManualTags();
+  const nextManualTags = uniqueValues(manualTags.map((tag) => tag === oldTag ? newTag : tag));
+  if (manualTags.includes(oldTag) || !nextManualTags.includes(newTag)) {
+    await writeManualTags([...nextManualTags, newTag]);
+  } else {
+    await writeManualTags(nextManualTags);
+  }
+  await rebuildIndexes();
+
+  return {
+    oldTag,
+    newTag,
+    touchedItems,
+    tags: await listTags()
+  };
 }
 
 async function deleteTags(tags) {
@@ -1565,15 +2889,47 @@ function startRefreshScheduler() {
 }
 
 async function runDueRefreshJobs() {
-  const now = Date.now();
+  const now = new Date();
   for (const job of settings.refreshJobs || []) {
     if (!job.enabled || refreshRuntime.running.has(job.id)) continue;
-    const intervalMs = Math.max(5, Number(job.intervalMinutes) || 60) * 60 * 1000;
-    const lastRunAt = job.lastRunAt ? Date.parse(job.lastRunAt) : 0;
-    if (!lastRunAt || now - lastRunAt >= intervalMs) {
-      await runRefreshJob(job);
+    const dueAt = nextDueRefreshSlot(job, now, settings.refreshSchedule);
+    if (dueAt) {
+      try {
+        await runRefreshJob(job);
+      } catch (error) {
+        console.error(`Scheduled refresh failed for ${job.id}:`, error.message || error);
+      }
     }
   }
+}
+
+function nextDueRefreshSlot(job, now = new Date(), schedule = {}) {
+  const intervalMinutes = Math.max(5, Number(job.intervalMinutes) || 60);
+  const start = parseTimeOfDay(schedule?.startTime || "08:00", "08:00");
+  const end = parseTimeOfDay(schedule?.endTime || "20:00", "20:00");
+  const startAt = new Date(now);
+  startAt.setHours(start.hours, start.minutes, 0, 0);
+  const endAt = new Date(now);
+  endAt.setHours(end.hours, end.minutes, 0, 0);
+  if (endAt < startAt) endAt.setDate(endAt.getDate() + 1);
+  if (now < startAt || now > endAt) return null;
+
+  const elapsedMinutes = Math.floor((now.getTime() - startAt.getTime()) / 60000);
+  const slotIndex = Math.floor(elapsedMinutes / intervalMinutes);
+  const dueAt = new Date(startAt.getTime() + slotIndex * intervalMinutes * 60000);
+  if (dueAt > endAt) return null;
+  const lastRunAt = job.lastRunAt ? new Date(job.lastRunAt) : null;
+  if (lastRunAt && lastRunAt >= dueAt) return null;
+  return dueAt;
+}
+
+function parseTimeOfDay(value, fallback) {
+  const text = /^\d{1,2}:\d{2}$/.test(cleanText(value)) ? cleanText(value) : fallback;
+  const [rawHours, rawMinutes] = text.split(":").map((part) => Number(part));
+  return {
+    hours: Math.min(23, Math.max(0, rawHours || 0)),
+    minutes: Math.min(59, Math.max(0, rawMinutes || 0))
+  };
 }
 
 async function runRefreshJobById(id, options = {}) {
@@ -1597,7 +2953,10 @@ async function runRefreshJob(job) {
   });
 
   try {
-    const result = await refreshListJob({ ...job, lastStartedAt: startedAt });
+    const result = job.pageKind === "content"
+      ? await refreshContentJob({ ...job, lastStartedAt: startedAt })
+      : await refreshListJob({ ...job, lastStartedAt: startedAt });
+    await notifyRefreshResult(job, result);
     await updateRefreshJobState(job.id, {
       status: "idle",
       lastRunAt: new Date().toISOString(),
@@ -1606,15 +2965,89 @@ async function runRefreshJob(job) {
     });
     return result;
   } catch (error) {
+    const unreachable = isNetworkUnavailableForJob(job, error);
+    const lastError = unreachable ? networkUnavailableMessage(job) : error.message || String(error);
     await updateRefreshJobState(job.id, {
-      status: "failed",
+      status: unreachable ? "unreachable" : "failed",
       lastRunAt: new Date().toISOString(),
-      lastError: error.message || String(error)
+      lastError
     });
+    if (unreachable) {
+      const friendlyError = new Error(lastError);
+      friendlyError.code = "NETWORK_UNAVAILABLE";
+      throw friendlyError;
+    }
     throw error;
   } finally {
     refreshRuntime.running.delete(job.id);
   }
+}
+
+function isNetworkUnavailableForJob(job, error) {
+  const adapter = detectSourceAdapter(job.url || "");
+  if (!requiresCompanyNetwork(adapter.hostname)) return false;
+  return isNetworkAccessError(error);
+}
+
+function requiresCompanyNetwork(hostname) {
+  return [
+    "jira.amlogic.com",
+    "confluence.amlogic.com"
+  ].includes(String(hostname || "").toLowerCase());
+}
+
+function isNetworkAccessError(error) {
+  const message = String(error?.message || error || "");
+  return /ERR_CONNECTION_CLOSED|ERR_CONNECTION_TIMED_OUT|ERR_NAME_NOT_RESOLVED|ERR_ADDRESS_UNREACHABLE|ERR_NETWORK_CHANGED|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EHOSTUNREACH/i.test(message);
+}
+
+function networkUnavailableMessage(job) {
+  const hostname = safeHostname(job.url || "") || detectSourceAdapter(job.url || "").hostname;
+  return `当前网络无法访问 ${hostname}。如果不在公司网络或 VPN 未连接，本次刷新会跳过；连接公司网络后再刷新即可。`;
+}
+
+async function notifyRefreshResult(job, result) {
+  const updatedItems = result?.updatedItems || [];
+  if (!updatedItems.length) return;
+  const sourceType = result.sourceType || detectSourceAdapter(job.url).sourceType || "web";
+  if (!shouldNotifySource(sourceType)) return;
+
+  const title = `资料更新：${sourceLabel(sourceType)} ${updatedItems.length} 条`;
+  const firstTitle = cleanText(updatedItems[0]?.title || updatedItems[0]?.key || job.name || "");
+  const message = updatedItems.length === 1
+    ? firstTitle || "检测到 1 条新内容"
+    : `${firstTitle || "检测到新内容"} 等 ${updatedItems.length} 条`;
+  await sendSystemNotification(title, message);
+}
+
+function shouldNotifySource(sourceType) {
+  const notifications = normalizeNotificationSettings(settings.notifications || {});
+  if (!notifications.enabled) return false;
+  return notifications.sources?.[sourceType] !== false;
+}
+
+function sourceLabel(sourceType) {
+  return {
+    confluence: "Confluence",
+    jira: "Jira",
+    github: "GitHub",
+    teams: "Teams",
+    web: "网页",
+    text: "文本"
+  }[sourceType] || sourceType || "资料";
+}
+
+async function sendSystemNotification(title, message) {
+  if (process.platform !== "darwin") {
+    console.log(`[notification] ${title}: ${message}`);
+    return;
+  }
+  await new Promise((resolve) => {
+    execFile("osascript", [
+      "-e",
+      `display notification ${JSON.stringify(message)} with title ${JSON.stringify(title)} sound name "Glass"`
+    ], () => resolve());
+  });
 }
 
 async function refreshListJob(job) {
@@ -1626,8 +3059,7 @@ async function refreshListJob(job) {
   const fetchedAt = new Date().toISOString();
   const listFetched = await fetchForRefreshJob(job.url, { ...job, pageKind: "list" }, adapter);
   const listUrl = listFetched.url || job.url;
-  const sourceTag = adapter.sourceType === "github" ? "github-filter" : `${adapter.sourceType}-filter`;
-  const tags = mergeTags(job.tags || [], [adapter.sourceType, sourceTag]);
+  const tags = normalizeTags(job.tags || []);
   const listItem = await upsertFetchedItem({
     title: listFetched.title,
     sourceType: adapter.sourceType,
@@ -1667,11 +3099,11 @@ async function refreshListJob(job) {
         title: contentFetched.title || link.title || link.key || contentUrl,
         sourceType: adapter.sourceType,
         url: contentFetched.url ? normalizeContentFetchUrl(contentFetched.url, adapter) : contentUrl,
-        tags: mergeTags(job.tags || [], [adapter.sourceType, link.key || link.number ? `${link.key || link.number}`.toLowerCase() : "content"]),
+        tags: normalizeTags(job.tags || []),
         raw: contentFetched.raw,
         text: contentFetched.text,
         comments: contentFetched.comments || [],
-        sourceUpdatedAt: contentFetched.sourceUpdatedAt || listUpdatedAt,
+        sourceUpdatedAt: listUpdatedAt || contentFetched.sourceUpdatedAt,
         fetchedAt: new Date().toISOString(),
         pageKind: "content",
         fetchMode: resolvedRefreshFetchMode(job, adapter),
@@ -1706,6 +3138,51 @@ async function refreshListJob(job) {
   };
 }
 
+async function refreshContentJob(job) {
+  const adapter = detectSourceAdapter(job.url);
+  const fetchedAt = new Date().toISOString();
+  const fetched = await fetchForRefreshJob(job.url, { ...job, pageKind: "content" }, adapter);
+  const item = await upsertFetchedItem({
+    title: fetched.title || job.name || job.url,
+    sourceType: adapter.sourceType,
+    url: fetched.url || job.url,
+    tags: normalizeTags(job.tags || []),
+    raw: fetched.raw,
+    text: fetched.text,
+    comments: fetched.comments || [],
+    sourceUpdatedAt: fetched.sourceUpdatedAt || "",
+    fetchedAt,
+    pageKind: "content",
+    fetchMode: resolvedRefreshFetchMode(job, adapter)
+  });
+
+  await rebuildIndexes();
+  return {
+    id: job.id,
+    sourceType: adapter.sourceType,
+    itemId: item.metadata.id,
+    url: item.metadata.url,
+    linkCount: 1,
+    updatedItemCount: item.metadata.contentUpdatedAt === fetchedAt ? 1 : 0,
+    skippedItemCount: item.metadata.contentUpdatedAt === fetchedAt ? 0 : 1,
+    errorCount: 0,
+    updatedItems: item.metadata.contentUpdatedAt === fetchedAt ? [{
+      title: item.metadata.title,
+      itemId: item.metadata.id,
+      url: item.metadata.url,
+      sourceUpdatedAt: item.metadata.sourceUpdatedAt || ""
+    }] : [],
+    skippedItems: item.metadata.contentUpdatedAt === fetchedAt ? [] : [{
+      title: item.metadata.title,
+      itemId: item.metadata.id,
+      url: item.metadata.url,
+      sourceUpdatedAt: item.metadata.sourceUpdatedAt || "",
+      reason: "unchanged-content"
+    }],
+    errors: []
+  };
+}
+
 async function refreshJiraFilterJob(job) {
   const adapter = detectSourceAdapter(job.url);
   if (adapter.sourceType !== "jira") {
@@ -1715,7 +3192,7 @@ async function refreshJiraFilterJob(job) {
   const fetchedAt = new Date().toISOString();
   const listFetched = await fetchUrlWithWebdriver(job.url, { pageKind: "list" });
   const listUrl = listFetched.url || job.url;
-  const tags = mergeTags(job.tags || [], ["jira", "jira-filter"]);
+  const tags = normalizeTags(job.tags || []);
   const listItem = await upsertFetchedItem({
     title: listFetched.title,
     sourceType: "jira",
@@ -1740,7 +3217,7 @@ async function refreshJiraFilterJob(job) {
         title: issueFetched.title || `${issue.key} ${issue.summary || ""}`.trim(),
         sourceType: "jira",
         url: issueFetched.url || issue.href,
-        tags: mergeTags(job.tags || [], ["jira", issue.key.toLowerCase()]),
+        tags: normalizeTags(job.tags || []),
         raw: issueFetched.raw,
         text: issueFetched.text,
         comments: issueFetched.comments || [],
@@ -1778,7 +3255,7 @@ async function fetchForRefreshJob(url, job, adapter = detectSourceAdapter(url)) 
 function resolvedRefreshFetchMode(job, adapter) {
   if (job.fetchMode === "fetch") return "fetch";
   if (job.fetchMode === "webdriver") return "webdriver";
-  return adapter.sourceType === "jira" ? "webdriver" : "fetch";
+  return adapter.sourceType === "jira" || adapter.sourceType === "teams" ? "webdriver" : "fetch";
 }
 
 async function updateRefreshJobState(id, patch) {
@@ -1790,6 +3267,22 @@ async function updateRefreshJobState(id, patch) {
   };
   await fs.mkdir(configDir, { recursive: true });
   await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+}
+
+async function deleteRefreshJob(id) {
+  const before = settings.refreshJobs || [];
+  const nextJobs = before.filter((job) => job.id !== id);
+  if (nextJobs.length === before.length) {
+    throw new Error("Refresh job not found.");
+  }
+  refreshRuntime.running.delete(id);
+  settings = {
+    ...settings,
+    refreshJobs: nextJobs
+  };
+  await fs.mkdir(configDir, { recursive: true });
+  await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  return publicRefreshJobs();
 }
 
 async function fetchUrl(url, options = {}) {
@@ -1821,14 +3314,45 @@ async function fetchUrl(url, options = {}) {
 async function fetchUrlWithWebdriver(url, options = {}) {
   if (!url) throw new Error("URL is required.");
   const adapter = detectSourceAdapter(url);
-  const session = await ensureWebdriverSession(adapter.hostname, url, false);
-  const page = session.page || await session.context.newPage();
-  session.page = page;
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-  await waitForJiraIssueNavigator(page, adapter, options.pageKind || "auto");
+  const session = await ensureWebdriverSession(adapter.hostname, url, {
+    headed: Boolean(options.headed),
+    autoClose: options.keepSession !== true
+  });
+  try {
+    const page = await ensureSessionPage(session);
+    session.page = page;
+    const navigationUrl = adapter.sourceType === "teams" ? normalizeTeamsNavigationUrl(url) : url;
+    await page.goto(navigationUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await waitForJiraIssueNavigator(page, adapter, options.pageKind || "auto");
+    if (adapter.sourceType === "teams") {
+      return await fetchTeamsWithWebdriver(page, url, adapter);
+    }
+    const raw = await page.content();
+    const currentUrl = page.url();
+    const extracted = extractByAdapter(raw, currentUrl || url, adapter, options.pageKind || "auto");
+    return {
+      raw,
+      title: extracted.title || await page.title(),
+      text: extracted.text,
+      comments: extracted.comments || [],
+      sourceUpdatedAt: extracted.sourceUpdatedAt || "",
+      url: currentUrl
+    };
+  } finally {
+    if (session.autoClose) {
+      await closeWebdriverSession(session);
+    }
+  }
+}
+
+async function fetchTeamsWithWebdriver(page, url, adapter) {
+  await resolveTeamsLauncher(page, url);
+  await waitForTeamsConversation(page);
+  await scrollTeamsMessages(page, 8);
   const raw = await page.content();
   const currentUrl = page.url();
-  const extracted = extractByAdapter(raw, currentUrl || url, adapter, options.pageKind || "auto");
+  const extracted = await extractTeamsFromPage(page, currentUrl || url, adapter);
+  validateTeamsExtraction(extracted, currentUrl || url);
   return {
     raw,
     title: extracted.title || await page.title(),
@@ -1839,10 +3363,137 @@ async function fetchUrlWithWebdriver(url, options = {}) {
   };
 }
 
+function validateTeamsExtraction(extracted, url) {
+  const title = cleanText(extracted?.title || "");
+  const comments = Array.isArray(extracted?.comments) ? extracted.comments : [];
+  const text = cleanText(extracted?.text || "");
+  const failedTitle = /^oops$/i.test(title);
+  const emptyCapture = comments.length === 0 || /Messages captured:\s*0/i.test(text);
+  const noMessagesNote = /No Teams messages captured/i.test(text);
+  if (failedTitle || emptyCapture || noMessagesNote) {
+    throw new Error([
+      "Teams 抓取没有捕获到有效消息，已跳过更新，避免覆盖已有内容。",
+      "请确认 WebDriver 已登录，并且目标聊天/频道页面已经打开。",
+      `URL: ${url}`
+    ].join(" "));
+  }
+}
+
+async function resolveTeamsLauncher(page, originalUrl) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const current = page.url();
+    const launchUrl = extractTeamsLaunchTarget(current) || extractTeamsLaunchTarget(originalUrl);
+    if (launchUrl && safeHostname(current) !== "teams.microsoft.com") {
+      await page.goto(launchUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await page.waitForTimeout(1500);
+      continue;
+    }
+
+    const clicked = await clickTeamsLauncherButton(page);
+    if (!clicked) break;
+    await page.waitForTimeout(2500);
+  }
+}
+
+function extractTeamsLaunchTarget(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname === "teams.cloud.microsoft" && /^\/l\/(?:chat|channel)\//i.test(parsed.pathname)) {
+      return "";
+    }
+    const target = parsed.searchParams.get("url") || parsed.searchParams.get("deeplink");
+    if (!target) return "";
+    const decoded = decodeURIComponent(target);
+    if (/^\/_#\//.test(decoded) || /^\/l\/(?:chat|channel)\//i.test(decoded)) {
+      return `https://teams.cloud.microsoft${decoded}`;
+    }
+    if (/^_#\//.test(decoded)) {
+      return `https://teams.cloud.microsoft/${decoded}`;
+    }
+    if (/https:\/\/teams\.cloud\.microsoft\//i.test(decoded)) return decoded;
+    if (/https:\/\/teams\.microsoft\.com\//i.test(decoded)) {
+      return decoded.replace(/^https:\/\/teams\.microsoft\.com/i, "https://teams.cloud.microsoft");
+    }
+    return "";
+  } catch {
+    return "";
+  }
+}
+
+function normalizeTeamsNavigationUrl(url) {
+  const deepPath = extractTeamsDeepPath(url);
+  if (!deepPath) return url;
+  return `https://teams.microsoft.com/v2/#${deepPath}`;
+}
+
+function extractTeamsDeepPath(url) {
+  try {
+    const parsed = new URL(url);
+    if (/^#\/l\/(?:chat|channel|message|team)\//i.test(parsed.hash)) {
+      return parsed.hash.slice(1);
+    }
+    if (/^\/l\/(?:chat|channel|message|team)\//i.test(parsed.pathname)) {
+      return `${parsed.pathname}${parsed.search}`;
+    }
+
+    const target = parsed.searchParams.get("url") || parsed.searchParams.get("deeplink");
+    if (!target) return "";
+    const decoded = decodeURIComponent(target);
+    if (/^\/_#\/l\/(?:chat|channel|message|team)\//i.test(decoded)) {
+      return decoded.replace(/^\/_#/i, "");
+    }
+    if (/^_#\/l\/(?:chat|channel|message|team)\//i.test(decoded)) {
+      return decoded.replace(/^_#/i, "");
+    }
+    if (/^\/l\/(?:chat|channel|message|team)\//i.test(decoded)) {
+      return decoded;
+    }
+    if (/^https:\/\/(?:teams\.microsoft\.com|teams\.cloud\.microsoft)\//i.test(decoded)) {
+      return extractTeamsDeepPath(decoded);
+    }
+    return "";
+  } catch {
+    return "";
+  }
+}
+
+async function clickTeamsLauncherButton(page) {
+  const labels = [
+    "继续此浏览器",
+    "在此浏览器中继续",
+    "使用 Web 应用",
+    "使用网页版",
+    "加入对话",
+    "打开 Teams",
+    "Continue on this browser",
+    "Use the web app",
+    "Join conversation",
+    "Open Teams",
+    "Launch it now"
+  ];
+  for (const label of labels) {
+    try {
+      const locator = page.getByText(label, { exact: false }).first();
+      if (await locator.count()) {
+        await locator.click({ timeout: 3000 });
+        return true;
+      }
+    } catch {
+      // Try the next possible launcher label.
+    }
+  }
+  return false;
+}
+
 async function openWebdriverSession(url, hostname) {
   const target = url || (hostname ? `https://${hostname}` : "https://jira.amlogic.com");
   const adapter = detectSourceAdapter(target);
-  const session = await ensureWebdriverSession(adapter.hostname, target, true);
+  const session = await ensureWebdriverSession(adapter.hostname, target, {
+    headed: true,
+    manual: true,
+    autoClose: false
+  });
+  session.page = await ensureSessionPage(session);
   await session.page.goto(target, { waitUntil: "domcontentloaded", timeout: 60000 });
   return describeWebdriverSession(adapter.hostname, session);
 }
@@ -1851,11 +3502,22 @@ async function saveWebdriverCookies(url, hostname) {
   const target = url || (hostname ? `https://${hostname}` : "");
   const adapter = detectSourceAdapter(target);
   if (!adapter.hostname) throw new Error("需要 URL 或 hostname 才能保存 Cookie。");
-  const session = await ensureWebdriverSession(adapter.hostname, target || `https://${adapter.hostname}`, false);
-  const cookies = await session.context.cookies(`https://${adapter.hostname}`);
-  const cookieHeader = cookiesToHeader(cookies);
-  if (!cookieHeader) {
-    throw new Error("没有读取到可保存的 Cookie。请先在 Webdriver 窗口完成登录。");
+  const session = await ensureWebdriverSession(adapter.hostname, target || `https://${adapter.hostname}`, {
+    headed: false,
+    autoClose: true
+  });
+  let cookies = [];
+  let cookieHeader = "";
+  try {
+    cookies = await session.context.cookies(`https://${adapter.hostname}`);
+    cookieHeader = cookiesToHeader(cookies);
+    if (!cookieHeader) {
+      throw new Error("没有读取到可保存的 Cookie。请先在 Webdriver 窗口完成登录。");
+    }
+  } finally {
+    if (session.autoClose) {
+      await closeWebdriverSession(session);
+    }
   }
 
   const previous = settings.sources?.[adapter.hostname] || defaultSourceProfile(adapter.hostname, adapter.sourceType);
@@ -1883,17 +3545,39 @@ async function saveWebdriverCookies(url, hostname) {
   };
 }
 
-async function ensureWebdriverSession(hostname, url, headed) {
+async function ensureWebdriverSession(hostname, url, options = {}) {
+  const normalizedOptions = typeof options === "boolean" ? { headed: options } : options;
+  const headed = Boolean(normalizedOptions.headed);
+  const manual = Boolean(normalizedOptions.manual);
   const key = hostname || safeHostname(url) || "default";
+  const profile = settings.sources?.[key] || {};
+  const headless = headed ? false : Boolean(profile.webdriverHeadless);
+  const autoClose = Boolean(normalizedOptions.autoClose && !manual);
   const existing = webdriverSessions.get(key);
-  if (existing) return existing;
+  if (existing) {
+    if (headed && existing.headless) {
+      await existing.context.close();
+    } else {
+      return existing;
+    }
+  }
 
   await fs.mkdir(webdriverRoot, { recursive: true });
   const userDataDir = path.join(webdriverRoot, slugify(key));
+  const windowSize = manual
+    ? { width: 1000, height: 720 }
+    : { width: 900, height: 640 };
+  const windowPosition = manual
+    ? { x: 80, y: 80 }
+    : { x: -2400, y: 80 };
   const context = await chromium.launchPersistentContext(userDataDir, {
-    headless: false,
-    viewport: { width: 1440, height: 1000 },
-    args: ["--disable-blink-features=AutomationControlled"]
+    headless,
+    viewport: windowSize,
+    args: [
+      "--disable-blink-features=AutomationControlled",
+      `--window-size=${windowSize.width},${windowSize.height}`,
+      `--window-position=${windowPosition.x},${windowPosition.y}`
+    ]
   });
   const page = context.pages()[0] || await context.newPage();
   const session = {
@@ -1901,11 +3585,29 @@ async function ensureWebdriverSession(hostname, url, headed) {
     userDataDir,
     context,
     page,
+    headless,
+    manual,
+    autoClose,
     startedAt: new Date().toISOString()
   };
   webdriverSessions.set(key, session);
   context.on("close", () => webdriverSessions.delete(key));
   return session;
+}
+
+async function closeWebdriverSession(session) {
+  try {
+    await session.context.close();
+  } catch {
+    // The user or browser may have already closed it.
+  }
+}
+
+async function ensureSessionPage(session) {
+  if (session.page && !session.page.isClosed()) return session.page;
+  const existingPage = session.context.pages().find((page) => !page.isClosed());
+  if (existingPage) return existingPage;
+  return session.context.newPage();
 }
 
 function cookiesToHeader(cookies) {
@@ -1927,6 +3629,9 @@ function describeWebdriverSession(hostname, session) {
   return {
     hostname,
     userDataDir: session.userDataDir,
+    headless: Boolean(session.headless),
+    manual: Boolean(session.manual),
+    autoClose: Boolean(session.autoClose),
     startedAt: session.startedAt,
     url: session.page?.url?.() || ""
   };
@@ -1947,12 +3652,147 @@ async function waitForJiraIssueNavigator(page, adapter, pageKind) {
   }
 }
 
+async function waitForTeamsConversation(page) {
+  try {
+    await page.waitForLoadState("networkidle", { timeout: 15000 });
+  } catch {
+    // Teams often keeps background requests open.
+  }
+  try {
+    await page.waitForSelector([
+      "[data-tid*='message']",
+      "[role='main']",
+      "[data-tid='chat-pane-list']",
+      "[aria-label*='Message']",
+      "[aria-label*='消息']"
+    ].join(","), { timeout: 30000 });
+  } catch {
+    // Keep current DOM; extractor will produce a review note if no messages are visible.
+  }
+}
+
+async function scrollTeamsMessages(page, maxScrolls = 6) {
+  for (let index = 0; index < maxScrolls; index += 1) {
+    const moved = await page.evaluate(() => {
+      const candidates = [...document.querySelectorAll("main, [role='main'], [data-tid*='chat'], [data-tid*='message'], div")]
+        .filter((el) => el instanceof HTMLElement)
+        .map((el) => ({
+          el,
+          score: (el.scrollHeight - el.clientHeight) * Math.max(1, el.getBoundingClientRect().height)
+        }))
+        .filter((entry) => entry.score > 0)
+        .sort((a, b) => b.score - a.score);
+      const target = candidates[0]?.el;
+      if (!target) return false;
+      const before = target.scrollTop;
+      target.scrollTop = 0;
+      return target.scrollTop !== before;
+    });
+    if (!moved) break;
+    await page.waitForTimeout(900);
+  }
+}
+
+async function extractTeamsFromPage(page, url, adapter) {
+  const data = await page.evaluate(() => {
+    const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+    const pickTitle = () => {
+      const selectors = [
+        "[data-tid='channel-name']",
+        "[data-tid='chat-title']",
+        "[data-tid='conversation-header-title']",
+        "h1",
+        "[role='heading']"
+      ];
+      for (const selector of selectors) {
+        const text = clean(document.querySelector(selector)?.textContent);
+        if (text) return text;
+      }
+      return clean(document.title) || "Microsoft Teams conversation";
+    };
+    const messageSelectors = [
+      "[data-tid='chat-pane-message']",
+      "[data-tid*='message-item']",
+      "[data-tid*='message'][role='listitem']",
+      "[role='listitem'][aria-label*='message' i]",
+      "[role='listitem'][aria-label*='消息']"
+    ];
+    const nodes = [...document.querySelectorAll(messageSelectors.join(","))]
+      .filter((node, index, list) => node instanceof HTMLElement && list.findIndex((candidate) => candidate === node || candidate.contains(node)) === index);
+    const fallbackNodes = nodes.length ? nodes : [...document.querySelectorAll("[role='listitem']")]
+      .filter((node) => clean(node.textContent).length > 12)
+      .slice(-80);
+    const messages = fallbackNodes.map((node, index) => {
+      const author = clean(node.querySelector("[data-tid*='author'], [data-tid*='sender'], [class*='author'], [class*='sender']")?.textContent)
+        || clean(node.getAttribute("data-author"))
+        || "";
+      const time = node.querySelector("time")?.getAttribute("datetime")
+        || node.querySelector("[datetime]")?.getAttribute("datetime")
+        || clean(node.querySelector("[data-tid*='timestamp'], [class*='timestamp'], [aria-label*='sent'], [aria-label*='发送']")?.textContent)
+        || "";
+      const bodyNode = node.querySelector("[data-tid*='messageBody'], [data-tid*='message-body'], [data-tid*='content'], [class*='messageBody'], [class*='message-body']")
+        || node;
+      const text = clean(bodyNode.innerText || bodyNode.textContent);
+      const links = [...node.querySelectorAll("a[href]")].map((link) => ({
+        text: clean(link.textContent),
+        href: link.href
+      })).filter((link) => link.href);
+      return {
+        id: node.id || node.getAttribute("data-tid") || `teams-message-${index + 1}`,
+        author,
+        createdAt: time,
+        body: text,
+        links
+      };
+    }).filter((message, index, list) => (
+      message.body && list.findIndex((candidate) => candidate.body === message.body && candidate.createdAt === message.createdAt) === index
+    )).slice(-120);
+    return { title: pickTitle(), messages };
+  });
+
+  const comments = data.messages.map((message) => ({
+    id: message.id,
+    author: message.author,
+    createdAt: message.createdAt,
+    body: message.body,
+    url
+  }));
+  const sourceUpdatedAt = comments.map((comment) => comment.createdAt).filter(Boolean).at(-1) || "";
+  const lines = [
+    `# ${data.title || "Microsoft Teams conversation"}`,
+    "",
+    `Source: ${url}`,
+    `Adapter: ${adapter.id}`,
+    `Messages captured: ${comments.length}`,
+    sourceUpdatedAt ? `Latest message: ${sourceUpdatedAt}` : "",
+    "",
+    "## Messages",
+    "",
+    ...(comments.length
+      ? comments.map((comment, index) => {
+          const heading = [comment.author, comment.createdAt].filter(Boolean).join(" · ");
+          return `### ${heading || `消息 ${index + 1}`}\n\n${comment.body || "_Empty message._"}`;
+        })
+      : ["_No Teams messages captured. Make sure the WebDriver window is logged in and the target chat or channel is open._"])
+  ].filter((line) => line !== "");
+
+  return {
+    title: data.title || "Microsoft Teams conversation",
+    text: lines.join("\n"),
+    comments,
+    sourceUpdatedAt
+  };
+}
+
 function detectSourceAdapter(url) {
   const hostname = safeHostname(url);
   if (hostname === "confluence.amlogic.com") return { id: "amlogic-confluence", sourceType: "confluence", hostname };
   if (hostname === "jira.amlogic.com") return { id: "amlogic-jira", sourceType: "jira", hostname };
   if (hostname === "roku.atlassian.net") return { id: "roku-jira", sourceType: "jira", hostname };
   if (hostname === "github.ecodesamsung.com") return { id: "ecodesamsung-github", sourceType: "github", hostname };
+  if (hostname === "teams.microsoft.com" || hostname.endsWith(".teams.microsoft.com") || hostname === "teams.live.com" || hostname === "teams.cloud.microsoft") {
+    return { id: "microsoft-teams", sourceType: "teams", hostname: "teams.microsoft.com" };
+  }
   return { id: "generic-web", sourceType: "web", hostname };
 }
 
@@ -1973,6 +3813,7 @@ function inferPageKind(url, adapter) {
   if (adapter.sourceType === "jira" && /\/browse\/[A-Z][A-Z0-9]+-\d+/i.test(pathname)) return "content";
   if (adapter.sourceType === "github" && pathname === "/notifications") return "list";
   if (adapter.sourceType === "github" && /\/(issues|pull|discussions)\/\d+/i.test(pathname)) return "content";
+  if (adapter.sourceType === "teams") return "content";
   if (adapter.sourceType === "confluence" && (/\/pages\/viewpage\.action/i.test(pathname) || /\/display\//i.test(pathname))) return "content";
   return "content";
 }
@@ -2114,6 +3955,7 @@ function extractContentLinksFromList(html, url, adapter) {
 }
 
 function normalizeContentFetchUrl(url, adapter) {
+  if (adapter.sourceType === "teams") return canonicalizeMaterialUrl(url);
   if (adapter.sourceType !== "github") return url;
   try {
     const parsed = new URL(url);
@@ -2203,6 +4045,10 @@ function extractJiraIssues(html, baseUrl) {
     });
   }
 
+  if (issuesByKey.size) {
+    return [...issuesByKey.values()].slice(0, 200);
+  }
+
   const links = extractLinks(html, baseUrl).filter((link) => /\/browse\/[A-Z][A-Z0-9]+-\d+/i.test(safePathname(link.href)));
   for (const link of links) {
     const key = link.href.match(/\/browse\/([A-Z][A-Z0-9]+-\d+)/i)?.[1];
@@ -2219,10 +4065,20 @@ function extractJiraIssues(html, baseUrl) {
 
 function extractJiraCell(rowHtml, classNames) {
   for (const className of classNames) {
-    const pattern = new RegExp(`<td\\\\b[^>]*class=["'][^"']*${className}[^"']*["'][^>]*>([\\\\s\\\\S]*?)<\\\\/td>`, "i");
+    const pattern = new RegExp(`<td\\b[^>]*class=["'][^"']*${className}[^"']*["'][^>]*>([\\s\\S]*?)<\\/td>`, "i");
     const match = rowHtml.match(pattern);
-    if (match) return htmlToText(match[1]).replace(/\s+/g, " ").trim();
+    if (match) {
+      return extractJiraDateValue(match[1]) || htmlToText(match[1]).replace(/\s+/g, " ").trim();
+    }
   }
+  return "";
+}
+
+function extractJiraDateValue(html) {
+  const datetime = decodeHtml(String(html || "").match(/<time\b[^>]*datetime=["']([^"']+)["'][^>]*>/i)?.[1] || "");
+  if (datetime) return datetime;
+  const title = decodeHtml(String(html || "").match(/<span\b[^>]*title=["']([^"']+)["'][^>]*>/i)?.[1] || "");
+  if (title) return title;
   return "";
 }
 
@@ -2695,12 +4551,13 @@ function extractConfluenceComments(html, baseUrl) {
 function extractJiraIssuePage(html, url, adapter) {
   const key = cleanInlineText(extractHtmlById(html, "key-val")) || safePathname(url).match(/\/browse\/([A-Z][A-Z0-9]+-\d+)/i)?.[1] || "";
   const summary = cleanInlineText(extractHtmlById(html, "summary-val")) || extractTitle(html) || key || url;
+  const updatedHtml = extractHtmlById(html, "updated-val");
   const fields = {
     type: cleanInlineText(extractHtmlById(html, "type-val")),
     status: cleanInlineText(extractHtmlById(html, "status-val")),
     priority: cleanInlineText(extractHtmlById(html, "priority-val")),
     resolution: cleanInlineText(extractHtmlById(html, "resolution-val")),
-    updated: cleanInlineText(extractHtmlById(html, "updated-val")),
+    updated: extractJiraDateValue(updatedHtml),
     assignee: extractJiraPeopleField(html, "assignee-val"),
     reporter: extractJiraPeopleField(html, "reporter-val")
   };
@@ -2935,12 +4792,37 @@ function safeSearch(url) {
 }
 
 function normalizeUrlForMatch(url) {
+  const canonical = canonicalizeMaterialUrl(url);
   try {
-    const parsed = new URL(url);
+    const parsed = new URL(canonical);
     parsed.hash = "";
+    const adapter = detectSourceAdapter(canonical);
+    if (adapter.sourceType === "teams") {
+      parsed.search = "";
+    }
     return parsed.toString();
   } catch {
-    return cleanText(url);
+    return cleanText(canonical);
+  }
+}
+
+function canonicalizeMaterialUrl(url) {
+  const value = cleanText(url);
+  if (!value) return "";
+  const adapter = detectSourceAdapter(value);
+  if (adapter.sourceType !== "teams") return value;
+  const deepPath = extractTeamsDeepPath(value);
+  if (deepPath) return `https://teams.microsoft.com${deepPath}`;
+  try {
+    const parsed = new URL(value);
+    parsed.hash = "";
+    parsed.searchParams.delete("deeplinkId");
+    parsed.searchParams.delete("directDl");
+    parsed.searchParams.delete("msLaunch");
+    parsed.searchParams.delete("enableMobilePage");
+    return parsed.toString();
+  } catch {
+    return value;
   }
 }
 
@@ -2980,8 +4862,38 @@ ${body.trim() || "_No content captured yet._"}
 `;
 }
 
+function renderProcessedDocument(metadata, body) {
+  const url = metadata.url || "local input";
+  return `# ${metadata.title}
+
+## Metadata
+
+- ID: ${metadata.id}
+- Source: ${metadata.sourceType}
+- URL: ${url}
+- Processed: ${metadata.processedAt || new Date().toISOString()}
+- Model: ${metadata.processedModel || settings.ai?.model || "unknown"}
+
+## AI Organized Content
+
+${body.trim() || "_No organized content generated yet._"}
+`;
+}
+
 function extractBodyFromDocument(document) {
   const marker = "\n## Content\n\n";
+  const index = document.indexOf(marker);
+  return index === -1 ? document : document.slice(index + marker.length);
+}
+
+function unwrapMarkdownFence(markdown) {
+  const source = String(markdown || "").trim();
+  const match = source.match(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```\s*$/i);
+  return match ? match[1].trim() : source;
+}
+
+function extractProcessedBodyFromDocument(document) {
+  const marker = "\n## AI Organized Content\n\n";
   const index = document.indexOf(marker);
   return index === -1 ? document : document.slice(index + marker.length);
 }
@@ -3002,6 +4914,7 @@ function normalizeSourceType(sourceType, url) {
   if (lowerUrl.includes("confluence.amlogic.com")) return "confluence";
   if (lowerUrl.includes("github.com")) return "github";
   if (lowerUrl.includes("github.ecodesamsung.com")) return "github";
+  if (lowerUrl.includes("teams.microsoft.com") || lowerUrl.includes("teams.live.com") || lowerUrl.includes("teams.cloud.microsoft")) return "teams";
   if (lowerUrl.includes("jira") || lowerUrl.includes("/browse/")) return "jira";
   if (lowerUrl.includes("roku.atlassian.net")) return "jira";
   return "web";
@@ -3194,6 +5107,212 @@ async function ensureKnowledgeBase() {
   }
 }
 
+function supplementalContextPath() {
+  return path.join(kbDir, "SUPPLEMENTAL.md");
+}
+
+function supplementalEntriesPath() {
+  return path.join(kbDir, "SUPPLEMENTAL.json");
+}
+
+async function readSupplementalContext() {
+  return renderSupplementalMarkdown(await readSupplementalEntries(), { includePending: false });
+}
+
+async function saveSupplementalContext(content) {
+  return saveSupplementalEntries(parseSupplementalMarkdown(content));
+}
+
+async function readSupplementalEntries() {
+  const entriesPath = supplementalEntriesPath();
+  if (await exists(entriesPath)) {
+    try {
+      const payload = JSON.parse(await fs.readFile(entriesPath, "utf8"));
+      return normalizeSupplementalEntries(Array.isArray(payload) ? payload : payload.entries || []);
+    } catch {
+      return [];
+    }
+  }
+
+  const markdownPath = supplementalContextPath();
+  if (!(await exists(markdownPath))) return [];
+  return normalizeSupplementalEntries(parseSupplementalMarkdown(await fs.readFile(markdownPath, "utf8")));
+}
+
+async function saveSupplementalEntries(entries) {
+  const normalized = normalizeSupplementalEntries(entries);
+  await fs.mkdir(kbDir, { recursive: true });
+  await fs.writeFile(supplementalEntriesPath(), `${JSON.stringify({ entries: normalized }, null, 2)}\n`, "utf8");
+  await fs.writeFile(supplementalContextPath(), renderSupplementalMarkdown(normalized, { includePending: true }), "utf8");
+  return normalized;
+}
+
+function normalizeSupplementalEntries(entries) {
+  const seen = new Set();
+  return (entries || [])
+    .map((entry, index) => {
+      const term = cleanText(entry.term || entry.title || "");
+      const category = cleanText(entry.category || "待确认") || "待确认";
+      const reason = cleanText(entry.reason || entry.note || "");
+      const explanation = cleanText(entry.explanation || entry.description || "");
+      const id = cleanText(entry.id || slugId(term || reason || `entry-${index}`));
+      return { id, term, category, reason, explanation };
+    })
+    .filter((entry) => entry.term || entry.reason || entry.explanation)
+    .map((entry, index) => {
+      const base = entry.id || slugId(entry.term || `entry-${index}`);
+      let id = base;
+      let counter = 2;
+      while (seen.has(id)) {
+        id = `${base}-${counter}`;
+        counter += 1;
+      }
+      seen.add(id);
+      return { ...entry, id };
+    });
+}
+
+function parseSupplementalMarkdown(content) {
+  const entries = [];
+  let category = "待确认";
+  for (const line of String(content || "").replace(/\r\n/g, "\n").split("\n")) {
+    const heading = line.match(/^#{2,4}\s+(.+?)\s*$/);
+    if (heading) {
+      category = heading[1].replace(/^已说明[:：]?|^待说明[:：]?/, "").trim() || "待确认";
+      continue;
+    }
+    const bullet = line.match(/^\s*[-*]\s+(?:\*\*)?([^:*：]+?)(?:\*\*)?\s*[:：]\s*(.+?)\s*$/);
+    if (bullet) {
+      const term = bullet[1].trim();
+      const value = bullet[2].trim();
+      const isPending = /待补充|需要补充|未定义|未明确|需确认|待确认/.test(value);
+      entries.push({
+        id: slugId(term),
+        term,
+        category,
+        reason: isPending ? value : "",
+        explanation: isPending ? "" : value
+      });
+    }
+  }
+  return entries;
+}
+
+function renderSupplementalMarkdown(entries, options = {}) {
+  const includePending = options.includePending !== false;
+  const normalized = normalizeSupplementalEntries(entries);
+  const complete = normalized.filter((entry) => entry.explanation);
+  const pending = normalized.filter((entry) => !entry.explanation);
+  const groups = new Map();
+  for (const entry of complete) {
+    const group = entry.category || "补充说明";
+    groups.set(group, [...(groups.get(group) || []), entry]);
+  }
+
+  const lines = [];
+  for (const [category, groupEntries] of groups) {
+    lines.push(`## ${category}`);
+    for (const entry of groupEntries) {
+      const reason = entry.reason ? `（${entry.reason}）` : "";
+      lines.push(`- ${entry.term}: ${entry.explanation}${reason}`);
+    }
+    lines.push("");
+  }
+
+  if (includePending && pending.length) {
+    lines.push("## 待说明");
+    for (const entry of pending) {
+      lines.push(`- ${entry.term || "未命名"}: ${entry.reason || "待补充"}`);
+    }
+    lines.push("");
+  }
+
+  return cleanTextBlock(lines.join("\n"));
+}
+
+function cleanTextBlock(content) {
+  return String(content || "").replace(/\r\n/g, "\n").trim() + "\n";
+}
+
+async function supplementalPromptBlock() {
+  const content = (await readSupplementalContext()).trim();
+  if (!content) return "";
+  return [
+    "以下是用户维护的补充资料、缩写和项目背景。处理资料时必须优先参考，但不要把补充资料本身当作原文事实来源：",
+    content.slice(0, 12000)
+  ].join("\n\n");
+}
+
+async function suggestSupplementalContext(existingEntries = []) {
+  if (!settings.ai?.baseUrl || !settings.ai?.apiKey || !settings.ai?.model) {
+    throw new Error("请先在设置页配置 AI 接口后再分析补充资料。");
+  }
+  const existing = normalizeSupplementalEntries(existingEntries.length ? existingEntries : await readSupplementalEntries());
+  const corpus = await buildSupplementalAnalysisCorpus();
+  if (!corpus.trim()) throw new Error("当前资料库没有足够内容可分析。");
+  const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${settings.ai.apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: settings.ai.model,
+      temperature: 0.2,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "你是资料库术语分析助手。",
+            "请从资料片段中找出可能需要用户补充解释的缩写、项目名、模块名、测试名、产品代号、组织内部词汇。",
+            "不要重复已有候选项。",
+            "不要编造确定含义，只说明为什么需要用户补充或确认。",
+            "只返回 JSON，格式为 {\"entries\":[{\"term\":\"CI+\",\"category\":\"缩写\",\"reason\":\"多次出现但上下文不完整\",\"explanation\":\"\"}]}。"
+          ].join("\n")
+        },
+        {
+          role: "user",
+          content: [
+            `已有候选项：${existing.map((entry) => entry.term).filter(Boolean).join(", ") || "none"}`,
+            "",
+            corpus
+          ].join("\n")
+        }
+      ]
+    })
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`AI 分析补充资料失败：${response.status} ${text.slice(0, 300)}`);
+  const payload = JSON.parse(text);
+  const parsed = parseJsonObjectFromText(payload.choices?.[0]?.message?.content || "");
+  const existingTerms = new Set(existing.map((entry) => entry.term.toLowerCase()).filter(Boolean));
+  return normalizeSupplementalEntries(parsed.entries || [])
+    .filter((entry) => entry.term && !existingTerms.has(entry.term.toLowerCase()))
+    .map((entry) => ({ ...entry, explanation: "" }))
+    .slice(0, 40);
+}
+
+async function buildSupplementalAnalysisCorpus() {
+  const dirs = await safeReaddir(itemsDir);
+  const chunks = [];
+  for (const id of dirs.slice(0, 80)) {
+    const metadataPath = path.join(itemsDir, id, "metadata.json");
+    const documentPath = path.join(itemsDir, id, "document.md");
+    if (!(await exists(metadataPath)) || !(await exists(documentPath))) continue;
+    const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
+    if (metadata.pageKind === "list") continue;
+    const document = await fs.readFile(documentPath, "utf8");
+    chunks.push([
+      `# ${metadata.title}`,
+      `Source: ${metadata.sourceType}`,
+      extractBodyFromDocument(document).slice(0, 1800)
+    ].join("\n"));
+    if (chunks.join("\n\n---\n\n").length > 60000) break;
+  }
+  return chunks.join("\n\n---\n\n");
+}
+
 async function loadSettings() {
   const defaults = defaultSettings();
   if (!(await exists(settingsPath))) {
@@ -3213,10 +5332,20 @@ async function saveSettings(input) {
       apiKey: cleanText(input.ai?.apiKey ?? input.apiKey ?? settings.ai.apiKey),
       model: cleanText(input.ai?.model ?? input.model ?? settings.ai.model)
     },
+    embedding: {
+      enabled: Boolean(input.embedding?.enabled ?? settings.embedding?.enabled ?? false),
+      baseUrl: cleanText(input.embedding?.baseUrl ?? settings.embedding?.baseUrl ?? ""),
+      apiKey: cleanText(input.embedding?.apiKey ?? settings.embedding?.apiKey ?? ""),
+      model: cleanText(input.embedding?.model ?? settings.embedding?.model ?? ""),
+      dimensions: Number(input.embedding?.dimensions || settings.embedding?.dimensions || 0)
+    },
     chat: {
       showThinking: Boolean(input.chat?.showThinking ?? settings.chat?.showThinking ?? true),
       showToolCalls: Boolean(input.chat?.showToolCalls ?? settings.chat?.showToolCalls ?? true)
     },
+    notifications: normalizeNotificationSettings(input.notifications || settings.notifications || {}),
+    refreshSchedule: normalizeRefreshSchedule(input.refreshSchedule || settings.refreshSchedule || {}),
+    processingPrompts: normalizeProcessingPrompts(input.processingPrompts || settings.processingPrompts || {}),
     documentRoot: cleanText(input.documentRoot ?? settings.documentRoot),
     sources: mergeSourceProfiles(settings.sources, input.sources || {}),
     refreshJobs: mergeRefreshJobs(settings.refreshJobs || [], input.refreshJobs || settings.refreshJobs || [])
@@ -3235,15 +5364,26 @@ function defaultSettings() {
       apiKey: "",
       model: "gpt-4.1-mini"
     },
+    embedding: {
+      enabled: false,
+      baseUrl: "",
+      apiKey: "",
+      model: "Qwen/Qwen3-Embedding-0.6B",
+      dimensions: 1024
+    },
     chat: {
       showThinking: true,
       showToolCalls: true
     },
+    notifications: defaultNotificationSettings(),
+    refreshSchedule: defaultRefreshSchedule(),
+    processingPrompts: defaultProcessingPrompts(),
     sources: {
       "confluence.amlogic.com": defaultSourceProfile("confluence.amlogic.com", "confluence"),
       "jira.amlogic.com": defaultSourceProfile("jira.amlogic.com", "jira"),
       "roku.atlassian.net": defaultSourceProfile("roku.atlassian.net", "jira"),
-      "github.ecodesamsung.com": defaultSourceProfile("github.ecodesamsung.com", "github")
+      "github.ecodesamsung.com": defaultSourceProfile("github.ecodesamsung.com", "github"),
+      "teams.microsoft.com": defaultSourceProfile("teams.microsoft.com", "teams")
     },
     refreshJobs: [
       defaultRefreshJob("jira-amlogic-filter-50724", "Amlogic Jira Filter 50724", "https://jira.amlogic.com/issues/?filter=50724")
@@ -3259,10 +5399,26 @@ function mergeSettings(base, patch) {
       ...base.ai,
       ...(patch.ai || {})
     },
+    embedding: {
+      ...base.embedding,
+      ...(patch.embedding || {})
+    },
     chat: {
       ...base.chat,
       ...(patch.chat || {})
     },
+    notifications: normalizeNotificationSettings({
+      ...(base.notifications || {}),
+      ...(patch.notifications || {})
+    }),
+    refreshSchedule: normalizeRefreshSchedule({
+      ...(base.refreshSchedule || {}),
+      ...(patch.refreshSchedule || {})
+    }),
+    processingPrompts: normalizeProcessingPrompts({
+      ...(base.processingPrompts || {}),
+      ...(patch.processingPrompts || {})
+    }),
     sources: mergeSourceProfiles(base.sources || {}, patch.sources || {}),
     refreshJobs: mergeRefreshJobs(base.refreshJobs || [], patch.refreshJobs || [])
   };
@@ -3277,13 +5433,118 @@ function publicSettings() {
       apiKey: settings.ai.apiKey ? "********" : "",
       model: settings.ai.model
     },
+    embedding: {
+      enabled: Boolean(settings.embedding?.enabled),
+      baseUrl: settings.embedding?.baseUrl || "",
+      apiKey: settings.embedding?.apiKey ? "********" : "",
+      model: settings.embedding?.model || "",
+      dimensions: Number(settings.embedding?.dimensions || 0)
+    },
     chat: {
       showThinking: settings.chat?.showThinking !== false,
       showToolCalls: settings.chat?.showToolCalls !== false
     },
+    notifications: normalizeNotificationSettings(settings.notifications || {}),
+    refreshSchedule: normalizeRefreshSchedule(settings.refreshSchedule || {}),
+    processingPrompts: normalizeProcessingPrompts(settings.processingPrompts || {}),
     sources: publicSourceProfiles(),
     refreshJobs: publicRefreshJobs()
   };
+}
+
+function defaultNotificationSettings() {
+  return {
+    enabled: true,
+    sources: {
+      confluence: true,
+      jira: true,
+      github: true,
+      teams: true,
+      web: false,
+      text: false
+    }
+  };
+}
+
+function defaultRefreshSchedule() {
+  return {
+    startTime: "08:00",
+    endTime: "20:00"
+  };
+}
+
+function normalizeRefreshSchedule(input = {}) {
+  const defaults = defaultRefreshSchedule();
+  return {
+    startTime: formatTimeOfDay(input.startTime || defaults.startTime, defaults.startTime),
+    endTime: formatTimeOfDay(input.endTime || defaults.endTime, defaults.endTime)
+  };
+}
+
+function formatTimeOfDay(value, fallback) {
+  const parsed = parseTimeOfDay(value, fallback);
+  return `${String(parsed.hours).padStart(2, "0")}:${String(parsed.minutes).padStart(2, "0")}`;
+}
+
+function normalizeNotificationSettings(input = {}) {
+  const defaults = defaultNotificationSettings();
+  const sourceTypes = Object.keys(defaults.sources);
+  return {
+    enabled: input.enabled !== false,
+    sources: Object.fromEntries(sourceTypes.map((sourceType) => [
+      sourceType,
+      input.sources?.[sourceType] ?? defaults.sources[sourceType]
+    ]).map(([sourceType, enabled]) => [sourceType, Boolean(enabled)]))
+  };
+}
+
+function defaultProcessingPrompts() {
+  return {
+    text: [
+      "你是文本资料整理助手。",
+      "请把输入内容整理成可检索、可复用的知识条目。",
+      "重点提取主题、关键事实、术语、结论、待确认问题和后续动作。"
+    ].join("\n"),
+    web: [
+      "你是网页资料整理助手。",
+      "请过滤导航、页脚、广告和重复内容，保留正文信息。",
+      "整理为：一句话结论、关键内容、重要链接/引用、可能需要后续追踪的点。"
+    ].join("\n"),
+    confluence: [
+      "你是 Confluence 文档整理助手。",
+      "请提取页面目的、背景、方案/规则、关键步骤、配置项、风险点和待办。",
+      "如果内容像需求或设计文档，请按模块和决策点整理。"
+    ].join("\n"),
+    jira: [
+      "你是 Jira 问题进展整理助手。",
+      "请重点提取：问题概述、当前状态、负责人/相关人、复现条件、关键进展、阻塞点、评论结论、下一步动作。",
+      "评论很多时不要逐条复述，只保留推动问题状态变化的信息。"
+    ].join("\n"),
+    github: [
+      "你是 GitHub issue/PR 讨论整理助手。",
+      "请提取问题背景、讨论结论、代码/方案变化、review 关注点、未解决分歧、下一步动作。",
+      "对通知列表或多条 issue，请按条目归纳高优先级事项。"
+    ].join("\n"),
+    teams: [
+      "你是 Teams 对话整理助手。",
+      "请从聊天记录中提取真正有用的信息：结论、决策、问题、行动项、负责人、时间点和待确认事项。",
+      "不要流水账复述寒暄；如果对话只是沟通背景，请压缩成简短背景说明。"
+    ].join("\n")
+  };
+}
+
+function normalizeProcessingPrompts(prompts) {
+  const defaults = defaultProcessingPrompts();
+  const sourceTypes = ["text", "web", "confluence", "jira", "github", "teams"];
+  return Object.fromEntries(sourceTypes.map((sourceType) => [
+    sourceType,
+    cleanText(prompts?.[sourceType] || defaults[sourceType])
+  ]));
+}
+
+function resolveProcessingPrompt(sourceType) {
+  const prompts = normalizeProcessingPrompts(settings.processingPrompts || {});
+  return prompts[sourceType] || prompts.web || defaultProcessingPrompts().web;
 }
 
 function defaultRefreshJob(id, name, url) {
@@ -3294,7 +5555,7 @@ function defaultRefreshJob(id, name, url) {
     enabled: false,
     intervalMinutes: 60,
     maxItems: 50,
-    tags: ["jira"],
+    tags: [],
     fetchMode: "webdriver",
     pageKind: "list",
     status: "idle",
@@ -3355,7 +5616,8 @@ function defaultSourceProfile(hostname, sourceType) {
     username: "",
     password: "",
     cookie: "",
-    token: ""
+    token: "",
+    webdriverHeadless: false
   };
 }
 
@@ -3367,6 +5629,7 @@ function mergeSourceProfiles(base = {}, patch = {}) {
       ...previous,
       ...profile,
       hostname,
+      webdriverHeadless: Boolean(profile.webdriverHeadless ?? previous.webdriverHeadless),
       password: profile.password === "********" ? previous.password : cleanText(profile.password ?? previous.password),
       cookie: profile.cookie === "********" ? previous.cookie : cleanText(profile.cookie ?? previous.cookie),
       token: profile.token === "********" ? previous.token : cleanText(profile.token ?? previous.token)
@@ -3436,15 +5699,17 @@ This directory is the primary storage for the material organizer. Agents should 
 - indexes/by-source.json: source type to item ids.
 - indexes/by-updated.json: item ids sorted by recent update.
 - tags/<tag>.json: reverse index for a single tag.
+- SUPPLEMENTAL.md: user-maintained glossary, abbreviations, project background, and interpretation notes. Read this before interpreting internal terms.
 
 ## Answering Questions
 
 1. Start with indexes when the user asks by tag, source, or recency.
-2. Read metadata.json to confirm the item source, URL, and fetch time.
-3. Read document.md for summaries and extracted content.
-4. Read comments.jsonl when the user asks about comments, discussion, decisions, or original remarks.
-5. Cite item ids and URLs when answering so the user can trace information back to the source.
-6. If the information may have changed, mention the lastFetchedAt timestamp.
+2. Read SUPPLEMENTAL.md for glossary/context when interpreting abbreviations, project names, and internal terminology.
+3. Read metadata.json to confirm the item source, URL, and fetch time.
+4. Read document.md for summaries and extracted content.
+5. Read comments.jsonl when the user asks about comments, discussion, decisions, or original remarks.
+6. Cite item ids and URLs when answering so the user can trace information back to the source.
+7. If the information may have changed, mention the lastFetchedAt timestamp.
 `;
 }
 

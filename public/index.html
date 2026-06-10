@@ -12,7 +12,9 @@
         <div class="brand">
           <div class="brand-mark">M</div>
           <div>
-            <h1>资料整理助手</h1>
+            <div class="brand-title-row">
+              <h1>资料整理助手</h1>
+            </div>
             <p>本地资料库</p>
           </div>
         </div>
@@ -21,12 +23,22 @@
           <button class="nav-item is-active" data-view="chat">AI 对话</button>
           <button class="nav-item" data-view="materials">资料整理</button>
           <button class="nav-item" data-view="import">新增资料</button>
+          <button class="nav-item" data-view="updates">
+            <span>内容更新</span>
+            <span id="updatesNewBadge" class="new-badge" hidden>NEW!</span>
+          </button>
+          <button class="nav-item" data-view="supplemental">补充资料</button>
+          <button class="nav-item" data-view="subscriptions">订阅管理</button>
           <button class="nav-item" data-view="settings">设置</button>
         </nav>
 
         <div id="materialSidebar" class="material-sidebar" hidden>
-          <section class="source-panel">
-            <div class="panel-title">来源</div>
+          <div class="filter-tabs" role="tablist" aria-label="资料筛选">
+            <button class="filter-tab is-active" type="button" role="tab" aria-selected="true" data-filter-tab="source">来源</button>
+            <button class="filter-tab" type="button" role="tab" aria-selected="false" data-filter-tab="tag">标签</button>
+          </div>
+
+          <section class="source-panel filter-panel is-active" data-filter-panel="source">
             <div class="source-list">
               <button class="source-item is-active" data-source="">全部资料</button>
               <button class="source-item" data-source="text">文本</button>
@@ -34,11 +46,11 @@
               <button class="source-item" data-source="confluence">Confluence</button>
               <button class="source-item" data-source="jira">Jira</button>
               <button class="source-item" data-source="github">GitHub</button>
+              <button class="source-item" data-source="teams">Teams</button>
             </div>
           </section>
 
-          <section class="tag-panel">
-            <div class="panel-title">标签</div>
+          <section class="tag-panel filter-panel" data-filter-panel="tag" hidden>
             <div id="tagList" class="tag-list"></div>
           </section>
         </div>
@@ -83,11 +95,13 @@
         <section id="materialsView" class="materials-view" hidden>
           <section class="toolbar">
             <div>
-              <h2>资料整理</h2>
+              <h2 id="materialsTitle">资料整理</h2>
               <p id="resultCount">准备载入</p>
             </div>
             <div class="toolbar-actions">
               <input id="searchInput" type="search" placeholder="搜索标题、标签、内容" />
+              <button id="classifyListButton" type="button">列表分类</button>
+              <button id="batchProcessButton" type="button">处理</button>
             </div>
           </section>
 
@@ -127,6 +141,7 @@
                     <option value="confluence">Confluence</option>
                     <option value="jira">Jira</option>
                     <option value="github">GitHub</option>
+                    <option value="teams">Teams</option>
                   </select>
                 </label>
 
@@ -205,6 +220,43 @@
           </section>
         </section>
 
+        <section id="supplementalView" class="supplemental-view" hidden>
+          <div class="view-heading">
+            <h2>补充资料</h2>
+            <p>维护缩写、项目名、术语和背景说明。AI 整理、标题生成、标签推荐和问答都会参考这里的内容。</p>
+          </div>
+
+          <section class="supplemental-panel">
+            <div class="supplemental-actions">
+              <button id="addSupplementalEntryButton" type="button">新增条目</button>
+              <button id="suggestSupplementalButton" type="button">AI 分析候选补充项</button>
+              <button id="saveSupplementalButton" type="button" class="primary-button">保存补充资料</button>
+            </div>
+            <p id="supplementalStatus" class="status-message">载入中。</p>
+            <div id="supplementalSummary" class="supplemental-summary"></div>
+            <div id="supplementalList" class="supplemental-list"></div>
+          </section>
+        </section>
+
+        <section id="subscriptionsView" class="subscriptions-view" hidden>
+          <div class="view-heading">
+            <h2>订阅管理</h2>
+            <p>管理需要定时刷新或手动刷新列表型资料源，例如 Jira filter、GitHub notifications 和 Teams 对话。</p>
+          </div>
+
+          <section class="subscriptions-panel">
+            <div class="subscription-toolbar">
+              <div id="subscriptionTabs" class="subscription-tabs" role="tablist" aria-label="订阅来源"></div>
+              <div class="subscription-toolbar-actions">
+                <button id="runAllSubscriptionsButton" type="button">刷新所有</button>
+                <button id="saveSubscriptionsButton" type="button" class="primary-button">保存订阅设置</button>
+              </div>
+            </div>
+            <p id="refreshJobStatus">未执行刷新任务。</p>
+            <div id="refreshJobs" class="refresh-jobs"></div>
+          </section>
+        </section>
+
         <section id="settingsView" class="settings-view" hidden>
           <div class="view-heading">
             <h2>设置</h2>
@@ -212,7 +264,15 @@
           </div>
 
           <form id="settingsForm" class="settings-panel">
-            <section class="settings-section">
+            <div id="settingsTabs" class="settings-tabs" role="tablist" aria-label="设置分类">
+              <button class="settings-tab is-active" type="button" role="tab" aria-selected="true" data-settings-tab="ai">AI</button>
+              <button class="settings-tab" type="button" role="tab" aria-selected="false" data-settings-tab="capture">抓取</button>
+              <button class="settings-tab" type="button" role="tab" aria-selected="false" data-settings-tab="tags">标签</button>
+              <button class="settings-tab" type="button" role="tab" aria-selected="false" data-settings-tab="storage">存储</button>
+              <button class="settings-tab" type="button" role="tab" aria-selected="false" data-settings-tab="notify">提醒</button>
+            </div>
+
+            <section class="settings-section" data-settings-panel="ai">
               <h3>AI 接口</h3>
               <p>支持 OpenAI 兼容格式，会调用 <code>/chat/completions</code>。</p>
               <label>
@@ -229,7 +289,7 @@
               </label>
             </section>
 
-            <section class="settings-section">
+            <section class="settings-section" data-settings-panel="ai">
               <h3>AI 对话显示</h3>
               <p>控制对话流中是否显示可观察的过程事件。</p>
               <label class="inline-toggle">
@@ -242,13 +302,117 @@
               </label>
             </section>
 
-            <section class="settings-section">
+            <section class="settings-section" data-settings-panel="notify" hidden>
+              <h3>更新提醒</h3>
+              <p>自动刷新检测到新内容时发送系统通知，可按资料来源分别开启。</p>
+              <label class="inline-toggle">
+                <input id="settingNotificationsEnabled" type="checkbox" />
+                开启系统提醒
+              </label>
+              <div class="settings-grid notification-source-grid">
+                <label class="inline-toggle">
+                  <input data-notification-source="confluence" type="checkbox" />
+                  Confluence
+                </label>
+                <label class="inline-toggle">
+                  <input data-notification-source="jira" type="checkbox" />
+                  Jira
+                </label>
+                <label class="inline-toggle">
+                  <input data-notification-source="github" type="checkbox" />
+                  GitHub
+                </label>
+                <label class="inline-toggle">
+                  <input data-notification-source="teams" type="checkbox" />
+                  Teams
+                </label>
+                <label class="inline-toggle">
+                  <input data-notification-source="web" type="checkbox" />
+                  网页
+                </label>
+              </div>
+            </section>
+
+            <section class="settings-section" data-settings-panel="notify" hidden>
+              <h3>自动刷新时间窗口</h3>
+              <p>订阅按每日固定窗口计算刷新点。例如 08:00 开始、间隔 120 分钟，会在 08:00、10:00、12:00 依次刷新。</p>
+              <div class="settings-grid">
+                <label>
+                  开始时间
+                  <input id="settingRefreshStartTime" type="time" />
+                </label>
+                <label>
+                  结束时间
+                  <input id="settingRefreshEndTime" type="time" />
+                </label>
+              </div>
+            </section>
+
+            <section class="settings-section" data-settings-panel="ai">
+              <h3>Embedding 检索</h3>
+              <p>配置 OpenAI 兼容的 <code>/embeddings</code> 接口。未开启或配置不完整时，会继续使用简单关键词搜索。</p>
+              <label class="inline-toggle">
+                <input id="settingEmbeddingEnabled" type="checkbox" />
+                开启高精度混合检索
+              </label>
+              <label>
+                Embedding Base URL
+                <input id="settingEmbeddingBaseUrl" placeholder="例如 https://api.example.com/v1" />
+              </label>
+              <label>
+                Embedding API Key
+                <input id="settingEmbeddingApiKey" type="password" placeholder="可与 AI 接口相同" />
+              </label>
+              <div class="settings-grid">
+                <label>
+                  Embedding Model
+                  <input id="settingEmbeddingModel" placeholder="例如 Qwen/Qwen3-Embedding-0.6B" />
+                </label>
+                <label>
+                  向量维度
+                  <input id="settingEmbeddingDimensions" type="number" min="0" placeholder="例如 1024" />
+                </label>
+              </div>
+            </section>
+
+            <section class="settings-section" data-settings-panel="ai">
+              <h3>AI 资料整理提示词</h3>
+              <p>按资料来源配置整理规则。资料详情页点击生成整理后，会使用对应类型的提示词处理原文。</p>
+              <div class="prompt-grid">
+                <label>
+                  文本
+                  <textarea data-processing-prompt="text" rows="5"></textarea>
+                </label>
+                <label>
+                  网页
+                  <textarea data-processing-prompt="web" rows="5"></textarea>
+                </label>
+                <label>
+                  Confluence
+                  <textarea data-processing-prompt="confluence" rows="5"></textarea>
+                </label>
+                <label>
+                  Jira
+                  <textarea data-processing-prompt="jira" rows="5"></textarea>
+                </label>
+                <label>
+                  GitHub
+                  <textarea data-processing-prompt="github" rows="5"></textarea>
+                </label>
+                <label>
+                  Teams
+                  <textarea data-processing-prompt="teams" rows="5"></textarea>
+                </label>
+              </div>
+            </section>
+
+            <section class="settings-section" data-settings-panel="capture" hidden>
               <h3>页面来源认证</h3>
               <p>列表页和内容页抓取会优先使用这里配置的 Cookie、Token 或 Basic 认证。</p>
               <div id="sourceProfiles" class="source-profiles"></div>
             </section>
 
-            <section class="settings-section">
+            <section class="settings-section" data-settings-panel="capture" hidden>
               <h3>Webdriver 登录</h3>
               <p>打开一个持久化浏览器窗口，手动登录后，新增资料页选择 Webdriver 抓取即可复用登录态。</p>
               <div class="webdriver-actions">
@@ -256,24 +420,19 @@
                 <button type="button" data-webdriver-url="https://confluence.amlogic.com">打开 Amlogic Confluence</button>
                 <button type="button" data-webdriver-url="https://roku.atlassian.net">打开 Roku Atlassian</button>
                 <button type="button" data-webdriver-url="https://github.ecodesamsung.com">打开 Samsung GitHub</button>
+                <button type="button" data-webdriver-url="https://teams.microsoft.com">打开 Microsoft Teams</button>
               </div>
               <div class="webdriver-actions">
                 <button type="button" data-save-cookie-url="https://jira.amlogic.com">保存 Jira Cookie</button>
                 <button type="button" data-save-cookie-url="https://confluence.amlogic.com">保存 Confluence Cookie</button>
                 <button type="button" data-save-cookie-url="https://roku.atlassian.net">保存 Roku Cookie</button>
                 <button type="button" data-save-cookie-url="https://github.ecodesamsung.com">保存 GitHub Cookie</button>
+                <button type="button" data-save-cookie-url="https://teams.microsoft.com">保存 Teams Cookie</button>
               </div>
               <p id="webdriverStatus">未启动 Webdriver 会话。</p>
             </section>
 
-            <section class="settings-section">
-              <h3>自动刷新</h3>
-              <p>定时刷新列表型资料源，并更新列表中的内容页面，例如 Jira filter 和 GitHub notifications。</p>
-              <div id="refreshJobs" class="refresh-jobs"></div>
-              <p id="refreshJobStatus">未执行刷新任务。</p>
-            </section>
-
-            <section class="settings-section">
+            <section class="settings-section" data-settings-panel="tags" hidden>
               <h3>标签管理</h3>
               <p>新增标签，或批量删除不再需要的标签。删除标签只会从资料上移除标签，不会删除资料。</p>
               <div class="tag-manager-actions">
@@ -291,7 +450,7 @@
               <div id="settingsTagList" class="settings-tag-list"></div>
             </section>
 
-            <section class="settings-section">
+            <section class="settings-section" data-settings-panel="storage" hidden>
               <h3>资料保存</h3>
               <p>默认保存到当前项目的 <code>knowledge-base</code> 目录。修改到外部路径时，运行环境需要对应写入权限。</p>
               <label>
@@ -337,6 +496,11 @@
         </section>
 
         <section class="tag-editor-section">
+          <div class="tag-editor-title">已有标签</div>
+          <div id="existingTagChips" class="tag-editor-chips"></div>
+        </section>
+
+        <section class="tag-editor-section">
           <div class="tag-editor-title">
             <span>推荐标签</span>
             <button type="button" id="recommendTagsButton">AI 推荐</button>
@@ -348,6 +512,95 @@
         <div class="dialog-actions">
           <button type="button" id="cancelTagDialogButton">取消</button>
           <button type="submit" class="primary-button">确定</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="batchProcessDialog" class="batch-process-dialog">
+      <form method="dialog" id="batchProcessForm">
+        <div class="dialog-header">
+          <div>
+            <h3>批量处理资料</h3>
+            <p id="batchProcessSubtitle">为当前列表中未整理的资料生成标题和整理内容。</p>
+          </div>
+          <button type="button" id="closeBatchProcessButton" class="icon-button" aria-label="关闭">×</button>
+        </div>
+
+        <label class="inline-toggle">
+          <input id="batchProcessTagsToggle" type="checkbox" />
+          同时整理标签
+        </label>
+        <label>
+          标签处理方式
+          <select id="batchProcessTagMode">
+            <option value="batch">全部一起处理</option>
+            <option value="single">单独处理</option>
+          </select>
+        </label>
+        <label class="inline-toggle">
+          <input id="batchProcessForceToggle" type="checkbox" />
+          强制重新处理所有内容
+        </label>
+        <label>
+          并发数量
+          <input id="batchProcessConcurrency" type="number" min="1" max="8" value="2" />
+        </label>
+
+        <section class="batch-progress-panel">
+          <div class="batch-progress-top">
+            <span id="batchProcessStatus">等待开始。</span>
+            <span id="batchProcessCount">0 / 0</span>
+          </div>
+          <progress id="batchProcessProgress" value="0" max="100"></progress>
+        </section>
+
+        <section class="batch-tag-review" id="batchTagReview" hidden>
+          <div class="tag-editor-title">选择要保留的标签</div>
+          <div id="batchTagGroups" class="batch-tag-groups"></div>
+        </section>
+
+        <div class="dialog-actions">
+          <button type="button" id="cancelBatchProcessButton">关闭</button>
+          <button type="button" id="applyBatchTagsButton" hidden>应用标签</button>
+          <button type="button" id="startBatchProcessButton" class="primary-button">开始处理</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="classifyListDialog" class="classify-list-dialog">
+      <form method="dialog" id="classifyListForm">
+        <div class="dialog-header">
+          <div>
+            <h3>列表分类</h3>
+            <p id="classifyListSubtitle">自定义类别后，AI 会把当前列表中的资料逐条归入这些类别。</p>
+          </div>
+          <button type="button" id="closeClassifyListButton" class="icon-button" aria-label="关闭">×</button>
+        </div>
+
+        <label>
+          新增类别
+          <div class="tag-input-row">
+            <input id="classifyCategoryInput" placeholder="例如 BM 测试、CI+、环境搭建、签证出行" />
+            <button type="button" id="addClassifyCategoryButton">添加</button>
+          </div>
+        </label>
+
+        <section class="tag-editor-section">
+          <div class="tag-editor-title">当前类别</div>
+          <div id="classificationCategoryChips" class="tag-editor-chips classification-category-chips"></div>
+        </section>
+
+        <section class="batch-progress-panel">
+          <div class="batch-progress-top">
+            <span id="classificationStatus">等待分类。</span>
+            <span id="classificationCount">0 / 0</span>
+          </div>
+          <progress id="classificationProgress" value="0" max="100"></progress>
+        </section>
+
+        <div class="dialog-actions">
+          <button type="button" id="cancelClassifyListButton">取消</button>
+          <button type="button" id="runClassifyListButton" class="primary-button">分类</button>
         </div>
       </form>
     </dialog>
