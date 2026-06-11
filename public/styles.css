@@ -130,13 +130,6 @@ button {
   display: none;
 }
 
-.nav-item[data-view="updates"] {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
 .brand p,
 .toolbar p,
 .view-heading p {
@@ -1259,15 +1252,8 @@ textarea {
   text-align: center;
 }
 
-.update-badge {
-  flex-shrink: 0;
-  border: 1px solid #f7d8a6;
-  border-radius: 999px;
-  background: #fffbeb;
-  color: #9a6200;
-  padding: 3px 7px;
-  font-size: 12px;
-  font-weight: 800;
+.item-new-badge {
+  margin-left: 8px;
 }
 
 .item-meta,
@@ -1503,6 +1489,79 @@ textarea {
   font-size: 14px;
 }
 
+.detail-content-layout {
+  display: block;
+}
+
+.detail-content-layout.has-toc {
+  display: grid;
+  grid-template-columns: minmax(160px, 220px) minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+
+.detail-toc {
+  position: sticky;
+  top: 12px;
+  max-height: calc(100vh - 120px);
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+  padding: 12px;
+}
+
+.detail-toc-title {
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.detail-toc-list {
+  display: grid;
+  gap: 4px;
+}
+
+.detail-toc-link {
+  width: 100%;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  padding: 6px 8px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+}
+
+.detail-toc-link:hover {
+  background: #eaf3f6;
+  color: var(--accent-dark);
+}
+
+.detail-toc-link.level-1 {
+  padding-left: 8px;
+}
+
+.detail-toc-link.level-2 {
+  padding-left: 16px;
+}
+
+.detail-toc-link.level-3 {
+  padding-left: 24px;
+}
+
+.detail-toc-link.level-4 {
+  padding-left: 32px;
+}
+
+.toc-heading {
+  scroll-margin-top: 18px;
+}
+
 .markdown-body {
   color: var(--text);
 }
@@ -1596,6 +1655,17 @@ textarea {
 
 .markdown-body th {
   background: var(--panel-soft);
+}
+
+@media (max-width: 960px) {
+  .detail-content-layout.has-toc {
+    grid-template-columns: 1fr;
+  }
+
+  .detail-toc {
+    position: static;
+    max-height: 180px;
+  }
 }
 
 .empty-state {

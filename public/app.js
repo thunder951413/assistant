@@ -23,8 +23,6 @@ const state = {
   settingsTags: [],
   selectedSettingsTags: new Set(),
   supplementalEntries: [],
-  updateCount: 0,
-  updateOnly: false,
   listClassification: null,
   listClassifying: false,
   listClassifier: {
@@ -41,7 +39,6 @@ const state = {
 
 const itemList = document.querySelector("#itemList");
 const tagList = document.querySelector("#tagList");
-const updatesNewBadge = document.querySelector("#updatesNewBadge");
 const materialSidebar = document.querySelector("#materialSidebar");
 const filterTabs = [...document.querySelectorAll("[data-filter-tab]")];
 const filterPanels = [...document.querySelectorAll("[data-filter-panel]")];
@@ -103,6 +100,14 @@ const processingPromptFields = [...document.querySelectorAll("[data-processing-p
 const settingDocumentRoot = document.querySelector("#settingDocumentRoot");
 const activeDocumentRoot = document.querySelector("#activeDocumentRoot");
 const settingsStatus = document.querySelector("#settingsStatus");
+const exportSettingsButton = document.querySelector("#exportSettingsButton");
+const importSettingsButton = document.querySelector("#importSettingsButton");
+const exportDataButton = document.querySelector("#exportDataButton");
+const importDataButton = document.querySelector("#importDataButton");
+const settingsImportFile = document.querySelector("#settingsImportFile");
+const dataImportFile = document.querySelector("#dataImportFile");
+const replaceDataOnImport = document.querySelector("#replaceDataOnImport");
+const importExportStatus = document.querySelector("#importExportStatus");
 const sourceProfiles = document.querySelector("#sourceProfiles");
 const webdriverStatus = document.querySelector("#webdriverStatus");
 const subscriptionTabs = document.querySelector("#subscriptionTabs");
@@ -172,6 +177,12 @@ clearImportButton.addEventListener("click", resetImport);
 copyPreviewButton.addEventListener("click", copyPreview);
 summarizeButton.addEventListener("click", summarizePreview);
 settingsForm.addEventListener("submit", saveSettings);
+exportSettingsButton.addEventListener("click", () => downloadExport("/api/export/settings"));
+exportDataButton.addEventListener("click", () => downloadExport("/api/export/data"));
+importSettingsButton.addEventListener("click", () => settingsImportFile.click());
+importDataButton.addEventListener("click", () => dataImportFile.click());
+settingsImportFile.addEventListener("change", importSettingsFile);
+dataImportFile.addEventListener("change", importDataFile);
 saveSubscriptionsButton.addEventListener("click", saveSubscriptions);
 runAllSubscriptionsButton.addEventListener("click", runAllRefreshJobs);
 settingsTabs.forEach((button) => {
@@ -250,7 +261,6 @@ document.querySelectorAll(".source-item").forEach((button) => {
     button.classList.add("is-active");
     state.sourceType = button.dataset.source;
     state.tag = "";
-    state.updateOnly = state.view === "updates";
     await loadItems();
     renderTags();
   });
@@ -267,7 +277,6 @@ searchInput.addEventListener("input", debounce(async () => {
 
 await loadAgentConfig();
 await loadSettings();
-await loadUpdateCount();
 loadChatSessions();
 renderView();
 
@@ -281,13 +290,13 @@ function renderView() {
   });
 
   chatView.hidden = state.view !== "chat";
-  materialsView.hidden = !(state.view === "materials" || state.view === "updates");
+  materialsView.hidden = state.view !== "materials";
   importView.hidden = state.view !== "import";
   supplementalView.hidden = state.view !== "supplemental";
   subscriptionsView.hidden = state.view !== "subscriptions";
   settingsView.hidden = state.view !== "settings";
-  materialSidebar.hidden = !(state.view === "materials" || state.view === "updates");
-  materialsTitle.textContent = state.view === "updates" ? "内容更新" : "资料整理";
+  materialSidebar.hidden = state.view !== "materials";
+  materialsTitle.textContent = "资料整理";
   if (state.view === "settings") {
     setSettingsTab(state.settingsTab);
   }
@@ -322,14 +331,8 @@ function setSettingsTab(tabName) {
 
 async function switchView(view) {
   state.view = view;
-  if (view === "updates") {
-    state.updateOnly = true;
-    state.tag = "";
-  } else if (view === "materials") {
-    state.updateOnly = false;
-  }
   renderView();
-  if (state.view === "materials" || state.view === "updates") {
+  if (state.view === "materials") {
     await loadAll();
   }
   if (state.view === "settings") {
@@ -347,7 +350,6 @@ async function loadItems() {
   const params = new URLSearchParams();
   if (state.sourceType) params.set("sourceType", state.sourceType);
   if (state.tag) params.set("tag", state.tag);
-  if (state.updateOnly) params.set("updates", "1");
   if (state.query) params.set("q", state.query);
 
   const { items } = await api(`/api/items?${params}`);
@@ -357,36 +359,14 @@ async function loadItems() {
 }
 
 async function loadTags() {
-  const [{ tags }, updatePayload] = await Promise.all([
-    api("/api/tags"),
-    api("/api/items?updates=1")
-  ]);
+  const { tags } = await api("/api/tags");
   state.tags = tags;
-  state.updateCount = updatePayload.items?.length || 0;
-  renderBrandNewBadge();
   renderTags();
-}
-
-async function loadUpdateCount() {
-  try {
-    const { items } = await api("/api/items?updates=1");
-    state.updateCount = items?.length || 0;
-    renderBrandNewBadge();
-  } catch (error) {
-    console.warn("Failed to load update count:", error);
-  }
-}
-
-function renderBrandNewBadge() {
-  updatesNewBadge.hidden = !state.updateCount;
-  updatesNewBadge.title = state.updateCount ? `${state.updateCount} 条内容更新` : "";
 }
 
 function renderItems() {
   const classified = state.listClassification?.groups?.length;
-  resultCount.textContent = state.updateOnly
-    ? `${state.items.length} 条有更新的资料${classified ? ` · ${state.listClassification.groups.length} 个分类` : ""}`
-    : `${state.items.length} 条资料${classified ? ` · ${state.listClassification.groups.length} 个分类` : ""}`;
+  resultCount.textContent = `${state.items.length} 条资料${classified ? ` · ${state.listClassification.groups.length} 个分类` : ""}`;
   classifyListButton.textContent = state.listClassifying
     ? "分类中..."
     : classified
@@ -395,7 +375,7 @@ function renderItems() {
   classifyListButton.disabled = state.listClassifying || !state.items.length;
 
   if (!state.items.length) {
-    itemList.innerHTML = `<div class="empty-state">${state.updateOnly ? "还没有检测到内容更新。" : "还没有符合条件的资料。"}</div>`;
+    itemList.innerHTML = `<div class="empty-state">还没有符合条件的资料。</div>`;
     return;
   }
 
@@ -414,7 +394,7 @@ function renderItemCard(item) {
     <button class="item-card ${state.selectedId === item.id ? "is-selected" : ""}" data-id="${escapeHtml(item.id)}">
       <div class="item-card-title">
         <h3>${escapeHtml(item.title)}</h3>
-        ${item.contentUpdatedAt ? `<span class="update-badge">内容更新</span>` : ""}
+        ${item.contentUpdatedAt ? `<span class="new-badge item-new-badge">NEW!</span>` : ""}
       </div>
     </button>
   `;
@@ -976,7 +956,6 @@ function renderTags() {
   tagList.innerHTML = allButton + tagButtons;
   tagList.querySelectorAll(".tag-chip").forEach((chip) => {
     chip.addEventListener("click", async () => {
-      state.updateOnly = state.view === "updates";
       state.tag = chip.dataset.tag;
       await loadItems();
       renderTags();
@@ -1039,9 +1018,16 @@ function renderDetail(item) {
     ${metadata.contentUpdatedAt ? `<div class="item-meta">内容更新：${escapeHtml(formatDate(metadata.contentUpdatedAt))}</div>` : ""}
     <hr />
     ${modeNote}
-    <div class="detail-doc markdown-body">${renderMarkdown(displayedDocument)}</div>
+    <div id="detailContentLayout" class="detail-content-layout">
+      <aside id="detailToc" class="detail-toc" hidden>
+        <div class="detail-toc-title">目录</div>
+        <nav id="detailTocList" class="detail-toc-list" aria-label="内容目录"></nav>
+      </aside>
+      <div id="detailDoc" class="detail-doc markdown-body">${renderMarkdown(displayedDocument)}</div>
+    </div>
   `;
   setupDetailTitleMarquee();
+  setupDetailToc();
 
   document.querySelector("#detailModeSwitch").addEventListener("change", (event) => {
     state.detailMode = event.target.checked ? "processed" : "raw";
@@ -1153,6 +1139,72 @@ function setupDetailTitleMarquee() {
     update();
   });
   update();
+}
+
+function setupDetailToc() {
+  const doc = document.querySelector("#detailDoc");
+  const toc = document.querySelector("#detailToc");
+  const tocList = document.querySelector("#detailTocList");
+  const layout = document.querySelector("#detailContentLayout");
+  if (!doc || !toc || !tocList || !layout) return;
+
+  const headings = [...doc.querySelectorAll("h1, h2, h3, h4")]
+    .map((heading, index) => {
+      const text = heading.textContent.trim();
+      if (!text) return null;
+      const id = uniqueHeadingId(slugForHeading(text), index, doc);
+      heading.id = id;
+      heading.classList.add("toc-heading");
+      return {
+        id,
+        text,
+        level: Number(heading.tagName.slice(1))
+      };
+    })
+    .filter(Boolean);
+
+  if (!headings.length) {
+    toc.hidden = true;
+    layout.classList.remove("has-toc");
+    return;
+  }
+
+  toc.hidden = false;
+  layout.classList.add("has-toc");
+  tocList.innerHTML = headings.map((heading) => `
+    <button type="button" class="detail-toc-link level-${heading.level}" data-heading-id="${escapeHtml(heading.id)}">
+      ${escapeHtml(heading.text)}
+    </button>
+  `).join("");
+
+  tocList.querySelectorAll("[data-heading-id]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const target = document.getElementById(button.dataset.headingId);
+      if (!target) return;
+      target.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  });
+}
+
+function slugForHeading(value) {
+  const slug = String(value || "")
+    .toLowerCase()
+    .replace(/<[^>]+>/g, "")
+    .replace(/&[a-z0-9#]+;/gi, "")
+    .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+  return slug || "heading";
+}
+
+function uniqueHeadingId(base, index, root) {
+  let id = `doc-${base}`;
+  let counter = index + 1;
+  while (root.querySelector(`#${CSS.escape(id)}`)) {
+    id = `doc-${base}-${counter}`;
+    counter += 1;
+  }
+  return id;
 }
 
 async function openTagDialog(item) {
@@ -1966,6 +2018,81 @@ async function saveSettings(event) {
   }
 }
 
+async function downloadExport(path) {
+  importExportStatus.textContent = "正在生成导出文件...";
+  try {
+    const response = await fetch(path);
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error || `导出失败：${response.status}`);
+    }
+    const blob = await response.blob();
+    const filename = filenameFromDisposition(response.headers.get("Content-Disposition"))
+      || (path.includes("settings") ? "assistant-settings.json" : "assistant-data.json");
+    const href = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = href;
+    link.download = filename;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(href);
+    importExportStatus.textContent = `已导出 ${filename}。`;
+  } catch (error) {
+    importExportStatus.textContent = error.message;
+  }
+}
+
+async function importSettingsFile(event) {
+  const file = event.target.files?.[0];
+  event.target.value = "";
+  if (!file) return;
+  importExportStatus.textContent = "正在导入设置...";
+  try {
+    const payload = JSON.parse(await file.text());
+    const { settings } = await api("/api/import/settings", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+    await loadSettings();
+    activeDocumentRoot.textContent = settings.activeDocumentRoot;
+    agentRoot.textContent = settings.activeDocumentRoot;
+    importExportStatus.textContent = "设置导入完成。";
+  } catch (error) {
+    importExportStatus.textContent = error.message;
+  }
+}
+
+async function importDataFile(event) {
+  const file = event.target.files?.[0];
+  event.target.value = "";
+  if (!file) return;
+  importExportStatus.textContent = "正在导入数据...";
+  try {
+    const bundle = JSON.parse(await file.text());
+    const result = await api("/api/import/data", {
+      method: "POST",
+      body: JSON.stringify({
+        bundle,
+        mode: replaceDataOnImport.checked ? "replace" : "merge"
+      })
+    });
+    await loadTags();
+    if (state.view === "materials") await loadItems();
+    importExportStatus.textContent = `数据导入完成：写入 ${result.writtenFileCount} 个文件。`;
+  } catch (error) {
+    importExportStatus.textContent = error.message;
+  }
+}
+
+function filenameFromDisposition(disposition) {
+  const value = String(disposition || "");
+  const utf8Match = value.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match) return decodeURIComponent(utf8Match[1]);
+  const plainMatch = value.match(/filename="?([^";]+)"?/i);
+  return plainMatch ? plainMatch[1] : "";
+}
+
 function collectProcessingPrompts() {
   return Object.fromEntries(processingPromptFields.map((field) => [
     field.dataset.processingPrompt,
@@ -2157,6 +2284,14 @@ function renderSourceProfiles(profiles) {
       <label class="checkbox-row">
         <input data-field="webdriverHeadless" type="checkbox" ${profile.webdriverHeadless ? "checked" : ""} />
         <span>后台抓取使用无头浏览器</span>
+      </label>
+      <label>
+        Webdriver 窗口模式
+        <select data-field="webdriverWindowMode">
+          <option value="compact" ${profile.webdriverWindowMode !== "normal" && profile.webdriverWindowMode !== "minimized" ? "selected" : ""}>小窗口后台</option>
+          <option value="normal" ${profile.webdriverWindowMode === "normal" ? "selected" : ""}>正常窗口</option>
+          <option value="minimized" ${profile.webdriverWindowMode === "minimized" ? "selected" : ""}>尝试最小化</option>
+        </select>
       </label>
       <label data-auth-field="basic">
         用户名
@@ -2379,10 +2514,8 @@ async function runRefreshJob(id) {
     const { result, jobs } = await api(`/api/refresh-jobs/${encodeURIComponent(id)}/run`, { method: "POST" });
     renderRefreshJobs(jobs || []);
     refreshJobStatus.textContent = `刷新完成：更新 ${result.updatedItemCount ?? result.updatedIssueCount ?? 0} / ${result.linkCount ?? result.issueCount ?? 0} 个内容页，跳过 ${result.skippedItemCount || 0} 个，失败 ${result.errorCount} 个。`;
-    if (state.view === "materials" || state.view === "updates") {
+    if (state.view === "materials") {
       await loadAll();
-    } else {
-      await loadUpdateCount();
     }
   } catch (error) {
     refreshJobStatus.textContent = error.message;
@@ -2424,10 +2557,8 @@ async function runAllRefreshJobs() {
       }
     }
     refreshJobStatus.textContent = `全部刷新完成：更新 ${updated} / ${total} 个内容页，跳过 ${skipped} 个，失败 ${failed} 个。`;
-    if (state.view === "materials" || state.view === "updates") {
+    if (state.view === "materials") {
       await loadAll();
-    } else {
-      await loadUpdateCount();
     }
   } finally {
     runAllSubscriptionsButton.disabled = false;

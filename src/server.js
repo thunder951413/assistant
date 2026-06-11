@@ -296,6 +296,38 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (req.method === "GET" && url.pathname === "/api/export/settings") {
+    sendJsonDownload(res, exportFilename("assistant-settings"), {
+      type: "material-organizer-settings",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      settings
+    });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/import/settings") {
+    const body = await readBody(req);
+    settings = await importSettingsBundle(body);
+    configureKnowledgeBase();
+    await ensureKnowledgeBase();
+    startRefreshScheduler();
+    sendJson(res, 200, { settings: publicSettings() });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/export/data") {
+    sendJsonDownload(res, exportFilename("assistant-data"), await exportDataBundle());
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/import/data") {
+    const body = await readBody(req);
+    const result = await importDataBundle(body.bundle || body, { mode: body.mode || "merge" });
+    sendJson(res, 200, result);
+    return;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/source-profiles") {
     sendJson(res, 200, { profiles: publicSourceProfiles() });
     return;
@@ -1805,7 +1837,13 @@ async function listItems(filters = {}) {
     });
   }
 
-  return items.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+  return items.sort((a, b) => {
+    const updateState = Number(Boolean(b.contentUpdatedAt)) - Number(Boolean(a.contentUpdatedAt));
+    if (updateState !== 0) return updateState;
+    const updateTime = String(b.contentUpdatedAt || "").localeCompare(String(a.contentUpdatedAt || ""));
+    if (updateTime !== 0) return updateTime;
+    return String(b.updatedAt).localeCompare(String(a.updatedAt));
+  });
 }
 
 async function searchItems(query) {
@@ -3432,9 +3470,10 @@ async function ensureWebdriverSession(hostname, url, options = {}) {
   const profile = settings.sources?.[key] || {};
   const headless = headed ? false : Boolean(profile.webdriverHeadless);
   const autoClose = Boolean(normalizedOptions.autoClose && !manual);
+  const windowMode = normalizeWebdriverWindowMode(profile.webdriverWindowMode);
   const existing = webdriverSessions.get(key);
   if (existing) {
-    if (headed && existing.headless) {
+    if ((headed && existing.headless) || existing.windowMode !== windowMode) {
       await existing.context.close();
     } else {
       return existing;
@@ -3443,19 +3482,15 @@ async function ensureWebdriverSession(hostname, url, options = {}) {
 
   await fs.mkdir(webdriverRoot, { recursive: true });
   const userDataDir = path.join(webdriverRoot, slugify(key));
-  const windowSize = manual
-    ? { width: 1000, height: 720 }
-    : { width: 900, height: 640 };
-  const windowPosition = manual
-    ? { x: 80, y: 80 }
-    : { x: -2400, y: 80 };
+  const windowPlacement = webdriverWindowPlacement(windowMode, manual);
   const context = await chromium.launchPersistentContext(userDataDir, {
     headless,
-    viewport: windowSize,
+    viewport: windowPlacement.size,
     args: [
       "--disable-blink-features=AutomationControlled",
-      `--window-size=${windowSize.width},${windowSize.height}`,
-      `--window-position=${windowPosition.x},${windowPosition.y}`
+      `--window-size=${windowPlacement.size.width},${windowPlacement.size.height}`,
+      `--window-position=${windowPlacement.position.x},${windowPlacement.position.y}`,
+      ...windowPlacement.args
     ]
   });
   const page = context.pages()[0] || await context.newPage();
@@ -3465,6 +3500,7 @@ async function ensureWebdriverSession(hostname, url, options = {}) {
     context,
     page,
     headless,
+    windowMode,
     manual,
     autoClose,
     startedAt: new Date().toISOString()
@@ -3509,10 +3545,39 @@ function describeWebdriverSession(hostname, session) {
     hostname,
     userDataDir: session.userDataDir,
     headless: Boolean(session.headless),
+    windowMode: session.windowMode || "compact",
     manual: Boolean(session.manual),
     autoClose: Boolean(session.autoClose),
     startedAt: session.startedAt,
     url: session.page?.url?.() || ""
+  };
+}
+
+function normalizeWebdriverWindowMode(value) {
+  return ["normal", "compact", "minimized"].includes(value) ? value : "compact";
+}
+
+function webdriverWindowPlacement(mode, manual) {
+  if (mode === "normal") {
+    return {
+      size: manual ? { width: 1000, height: 720 } : { width: 900, height: 640 },
+      position: manual ? { x: 80, y: 80 } : { x: -2400, y: 80 },
+      args: []
+    };
+  }
+
+  if (mode === "minimized") {
+    return {
+      size: { width: 420, height: 260 },
+      position: { x: -3000, y: 80 },
+      args: ["--start-minimized"]
+    };
+  }
+
+  return {
+    size: { width: manual ? 520 : 420, height: manual ? 420 : 260 },
+    position: manual ? { x: -2200, y: 80 } : { x: -3000, y: 80 },
+    args: []
   };
 }
 
@@ -4884,6 +4949,15 @@ function sendJson(res, status, payload) {
   res.end(JSON.stringify(payload));
 }
 
+function sendJsonDownload(res, filename, payload) {
+  const content = `${JSON.stringify(payload, null, 2)}\n`;
+  res.writeHead(200, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Content-Disposition": `attachment; filename="${filename}"`
+  });
+  res.end(content);
+}
+
 function startSse(res) {
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -5154,6 +5228,105 @@ async function loadSettings() {
 
   const saved = JSON.parse(await fs.readFile(settingsPath, "utf8"));
   return mergeSettings(defaults, saved);
+}
+
+function exportFilename(prefix) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `${prefix}-${stamp}.json`;
+}
+
+async function importSettingsBundle(payload) {
+  const imported = payload?.settings || payload;
+  if (!imported || typeof imported !== "object" || Array.isArray(imported)) {
+    throw new Error("设置导入文件格式不正确。");
+  }
+  const next = mergeSettings(defaultSettings(), imported);
+  await fs.mkdir(configDir, { recursive: true });
+  await fs.writeFile(settingsPath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+  return next;
+}
+
+async function exportDataBundle() {
+  await ensureKnowledgeBase();
+  const files = await collectDataFiles(kbDir);
+  return {
+    type: "material-organizer-data",
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    documentRootName: path.basename(kbDir),
+    fileCount: files.length,
+    files
+  };
+}
+
+async function collectDataFiles(baseDir, relativeDir = "") {
+  const dir = path.join(baseDir, relativeDir);
+  const names = await safeReaddir(dir);
+  const files = [];
+  for (const name of names) {
+    if (name === ".DS_Store") continue;
+    const relativePath = relativeDir ? path.posix.join(relativeDir, name) : name;
+    const absolutePath = path.join(baseDir, relativePath);
+    const stat = await fs.stat(absolutePath);
+    if (stat.isDirectory()) {
+      files.push(...await collectDataFiles(baseDir, relativePath));
+      continue;
+    }
+    if (!stat.isFile()) continue;
+    const content = await fs.readFile(absolutePath);
+    files.push({
+      path: relativePath.split(path.sep).join("/"),
+      encoding: "base64",
+      content: content.toString("base64")
+    });
+  }
+  return files;
+}
+
+async function importDataBundle(bundle, options = {}) {
+  if (!bundle || bundle.type !== "material-organizer-data" || !Array.isArray(bundle.files)) {
+    throw new Error("数据导入文件格式不正确。");
+  }
+
+  const mode = options.mode === "replace" ? "replace" : "merge";
+  await fs.mkdir(path.dirname(kbDir), { recursive: true });
+  let backupPath = "";
+  if (mode === "replace" && await exists(kbDir)) {
+    backupPath = `${kbDir}.backup-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+    await fs.rename(kbDir, backupPath);
+  }
+  await fs.mkdir(kbDir, { recursive: true });
+
+  let writtenFileCount = 0;
+  for (const file of bundle.files) {
+    const relativePath = validateDataBundlePath(file.path);
+    const targetPath = path.join(kbDir, relativePath);
+    await fs.mkdir(path.dirname(targetPath), { recursive: true });
+    const content = Buffer.from(String(file.content || ""), file.encoding === "utf8" ? "utf8" : "base64");
+    await fs.writeFile(targetPath, content);
+    writtenFileCount += 1;
+  }
+
+  await ensureKnowledgeBase();
+  await rebuildIndexes();
+  return {
+    ok: true,
+    mode,
+    backupPath,
+    writtenFileCount
+  };
+}
+
+function validateDataBundlePath(value) {
+  const relativePath = String(value || "").replace(/\\/g, "/");
+  if (!relativePath || relativePath.startsWith("/") || relativePath.includes("\0")) {
+    throw new Error(`非法数据文件路径：${value}`);
+  }
+  const normalized = path.posix.normalize(relativePath);
+  if (normalized === "." || normalized.startsWith("../") || normalized.includes("/../")) {
+    throw new Error(`非法数据文件路径：${value}`);
+  }
+  return normalized;
 }
 
 async function saveSettings(input) {
@@ -5448,7 +5621,8 @@ function defaultSourceProfile(hostname, sourceType) {
     password: "",
     cookie: "",
     token: "",
-    webdriverHeadless: false
+    webdriverHeadless: false,
+    webdriverWindowMode: "compact"
   };
 }
 
@@ -5461,6 +5635,7 @@ function mergeSourceProfiles(base = {}, patch = {}) {
       ...profile,
       hostname,
       webdriverHeadless: Boolean(profile.webdriverHeadless ?? previous.webdriverHeadless),
+      webdriverWindowMode: normalizeWebdriverWindowMode(profile.webdriverWindowMode ?? previous.webdriverWindowMode),
       password: profile.password === "********" ? previous.password : cleanText(profile.password ?? previous.password),
       cookie: profile.cookie === "********" ? previous.cookie : cleanText(profile.cookie ?? previous.cookie),
       token: profile.token === "********" ? previous.token : cleanText(profile.token ?? previous.token)
