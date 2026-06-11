@@ -23,6 +23,7 @@ const state = {
   settingsTags: [],
   selectedSettingsTags: new Set(),
   supplementalEntries: [],
+  updateCount: 0,
   listClassification: null,
   listClassifying: false,
   listClassifier: {
@@ -39,6 +40,7 @@ const state = {
 
 const itemList = document.querySelector("#itemList");
 const tagList = document.querySelector("#tagList");
+const materialsNewBadge = document.querySelector("#materialsNewBadge");
 const materialSidebar = document.querySelector("#materialSidebar");
 const filterTabs = [...document.querySelectorAll("[data-filter-tab]")];
 const filterPanels = [...document.querySelectorAll("[data-filter-panel]")];
@@ -277,11 +279,12 @@ searchInput.addEventListener("input", debounce(async () => {
 
 await loadAgentConfig();
 await loadSettings();
+await loadMaterialUpdateCount();
 loadChatSessions();
 renderView();
 
 async function loadAll() {
-  await Promise.all([loadTags(), loadItems()]);
+  await Promise.all([loadTags(), loadItems(), loadMaterialUpdateCount()]);
 }
 
 function renderView() {
@@ -300,6 +303,7 @@ function renderView() {
   if (state.view === "settings") {
     setSettingsTab(state.settingsTab);
   }
+  renderMaterialsNewBadge();
 }
 
 function setFilterTab(tabName) {
@@ -354,14 +358,39 @@ async function loadItems() {
 
   const { items } = await api(`/api/items?${params}`);
   state.items = items;
+  syncMaterialUpdateCountFromItems(items);
   state.listClassification = null;
   renderItems();
+  renderMaterialsNewBadge();
 }
 
 async function loadTags() {
   const { tags } = await api("/api/tags");
   state.tags = tags;
   renderTags();
+}
+
+async function loadMaterialUpdateCount() {
+  try {
+    const { items } = await api("/api/items?updates=1");
+    state.updateCount = items?.length || 0;
+    renderMaterialsNewBadge();
+  } catch (error) {
+    console.warn("Failed to load material update count:", error);
+  }
+}
+
+function syncMaterialUpdateCountFromItems(items) {
+  const visibleUpdates = (items || []).filter((item) => item.contentUpdatedAt).length;
+  if (visibleUpdates || !state.sourceType && !state.tag && !state.query) {
+    state.updateCount = visibleUpdates;
+  }
+}
+
+function renderMaterialsNewBadge() {
+  if (!materialsNewBadge) return;
+  materialsNewBadge.hidden = !state.updateCount;
+  materialsNewBadge.title = state.updateCount ? `${state.updateCount} 条资料有新内容` : "";
 }
 
 function renderItems() {
@@ -967,7 +996,36 @@ async function selectItem(id) {
   state.selectedId = id;
   renderItems();
   const { item } = await api(`/api/items/${encodeURIComponent(id)}`);
+  if (item.metadata.contentUpdatedAt) {
+    const acknowledgedItem = await acknowledgeSelectedItemUpdate(id);
+    renderDetail(acknowledgedItem || item);
+    return;
+  }
   renderDetail(item);
+}
+
+async function acknowledgeSelectedItemUpdate(id) {
+  try {
+    const { item } = await api(`/api/items/${encodeURIComponent(id)}/ack-update`, { method: "POST" });
+    if (state.selectedId !== id) return item;
+    const index = state.items.findIndex((candidate) => candidate.id === id);
+    if (index !== -1) {
+      state.items[index] = {
+        ...state.items[index],
+        contentUpdatedAt: "",
+        updateAcknowledgedAt: item.metadata.updateAcknowledgedAt || ""
+      };
+      state.updateCount = Math.max(0, state.updateCount - 1);
+      renderItems();
+      renderMaterialsNewBadge();
+    } else {
+      await loadMaterialUpdateCount();
+    }
+    return item;
+  } catch (error) {
+    console.warn("Failed to acknowledge item update:", error);
+    return null;
+  }
 }
 
 function renderDetail(item) {
