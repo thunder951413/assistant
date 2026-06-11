@@ -4,6 +4,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { chromium } from "playwright";
+import {
+  cleanText,
+  normalizeTags,
+  safeHostname,
+  safePathname,
+  safeSearch,
+  slugify,
+  uniqueValues
+} from "./utils.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -655,22 +664,14 @@ async function refreshItem(id) {
     && normalizeSourceUpdatedAt(nextSourceUpdatedAt) !== normalizeSourceUpdatedAt(item.metadata.sourceUpdatedAt || "");
   const contentChanged = previousBody !== currentBody;
   const hasUpdate = Boolean(sourceChanged || contentChanged);
-  const updateSummary = hasUpdate
-    ? await buildUpdateSummaryWithAi(previousBody, currentBody, {
-      generatedAt: now,
-      sourceUpdatedAt: nextSourceUpdatedAt,
-      title: item.metadata.title || fetched.title,
-      sourceType: item.metadata.sourceType
-    })
-    : item.metadata.updateSummary || null;
+  const { updateSummary: _ignoredUpdateSummary, ...previousMetadata } = item.metadata;
   const metadata = {
-    ...item.metadata,
+    ...previousMetadata,
     title: item.metadata.title || fetched.title,
     updatedAt: now,
     lastFetchedAt: now,
     sourceUpdatedAt: nextSourceUpdatedAt,
     contentUpdatedAt: hasUpdate ? now : item.metadata.contentUpdatedAt || "",
-    updateSummary,
     processedStale: hasUpdate && item.metadata.processedAt ? true : item.metadata.processedStale || false,
     refreshNote: {
       previousDocumentLength: previousLength,
@@ -736,16 +737,9 @@ async function upsertFetchedItem(input) {
     && normalizeSourceUpdatedAt(nextSourceUpdatedAt) !== normalizeSourceUpdatedAt(item.metadata.sourceUpdatedAt || "");
   const contentChanged = previousBody !== currentBody;
   const hasUpdate = Boolean(sourceChanged || contentChanged);
-  const updateSummary = hasUpdate
-    ? await buildUpdateSummaryWithAi(previousBody, currentBody, {
-      generatedAt: input.fetchedAt,
-      sourceUpdatedAt: nextSourceUpdatedAt,
-      title: input.title || item.metadata.title,
-      sourceType: input.sourceType || item.metadata.sourceType
-    })
-    : item.metadata.updateSummary || null;
+  const { updateSummary: _ignoredUpdateSummary, ...previousMetadata } = item.metadata;
   const metadata = {
-    ...item.metadata,
+    ...previousMetadata,
     title: input.title || item.metadata.title,
     sourceType: input.sourceType || item.metadata.sourceType,
     url: itemUrl,
@@ -754,7 +748,6 @@ async function upsertFetchedItem(input) {
     lastFetchedAt: input.fetchedAt,
     sourceUpdatedAt: nextSourceUpdatedAt,
     contentUpdatedAt: hasUpdate ? input.fetchedAt : item.metadata.contentUpdatedAt || "",
-    updateSummary,
     processedStale: hasUpdate && item.metadata.processedAt ? true : item.metadata.processedStale || false,
     rawFileName: item.metadata.rawFileName || "raw.html",
     pageKind: input.pageKind || item.metadata.pageKind || null,
@@ -797,116 +790,6 @@ function shouldSkipContentRefresh(existingMetadata, listUpdatedAt) {
     return existingTime >= listTime || Math.abs(existingTime - listTime) <= 60 * 1000;
   }
   return normalizeSourceUpdatedAt(existingMetadata.sourceUpdatedAt, existingMetadata.lastFetchedAt) === normalizeSourceUpdatedAt(listUpdatedAt);
-}
-
-function buildUpdateSummary(previousText, currentText, options = {}) {
-  const previousLines = comparableContentLines(previousText);
-  const currentLines = comparableContentLines(currentText);
-  const previousSet = new Set(previousLines.map((line) => line.key));
-  const currentSet = new Set(currentLines.map((line) => line.key));
-  const added = currentLines
-    .filter((line) => !previousSet.has(line.key))
-    .map((line) => line.text)
-    .slice(0, 30);
-  const removed = previousLines
-    .filter((line) => !currentSet.has(line.key))
-    .map((line) => line.text)
-    .slice(0, 30);
-
-  return {
-    generatedAt: options.generatedAt || new Date().toISOString(),
-    sourceUpdatedAt: cleanText(options.sourceUpdatedAt || ""),
-    previousLength: String(previousText || "").length,
-    currentLength: String(currentText || "").length,
-    lengthDelta: String(currentText || "").length - String(previousText || "").length,
-    added,
-    removed,
-    addedCount: added.length,
-    removedCount: removed.length
-  };
-}
-
-async function buildUpdateSummaryWithAi(previousText, currentText, options = {}) {
-  const summary = buildUpdateSummary(previousText, currentText, options);
-  if (!settings.ai?.baseUrl || !settings.ai?.apiKey || !settings.ai?.model) {
-    return summary;
-  }
-  try {
-    const aiSummary = await summarizeUpdateWithOpenAICompatible(previousText, currentText, summary, options);
-    return {
-      ...summary,
-      aiSummary,
-      aiSummaryModel: settings.ai.model,
-      aiSummaryGeneratedAt: new Date().toISOString()
-    };
-  } catch (error) {
-    return {
-      ...summary,
-      aiSummaryError: error.message
-    };
-  }
-}
-
-async function summarizeUpdateWithOpenAICompatible(previousText, currentText, summary, options = {}) {
-  const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${settings.ai.apiKey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: settings.ai.model,
-      temperature: 0.2,
-      messages: [
-        {
-          role: "system",
-          content: [
-            "你是资料库更新分析助手。",
-            "请用中文总结这次资料更新，重点说明新增信息、删除/变化的信息、影响、下一步或需要关注的问题。",
-            "保持简洁，输出 3 到 6 条要点，不要复述完整原文。"
-          ].join("\n")
-        },
-        {
-          role: "user",
-          content: [
-            `标题：${options.title || ""}`,
-            `来源：${options.sourceType || ""}`,
-            `来源更新时间：${summary.sourceUpdatedAt || ""}`,
-            `长度变化：${summary.lengthDelta}`,
-            "",
-            "检测到的新增内容：",
-            (summary.added || []).slice(0, 20).map((line) => `- ${line}`).join("\n") || "无",
-            "",
-            "检测到的删除内容：",
-            (summary.removed || []).slice(0, 20).map((line) => `- ${line}`).join("\n") || "无",
-            "",
-            "更新前内容片段：",
-            String(previousText || "").slice(0, 6000),
-            "",
-            "更新后内容片段：",
-            String(currentText || "").slice(0, 9000)
-          ].join("\n")
-        }
-      ]
-    })
-  });
-  const text = await response.text();
-  if (!response.ok) throw new Error(`AI 更新总结失败：${response.status} ${text.slice(0, 300)}`);
-  const payload = JSON.parse(text);
-  return cleanText(payload.choices?.[0]?.message?.content || "");
-}
-
-function comparableContentLines(text) {
-  return String(text || "")
-    .split(/\n+/)
-    .map((line) => cleanText(line.replace(/^[-*#>`\s]+/, "")))
-    .filter((line) => line.length >= 3)
-    .filter((line) => !/^(source|adapter|url|updated|source updated|latest message):/i.test(line))
-    .map((text) => ({
-      text,
-      key: text.toLowerCase().replace(/\s+/g, " ")
-    }));
 }
 
 function isSameRelativeSourceDay(existingValue, referenceDate, listValue) {
@@ -1742,10 +1625,6 @@ function parseJsonObjectFromText(text) {
   } catch {
     return {};
   }
-}
-
-function uniqueValues(values) {
-  return [...new Set((values || []).filter(Boolean))];
 }
 
 function recommendTagsLocally(content, allTags, currentTags) {
@@ -4767,30 +4646,6 @@ function buildAuthHeaders(url) {
   return {};
 }
 
-function safeHostname(url) {
-  try {
-    return new URL(url).hostname.toLowerCase();
-  } catch {
-    return "";
-  }
-}
-
-function safePathname(url) {
-  try {
-    return new URL(url).pathname;
-  } catch {
-    return "";
-  }
-}
-
-function safeSearch(url) {
-  try {
-    return new URL(url).search;
-  } catch {
-    return "";
-  }
-}
-
 function normalizeUrlForMatch(url) {
   const canonical = canonicalizeMaterialUrl(url);
   try {
@@ -4920,13 +4775,6 @@ function normalizeSourceType(sourceType, url) {
   return "web";
 }
 
-function normalizeTags(tags) {
-  if (Array.isArray(tags)) {
-    return [...new Set(tags.map((tag) => slugTag(tag)).filter(Boolean))];
-  }
-  return [...new Set(String(tags || "").split(",").map((tag) => slugTag(tag)).filter(Boolean))];
-}
-
 function normalizeComments(comments) {
   if (!Array.isArray(comments)) return [];
   return comments
@@ -4969,19 +4817,6 @@ function looksLikeHtml(value) {
   return /<\/?[a-z][\s\S]*>/i.test(value || "");
 }
 
-function slugTag(value) {
-  return cleanText(value).toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9._/-]/g, "");
-}
-
-function slugify(value) {
-  const slug = String(value)
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 72);
-  return slug || "item";
-}
-
 async function uniqueItemId(base) {
   let id = base;
   let counter = 2;
@@ -4992,10 +4827,6 @@ async function uniqueItemId(base) {
   }
 
   return id;
-}
-
-function cleanText(value) {
-  return String(value || "").replace(/\r\n/g, "\n").trim();
 }
 
 function extractTitle(html) {

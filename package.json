@@ -4,7 +4,14 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "service": "node scripts/service.js",
+    "service:start": "node scripts/service.js --start",
+    "service:stop": "node scripts/service.js --stop",
+    "service:restart": "node scripts/service.js --restart",
+    "service:status": "node scripts/service.js --status",
+    "check": "node --check src/server.js && node --check src/utils.js",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=18"

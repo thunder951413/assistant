@@ -630,50 +630,6 @@ function buildClassificationFromAssignments(assignments, categories, errors = []
   };
 }
 
-function renderUpdateSnippet(summary) {
-  if (!summary) return "";
-  const added = Array.isArray(summary.added) ? summary.added : [];
-  const removed = Array.isArray(summary.removed) ? summary.removed : [];
-  const primary = added[0] || removed[0] || "";
-  if (!primary) return "";
-  const prefix = added[0] ? "新增" : "删除";
-  return `
-    <div class="update-snippet">
-      <strong>${prefix}</strong>
-      <span>${escapeHtml(primary)}</span>
-    </div>
-  `;
-}
-
-function renderUpdateSummary(summary, isActiveUpdate) {
-  if (!summary || (!isActiveUpdate && !summary.added?.length && !summary.removed?.length)) return "";
-  const added = Array.isArray(summary.added) ? summary.added : [];
-  const removed = Array.isArray(summary.removed) ? summary.removed : [];
-  const aiSummaryHtml = summary.aiSummary
-    ? `<div class="ai-update-summary"><strong>AI 总结</strong><p>${escapeHtml(summary.aiSummary)}</p></div>`
-    : "";
-  const addedHtml = added.length
-    ? `<div><strong>新增内容</strong><ul>${added.slice(0, 12).map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul></div>`
-    : "";
-  const removedHtml = removed.length
-    ? `<div><strong>删除内容</strong><ul>${removed.slice(0, 12).map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul></div>`
-    : "";
-  const emptyHtml = !addedHtml && !removedHtml ? `<p>更新时间或页面结构发生变化，正文没有检测到可展示的段落差异。</p>` : "";
-  return `
-    <section class="update-summary">
-      <div class="update-summary-head">
-        <h3>更新摘要</h3>
-        <span>${escapeHtml(formatDate(summary.generatedAt || ""))}</span>
-      </div>
-      <div class="item-meta">长度变化：${Number(summary.lengthDelta || 0) >= 0 ? "+" : ""}${escapeHtml(String(summary.lengthDelta || 0))} 字符${summary.sourceUpdatedAt ? ` · 来源更新时间：${escapeHtml(summary.sourceUpdatedAt)}` : ""}</div>
-      ${aiSummaryHtml}
-      ${emptyHtml}
-      ${addedHtml}
-      ${removedHtml}
-    </section>
-  `;
-}
-
 function openBatchProcessDialog() {
   state.batchProcess = {
     items: [],
@@ -1033,33 +989,6 @@ async function selectItem(id) {
   renderItems();
   const { item } = await api(`/api/items/${encodeURIComponent(id)}`);
   renderDetail(item);
-  if (item.metadata.contentUpdatedAt) {
-    await acknowledgeSelectedItemUpdate(id);
-  }
-}
-
-async function acknowledgeSelectedItemUpdate(id) {
-  try {
-    const { item } = await api(`/api/items/${encodeURIComponent(id)}/ack-update`, { method: "POST" });
-    if (state.selectedId !== id) return;
-    const index = state.items.findIndex((candidate) => candidate.id === id);
-    if (index !== -1) {
-      if (state.updateOnly) {
-        state.items.splice(index, 1);
-      } else {
-        state.items[index] = {
-          ...state.items[index],
-          contentUpdatedAt: "",
-          updateAcknowledgedAt: item.metadata.updateAcknowledgedAt || ""
-        };
-      }
-      renderItems();
-    }
-    await loadTags();
-    await loadUpdateCount();
-  } catch (error) {
-    console.warn("Failed to acknowledge item update:", error);
-  }
 }
 
 function renderDetail(item) {
@@ -1074,7 +1003,6 @@ function renderDetail(item) {
     : showProcessed && metadata.processedStale
       ? `<div class="detail-note">原文刷新后发生过变化，当前 AI 整理版可能不是最新。点击“更新整理”可重新生成。</div>`
     : "";
-  const updateSummary = renderUpdateSummary(metadata.updateSummary, metadata.contentUpdatedAt);
   detailPanel.innerHTML = `
     <div class="detail-title">
       <div class="title-editor">
@@ -1111,7 +1039,6 @@ function renderDetail(item) {
     ${metadata.contentUpdatedAt ? `<div class="item-meta">内容更新：${escapeHtml(formatDate(metadata.contentUpdatedAt))}</div>` : ""}
     <hr />
     ${modeNote}
-    ${updateSummary}
     <div class="detail-doc markdown-body">${renderMarkdown(displayedDocument)}</div>
   `;
   setupDetailTitleMarquee();

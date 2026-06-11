@@ -19,9 +19,31 @@
 
 ## 启动
 
+前台启动：
+
 ```bash
 npm start
 ```
+
+后台启动和控制：
+
+```bash
+npm run service:start
+npm run service:stop
+npm run service:restart
+npm run service:status
+```
+
+也可以直接使用脚本参数：
+
+```bash
+node scripts/service.js --start
+node scripts/service.js --stop
+node scripts/service.js --restart
+node scripts/service.js --status
+```
+
+后台日志保存在 `.config/runtime/assistant.log`。
 
 打开：
 
