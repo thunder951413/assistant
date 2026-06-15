@@ -66,7 +66,10 @@
             <aside class="chat-history-panel">
               <div class="chat-history-header">
                 <h3>历史记录</h3>
-                <button type="button" id="newChatButton">新建</button>
+                <div class="chat-history-actions">
+                  <button type="button" id="newChatButton">新建</button>
+                  <button type="button" id="clearChatHistoryButton">清除</button>
+                </div>
               </div>
               <div id="chatHistoryList" class="chat-history-list"></div>
             </aside>
@@ -240,7 +243,7 @@
         <section id="subscriptionsView" class="subscriptions-view" hidden>
           <div class="view-heading">
             <h2>订阅管理</h2>
-            <p>管理需要定时刷新或手动刷新列表型资料源，例如 Jira filter、GitHub notifications 和 Teams 对话。</p>
+            <p>管理需要定时刷新或手动刷新的订阅和普通页面，例如 Jira filter、GitHub notifications、Teams 对话和已导入网页。</p>
           </div>
 
           <section class="subscriptions-panel">

@@ -24,6 +24,9 @@ const state = {
   selectedSettingsTags: new Set(),
   supplementalEntries: [],
   updateCount: 0,
+  refreshReloadTimer: null,
+  refreshMonitorTimer: null,
+  seenRefreshRunKey: localStorage.getItem("materialOrganizer.seenRefreshRunKey") || "",
   listClassification: null,
   listClassifying: false,
   listClassifier: {
@@ -60,6 +63,7 @@ const agentRoot = document.querySelector("#agentRoot");
 const chatSessionTitle = document.querySelector("#chatSessionTitle");
 const chatHistoryList = document.querySelector("#chatHistoryList");
 const newChatButton = document.querySelector("#newChatButton");
+const clearChatHistoryButton = document.querySelector("#clearChatHistoryButton");
 const chatMessages = document.querySelector("#chatMessages");
 const chatForm = document.querySelector("#chatForm");
 const chatInput = document.querySelector("#chatInput");
@@ -173,6 +177,7 @@ const classifyListSubtitle = document.querySelector("#classifyListSubtitle");
 
 chatForm.addEventListener("submit", sendChatMessage);
 newChatButton.addEventListener("click", () => createChatSession({ activate: true }));
+clearChatHistoryButton.addEventListener("click", clearChatHistory);
 importForm.addEventListener("submit", previewImport);
 confirmImportButton.addEventListener("click", confirmImport);
 clearImportButton.addEventListener("click", resetImport);
@@ -279,6 +284,7 @@ searchInput.addEventListener("input", debounce(async () => {
 
 await loadAgentConfig();
 await loadSettings();
+startRefreshJobMonitor();
 await loadMaterialUpdateCount();
 loadChatSessions();
 renderView();
@@ -1077,10 +1083,13 @@ function renderDetail(item) {
     <hr />
     ${modeNote}
     <div id="detailContentLayout" class="detail-content-layout">
-      <aside id="detailToc" class="detail-toc" hidden>
-        <div class="detail-toc-title">目录</div>
-        <nav id="detailTocList" class="detail-toc-list" aria-label="内容目录"></nav>
-      </aside>
+      <div id="detailTocWrap" class="detail-toc-wrap" hidden>
+        <button id="detailTocToggle" type="button" class="detail-toc-toggle" aria-expanded="false">目录</button>
+        <aside id="detailToc" class="detail-toc" hidden>
+          <div class="detail-toc-title">目录</div>
+          <nav id="detailTocList" class="detail-toc-list" aria-label="内容目录"></nav>
+        </aside>
+      </div>
       <div id="detailDoc" class="detail-doc markdown-body">${renderMarkdown(displayedDocument)}</div>
     </div>
   `;
@@ -1201,10 +1210,12 @@ function setupDetailTitleMarquee() {
 
 function setupDetailToc() {
   const doc = document.querySelector("#detailDoc");
+  const tocWrap = document.querySelector("#detailTocWrap");
+  const tocToggle = document.querySelector("#detailTocToggle");
   const toc = document.querySelector("#detailToc");
   const tocList = document.querySelector("#detailTocList");
   const layout = document.querySelector("#detailContentLayout");
-  if (!doc || !toc || !tocList || !layout) return;
+  if (!doc || !tocWrap || !tocToggle || !toc || !tocList || !layout) return;
 
   const headings = [...doc.querySelectorAll("h1, h2, h3, h4")]
     .map((heading, index) => {
@@ -1222,12 +1233,16 @@ function setupDetailToc() {
     .filter(Boolean);
 
   if (!headings.length) {
+    tocWrap.hidden = true;
     toc.hidden = true;
     layout.classList.remove("has-toc");
     return;
   }
 
-  toc.hidden = false;
+  tocWrap.hidden = false;
+  toc.hidden = true;
+  tocToggle.setAttribute("aria-expanded", "false");
+  tocToggle.textContent = "目录";
   layout.classList.add("has-toc");
   tocList.innerHTML = headings.map((heading) => `
     <button type="button" class="detail-toc-link level-${heading.level}" data-heading-id="${escapeHtml(heading.id)}">
@@ -1240,7 +1255,16 @@ function setupDetailToc() {
       const target = document.getElementById(button.dataset.headingId);
       if (!target) return;
       target.scrollIntoView({ behavior: "smooth", block: "start" });
+      toc.hidden = true;
+      tocToggle.setAttribute("aria-expanded", "false");
+      tocToggle.textContent = "目录";
     });
+  });
+  tocToggle.addEventListener("click", () => {
+    const nextOpen = toc.hidden;
+    toc.hidden = !nextOpen;
+    tocToggle.setAttribute("aria-expanded", String(nextOpen));
+    tocToggle.textContent = nextOpen ? "隐藏" : "目录";
   });
 }
 
@@ -1426,6 +1450,7 @@ async function loadSettings() {
   activeDocumentRoot.textContent = settings.activeDocumentRoot || settings.documentRoot || "";
   renderSourceProfiles(settings.sources || {});
   renderRefreshJobs(settings.refreshJobs || []);
+  rememberLatestRefreshRun(settings.refreshJobs || []);
   await loadSettingsTags();
 }
 
@@ -1834,6 +1859,19 @@ function deleteChatSession(id) {
   renderActiveChat();
 }
 
+function clearChatHistory() {
+  if (!state.chatSessions.length) return;
+  const ok = confirm("清除所有 AI 对话历史？");
+  if (!ok) return;
+
+  state.chatSessions = [];
+  state.activeChatId = "";
+  createChatSession({ activate: true, save: false });
+  saveChatSessions();
+  renderChatHistory();
+  renderActiveChat();
+}
+
 function renderActiveChat() {
   const session = getActiveChatSession();
   if (!session) return;
@@ -1931,11 +1969,12 @@ async function previewImport(event) {
       ? ` 已加入订阅管理：${preview.refreshJob.name}（默认${preview.refreshJob.enabled ? "开启" : "关闭"}，可在订阅管理页点击立即刷新）。`
       : "";
     previewStatus.textContent = `${preview.parseNote} 内容长度 ${preview.contentLength} 字符。${linkedNote}${refreshJobNote}${duplicateNote}`;
-    summaryStatus.textContent = "可以生成 AI 总结，或手动填写总结。";
-    previewBadge.textContent = preview.existingItem ? "已存在" : (preview.parseStatus === "ready" ? "可导入" : "需确认");
-    confirmImportButton.textContent = preview.existingItem ? "查看已有资料" : "确认导入";
-    confirmImportButton.disabled = !preview.extractedContent.trim() && !preview.existingItem;
-    summarizeButton.disabled = !preview.extractedContent.trim();
+    const isSubscription = preview.importMode === "subscription" || (preview.pageKind === "list" && preview.refreshJob);
+    summaryStatus.textContent = isSubscription ? "订阅链接不需要生成总结，刷新订阅后会导入内容页。" : "可以生成 AI 总结，或手动填写总结。";
+    previewBadge.textContent = isSubscription ? "订阅" : preview.existingItem ? "已存在" : (preview.parseStatus === "ready" ? "可导入" : "需确认");
+    confirmImportButton.textContent = isSubscription ? "查看订阅" : preview.existingItem ? "查看已有资料" : "确认导入";
+    confirmImportButton.disabled = isSubscription ? !preview.refreshJob : (!preview.extractedContent.trim() && !preview.existingItem);
+    summarizeButton.disabled = isSubscription || !preview.extractedContent.trim();
   } catch (error) {
     previewStatus.textContent = error.message;
     previewBadge.textContent = "失败";
@@ -1953,6 +1992,12 @@ async function confirmImport() {
     resetImport();
     await switchView("materials");
     await selectItem(existingId);
+    return;
+  }
+
+  if (preview.importMode === "subscription" || (preview.pageKind === "list" && preview.refreshJob)) {
+    resetImport();
+    await switchView("subscriptions");
     return;
   }
 
@@ -2399,12 +2444,15 @@ function updateAuthFields(section) {
 function renderRefreshJobs(jobs) {
   state.refreshJobs = jobs || [];
   renderSubscriptionTabs();
-  const visibleJobs = state.subscriptionSource === "all"
-    ? state.refreshJobs
-    : state.refreshJobs.filter((job) => sourceTypeForSubscription(job) === state.subscriptionSource);
+  const visibleJobs = refreshJobsForCurrentTab();
 
   if (!visibleJobs.length) {
     refreshJobs.innerHTML = `<div class="empty-state">还没有刷新任务。</div>`;
+    return;
+  }
+
+  if (state.subscriptionSource === "content") {
+    renderContentPageRefreshGroup(visibleJobs);
     return;
   }
 
@@ -2417,11 +2465,11 @@ function renderRefreshJobs(jobs) {
         </label>
         <div class="refresh-job-actions">
           <button type="button" data-run-job="${escapeHtml(job.id)}">${job.running ? "运行中" : "立即刷新"}</button>
-          <button type="button" class="danger-button" data-delete-job="${escapeHtml(job.id)}">删除</button>
+          ${isManagedContentPageJob(job) ? "" : `<button type="button" class="danger-button" data-delete-job="${escapeHtml(job.id)}">删除</button>`}
         </div>
       </div>
       <label>
-        Filter URL
+        ${isManagedContentPageJob(job) ? "页面 URL" : "订阅 URL"}
         <input data-field="url" value="${escapeHtml(job.url || "")}" />
       </label>
       <div class="settings-grid">
@@ -2436,7 +2484,7 @@ function renderRefreshJobs(jobs) {
       </div>
       <label>
         标签
-        <input data-field="tags" value="${escapeHtml((job.tags || []).join(", "))}" />
+        <input data-field="tags" value="${escapeHtml(refreshJobTagsText(job.tags))}" />
       </label>
       <div class="item-meta">
         状态：${escapeHtml(formatRefreshStatus(job.running ? "running" : job.status || "idle"))} · 上次刷新：${escapeHtml(job.lastRunAt ? formatDate(job.lastRunAt) : "未刷新")}
@@ -2456,13 +2504,71 @@ function renderRefreshJobs(jobs) {
   });
 }
 
+function renderContentPageRefreshGroup(contentJobs) {
+  const enabledCount = contentJobs.filter((job) => job.enabled).length;
+  const intervalMinutes = commonRefreshJobValue(contentJobs, "intervalMinutes") || contentJobs[0]?.intervalMinutes || 60;
+  const latestRunAt = contentJobs
+    .map((job) => job.lastRunAt || "")
+    .filter(Boolean)
+    .sort((a, b) => b.localeCompare(a))[0] || "";
+  const failedCount = contentJobs.filter((job) => job.status === "failed" || job.status === "unreachable").length;
+  const running = contentJobs.some((job) => job.running);
+  const sourceCounts = new Map();
+  for (const job of contentJobs) {
+    const source = sourceTypeForSubscription(job);
+    sourceCounts.set(source, (sourceCounts.get(source) || 0) + 1);
+  }
+  const sourceSummary = [...sourceCounts.entries()]
+    .map(([source, count]) => `${subscriptionSourceLabel(source)} ${count}`)
+    .join(" · ");
+
+  refreshJobs.innerHTML = `
+    <section class="refresh-job content-refresh-group" data-content-page-group="1">
+      <div class="refresh-job-title">
+        <label class="inline-toggle">
+          <input data-field="enabled" type="checkbox" ${enabledCount ? "checked" : ""} />
+          <strong>普通页面整体刷新</strong>
+        </label>
+        <div class="refresh-job-actions">
+          <button type="button" data-run-content-pages>${running ? "运行中" : "立即刷新"}</button>
+        </div>
+      </div>
+      <div class="settings-grid">
+        <label>
+          刷新间隔分钟
+          <input data-field="intervalMinutes" type="number" min="5" value="${escapeHtml(intervalMinutes)}" />
+        </label>
+        <label>
+          页面数量
+          <input value="${escapeHtml(contentJobs.length)}" disabled />
+        </label>
+      </div>
+      <div class="item-meta">
+        已启用：${escapeHtml(String(enabledCount))} / ${escapeHtml(String(contentJobs.length))} · 上次刷新：${escapeHtml(latestRunAt ? formatDate(latestRunAt) : "未刷新")}
+      </div>
+      ${sourceSummary ? `<div class="item-meta">${escapeHtml(sourceSummary)}</div>` : ""}
+      ${failedCount ? `<div class="item-meta">失败：${escapeHtml(String(failedCount))} 个页面</div>` : ""}
+    </section>
+  `;
+
+  refreshJobs.querySelector("[data-run-content-pages]")?.addEventListener("click", () => runAllRefreshJobs());
+}
+
+function commonRefreshJobValue(jobs, field) {
+  if (!jobs.length) return "";
+  const [first] = jobs;
+  return jobs.every((job) => String(job[field] || "") === String(first[field] || "")) ? first[field] : "";
+}
+
 function renderSubscriptionTabs() {
   const counts = new Map([["all", state.refreshJobs.length]]);
+  const contentCount = state.refreshJobs.filter(isManagedContentPageJob).length;
+  if (contentCount) counts.set("content", contentCount);
   for (const job of state.refreshJobs) {
     const sourceType = sourceTypeForSubscription(job);
     counts.set(sourceType, (counts.get(sourceType) || 0) + 1);
   }
-  const sources = ["all", "jira", "github", "teams", "confluence", "web"];
+  const sources = ["all", "content", "jira", "github", "teams", "confluence", "web"];
   const visibleSources = sources.filter((source) => source === "all" || counts.has(source));
   if (!visibleSources.includes(state.subscriptionSource)) {
     state.subscriptionSource = "all";
@@ -2496,9 +2602,30 @@ function sourceTypeForSubscription(job) {
   return "web";
 }
 
+function refreshJobTagsText(tags) {
+  return Array.isArray(tags) ? tags.join(", ") : String(tags || "");
+}
+
+function refreshJobsForCurrentTab() {
+  if (state.subscriptionSource === "content") {
+    return state.refreshJobs.filter(isManagedContentPageJob);
+  }
+  if (state.subscriptionSource === "all") {
+    return state.refreshJobs;
+  }
+  return state.refreshJobs.filter((job) => (
+    sourceTypeForSubscription(job) === state.subscriptionSource
+  ));
+}
+
+function isManagedContentPageJob(job) {
+  return job?.managedBy === "content-page";
+}
+
 function subscriptionSourceLabel(source) {
   return {
     all: "全部",
+    content: "普通页面",
     confluence: "Confluence",
     jira: "Jira",
     github: "GitHub",
@@ -2525,7 +2652,25 @@ function collectRefreshJobs() {
 }
 
 function syncRefreshJobsFromDom() {
+  const contentGroup = refreshJobs.querySelector("[data-content-page-group]");
+  if (contentGroup) {
+    const valueOf = (field) => contentGroup.querySelector(`[data-field="${field}"]`);
+    const enabled = Boolean(valueOf("enabled")?.checked);
+    const intervalMinutes = Number(valueOf("intervalMinutes")?.value || 60);
+    state.refreshJobs = state.refreshJobs.map((job) => isManagedContentPageJob(job)
+      ? {
+          ...job,
+          enabled,
+          intervalMinutes,
+          maxItems: 1,
+          pageKind: "content",
+          managedBy: "content-page"
+        }
+      : job);
+  }
+
   const visible = [...refreshJobs.querySelectorAll(".refresh-job")].map((section) => {
+    if (section.dataset.contentPageGroup) return null;
     const valueOf = (field) => section.querySelector(`[data-field="${field}"]`);
     return {
       id: section.dataset.id,
@@ -2538,7 +2683,7 @@ function syncRefreshJobsFromDom() {
       fetchMode: valueOf("fetchMode")?.value || "auto",
       pageKind: valueOf("pageKind")?.value || "list"
     };
-  });
+  }).filter(Boolean);
   if (!visible.length) return;
   const byId = new Map(visible.map((job) => [job.id, job]));
   state.refreshJobs = state.refreshJobs.map((job) => byId.has(job.id) ? { ...job, ...byId.get(job.id) } : job);
@@ -2571,10 +2716,12 @@ async function runRefreshJob(id) {
   try {
     const { result, jobs } = await api(`/api/refresh-jobs/${encodeURIComponent(id)}/run`, { method: "POST" });
     renderRefreshJobs(jobs || []);
-    refreshJobStatus.textContent = `刷新完成：更新 ${result.updatedItemCount ?? result.updatedIssueCount ?? 0} / ${result.linkCount ?? result.issueCount ?? 0} 个内容页，跳过 ${result.skippedItemCount || 0} 个，失败 ${result.errorCount} 个。`;
+    const updated = Number(result.updatedItemCount ?? result.updatedIssueCount ?? 0);
+    refreshJobStatus.textContent = `刷新完成：更新 ${updated} / ${result.linkCount ?? result.issueCount ?? 0} 个内容页，跳过 ${result.skippedItemCount || 0} 个，失败 ${result.errorCount} 个。`;
     if (state.view === "materials") {
       await loadAll();
     }
+    scheduleReloadAfterRefreshUpdates(updated);
   } catch (error) {
     refreshJobStatus.textContent = error.message;
     await loadSettings();
@@ -2583,13 +2730,7 @@ async function runRefreshJob(id) {
 
 async function runAllRefreshJobs() {
   syncRefreshJobsFromDom();
-  const jobsToRun = state.subscriptionSource === "all"
-    ? state.refreshJobs
-    : state.refreshJobs.filter((job) => sourceTypeForSubscription(job) === state.subscriptionSource);
-  if (!jobsToRun.length) {
-    refreshJobStatus.textContent = "当前分类下没有可刷新的订阅。";
-    return;
-  }
+  const jobsToRun = refreshJobsForCurrentTab();
 
   runAllSubscriptionsButton.disabled = true;
   saveSubscriptionsButton.disabled = true;
@@ -2597,31 +2738,97 @@ async function runAllRefreshJobs() {
   let total = 0;
   let skipped = 0;
   let failed = 0;
-  let completed = 0;
   try {
-    for (const job of jobsToRun) {
-      completed += 1;
-      refreshJobStatus.textContent = `正在刷新 ${completed} / ${jobsToRun.length}：${job.name || job.id}`;
-      try {
-        const { result, jobs } = await api(`/api/refresh-jobs/${encodeURIComponent(job.id)}/run`, { method: "POST" });
-        renderRefreshJobs(jobs || []);
-        updated += Number(result.updatedItemCount ?? result.updatedIssueCount ?? 0);
-        total += Number(result.linkCount ?? result.issueCount ?? 0);
-        skipped += Number(result.skippedItemCount || 0);
-        failed += Number(result.errorCount || 0);
-      } catch (error) {
-        failed += 1;
-        refreshJobStatus.textContent = `${job.name || job.id} 刷新失败：${error.message}`;
-      }
-    }
+    const sourceLabel = subscriptionSourceLabel(state.subscriptionSource);
+    refreshJobStatus.textContent = jobsToRun.length
+      ? `正在刷新 ${sourceLabel} ${jobsToRun.length} 个任务...`
+      : `当前分类下没有可刷新的任务。`;
+    if (!jobsToRun.length) return;
+    const { result, jobs } = await api("/api/refresh-jobs/run-batch", {
+      method: "POST",
+      body: JSON.stringify({
+        ids: jobsToRun.map((job) => job.id),
+        sourceType: state.subscriptionSource
+      })
+    });
+    renderRefreshJobs(jobs || []);
+    updated = Number(result.updatedItemCount ?? result.updatedIssueCount ?? 0);
+    total = Number(result.linkCount ?? result.issueCount ?? 0);
+    skipped = Number(result.skippedItemCount || 0);
+    failed = Number(result.errorCount || 0);
     refreshJobStatus.textContent = `全部刷新完成：更新 ${updated} / ${total} 个内容页，跳过 ${skipped} 个，失败 ${failed} 个。`;
     if (state.view === "materials") {
       await loadAll();
     }
+    scheduleReloadAfterRefreshUpdates(updated);
+  } catch (error) {
+    refreshJobStatus.textContent = error.message;
+    await loadSettings();
   } finally {
     runAllSubscriptionsButton.disabled = false;
     saveSubscriptionsButton.disabled = false;
   }
+}
+
+function scheduleReloadAfterRefreshUpdates(updatedCount) {
+  if (!updatedCount) return;
+  clearTimeout(state.refreshReloadTimer);
+  refreshJobStatus.textContent = `${refreshJobStatus.textContent} 页面将在 1.2 秒后刷新以显示 NEW 状态。`;
+  state.refreshReloadTimer = setTimeout(() => {
+    window.location.reload();
+  }, 1200);
+}
+
+function startRefreshJobMonitor() {
+  if (state.refreshMonitorTimer) clearInterval(state.refreshMonitorTimer);
+  state.refreshMonitorTimer = setInterval(checkRefreshJobsForUpdates, 60 * 1000);
+}
+
+async function checkRefreshJobsForUpdates() {
+  try {
+    const { jobs } = await api("/api/refresh-jobs");
+    const latest = latestUpdatedRefreshRun(jobs || []);
+    if (!latest || latest.key <= state.seenRefreshRunKey) return;
+    const updated = refreshResultUpdatedCount(latest.job.lastResult);
+    if (!updated) return;
+    rememberRefreshRunKey(latest.key);
+    schedulePageReloadForBackgroundRefresh(updated);
+  } catch (error) {
+    console.warn("Failed to check refresh jobs:", error);
+  }
+}
+
+function rememberLatestRefreshRun(jobs) {
+  const latest = latestUpdatedRefreshRun(jobs || []);
+  if (!latest || latest.key <= state.seenRefreshRunKey) return;
+  rememberRefreshRunKey(latest.key);
+}
+
+function rememberRefreshRunKey(key) {
+  state.seenRefreshRunKey = key;
+  localStorage.setItem("materialOrganizer.seenRefreshRunKey", key);
+}
+
+function latestUpdatedRefreshRun(jobs) {
+  return (jobs || [])
+    .filter((job) => job.lastRunAt && refreshResultUpdatedCount(job.lastResult) > 0)
+    .map((job) => ({
+      job,
+      key: `${job.lastRunAt}|${job.id}`
+    }))
+    .sort((a, b) => b.key.localeCompare(a.key))[0] || null;
+}
+
+function refreshResultUpdatedCount(result) {
+  return Number(result?.updatedItemCount ?? result?.updatedIssueCount ?? 0);
+}
+
+function schedulePageReloadForBackgroundRefresh(updatedCount) {
+  if (!updatedCount) return;
+  clearTimeout(state.refreshReloadTimer);
+  state.refreshReloadTimer = setTimeout(() => {
+    window.location.reload();
+  }, 1200);
 }
 
 async function deleteRefreshJob(id) {

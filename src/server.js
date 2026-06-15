@@ -34,6 +34,7 @@ const refreshRuntime = {
 const port = Number(process.env.PORT || 5173);
 
 await ensureKnowledgeBase();
+await syncContentRefreshJobsFromItems();
 startRefreshScheduler();
 
 const server = http.createServer(async (req, res) => {
@@ -292,6 +293,7 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "GET" && url.pathname === "/api/settings") {
+    await syncContentRefreshJobsFromItems();
     sendJson(res, 200, { settings: publicSettings() });
     return;
   }
@@ -311,6 +313,7 @@ async function handleApi(req, res, url) {
     settings = await importSettingsBundle(body);
     configureKnowledgeBase();
     await ensureKnowledgeBase();
+    await syncContentRefreshJobsFromItems();
     startRefreshScheduler();
     sendJson(res, 200, { settings: publicSettings() });
     return;
@@ -324,6 +327,7 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && url.pathname === "/api/import/data") {
     const body = await readBody(req);
     const result = await importDataBundle(body.bundle || body, { mode: body.mode || "merge" });
+    await syncContentRefreshJobsFromItems();
     sendJson(res, 200, result);
     return;
   }
@@ -334,13 +338,26 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "GET" && url.pathname === "/api/refresh-jobs") {
+    await syncContentRefreshJobsFromItems();
     sendJson(res, 200, { jobs: publicRefreshJobs() });
     return;
   }
 
   if (req.method === "POST" && url.pathname.startsWith("/api/refresh-jobs/") && url.pathname.endsWith("/run")) {
+    await syncContentRefreshJobsFromItems();
     const id = decodeURIComponent(url.pathname.split("/")[3] || "");
     const result = await runRefreshJobById(id, { force: true });
+    sendJson(res, 200, { result, jobs: publicRefreshJobs() });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/refresh-jobs/run-batch") {
+    await syncContentRefreshJobsFromItems();
+    const body = await readBody(req);
+    const result = await runRefreshJobsByIds(body.ids || [], {
+      force: true,
+      sourceType: cleanText(body.sourceType || "all")
+    });
     sendJson(res, 200, { result, jobs: publicRefreshJobs() });
     return;
   }
@@ -358,6 +375,7 @@ async function handleApi(req, res, url) {
     settings = await saveSettings(body);
     configureKnowledgeBase();
     await ensureKnowledgeBase();
+    await syncContentRefreshJobsFromItems();
     startRefreshScheduler();
     sendJson(res, 200, { settings: publicSettings() });
     return;
@@ -422,7 +440,8 @@ async function createItem(input) {
     rawFileName,
     pageKind: input.pageKind || null,
     fetchMode: input.fetchMode || null,
-    parentUrl: input.parentUrl || null
+    parentUrl: input.parentUrl || null,
+    managedBy: input.managedBy || null
   };
 
   await fs.writeFile(path.join(itemDir, rawFileName), rawContent, "utf8");
@@ -448,11 +467,12 @@ async function createItem(input) {
       await fs.writeFile(path.join(itemDir, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
       await fs.writeFile(path.join(itemDir, "document.md"), renderDocument(metadata, extractedContent, summary), "utf8");
     }
-  } else if (metadata.sourceType === "teams" && metadata.url) {
+  } else if (metadata.url) {
     metadata.refreshJob = await ensureRefreshJobForContentUrl(metadata.url, {
       title,
       sourceType,
-      fetchMode: metadata.fetchMode || "webdriver"
+      fetchMode: metadata.fetchMode || "auto",
+      managedBy: metadata.managedBy || "content-page"
     });
     await fs.writeFile(path.join(itemDir, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
     await fs.writeFile(path.join(itemDir, "document.md"), renderDocument(metadata, extractedContent, summary), "utf8");
@@ -467,6 +487,7 @@ async function previewSource(input) {
   const pasted = cleanText(input.content || "");
   const detectedUrl = cleanText(input.url || detectUrl(pasted));
   const canonicalDetectedUrl = canonicalizeMaterialUrl(detectedUrl);
+  const requestedPageKind = resolvePageKind(canonicalDetectedUrl, input.pageKind || "auto");
   const existingItem = canonicalDetectedUrl ? await findItemByUrl(canonicalDetectedUrl) : null;
   const sourceType = normalizeSourceType(input.sourceType, canonicalDetectedUrl || detectedUrl);
   let title = cleanText(input.title || "");
@@ -478,6 +499,45 @@ async function previewSource(input) {
   let parseNote = "文本内容已读取，确认后即可导入。";
   let linkedItems = [];
   let refreshJob = null;
+
+  if (canonicalDetectedUrl && requestedPageKind === "list" && shouldFetchForPreview(input, pasted) && !looksLikeHtml(pasted)) {
+    const adapter = detectSourceAdapter(canonicalDetectedUrl);
+    title = title || defaultRefreshJobNameForListUrl(canonicalDetectedUrl, "");
+    rawContent = canonicalDetectedUrl;
+    extractedContent = [
+      `# ${title}`,
+      "",
+      `Source: ${canonicalDetectedUrl}`,
+      "",
+      "该链接已识别为订阅/过滤页。确认后只会加入订阅管理，不会作为资料内容导入。",
+      "可以在订阅管理里点击立即刷新，抓取该列表中的内容页。"
+    ].join("\n");
+    refreshJob = await ensureRefreshJobForListUrl(canonicalDetectedUrl, {
+      title,
+      sourceType: adapter.sourceType,
+      fetchMode: input.fetchMode || "auto"
+    });
+    return {
+      title,
+      sourceType: adapter.sourceType,
+      url: canonicalDetectedUrl,
+      rawContent,
+      extractedContent,
+      rawFileName,
+      lastFetchedAt,
+      existingItem: null,
+      comments: [],
+      sourceUpdatedAt: "",
+      linkedItems,
+      refreshJob,
+      parseStatus: "ready",
+      parseNote: "已识别为订阅/过滤页，确认后会加入订阅管理。",
+      contentLength: extractedContent.length,
+      pageKind: "list",
+      fetchMode: input.fetchMode || "auto",
+      importMode: "subscription"
+    };
+  }
 
   if (existingItem) {
     const existing = await readItem(existingItem.id);
@@ -505,7 +565,7 @@ async function previewSource(input) {
       parseStatus: "ready",
       parseNote: "检测到该页面已经在资料库中，当前显示已有内容预览。",
       contentLength: existingBody.length,
-      pageKind: existing.metadata.pageKind || resolvePageKind(canonicalDetectedUrl, input.pageKind || "auto"),
+      pageKind: requestedPageKind,
       fetchMode: existing.metadata.fetchMode || input.fetchMode || "auto"
     };
   }
@@ -513,8 +573,8 @@ async function previewSource(input) {
   if (canonicalDetectedUrl && shouldFetchForPreview(input, pasted)) {
     try {
       const fetched = input.fetchMode === "webdriver" || sourceType === "teams"
-        ? await fetchUrlWithWebdriver(canonicalDetectedUrl, { pageKind: input.pageKind || "auto" })
-        : await fetchUrl(canonicalDetectedUrl, { pageKind: input.pageKind || "auto" });
+        ? await fetchUrlWithWebdriver(canonicalDetectedUrl, { pageKind: requestedPageKind })
+        : await fetchUrl(canonicalDetectedUrl, { pageKind: requestedPageKind });
       title = title || fetched.title || canonicalDetectedUrl;
       rawContent = fetched.raw;
       extractedContent = fetched.text;
@@ -523,7 +583,7 @@ async function previewSource(input) {
       input.sourceUpdatedAt = fetched.sourceUpdatedAt || "";
       input.comments = fetched.comments || [];
       parseNote = "网页内容已抓取并过滤为可读文本。";
-      linkedItems = extractPreviewLinkedItems(rawContent, canonicalDetectedUrl, sourceType, input.pageKind || "auto");
+      linkedItems = extractPreviewLinkedItems(rawContent, canonicalDetectedUrl, sourceType, requestedPageKind);
     } catch (error) {
       title = title || canonicalDetectedUrl;
       rawContent = pasted || canonicalDetectedUrl;
@@ -533,30 +593,31 @@ async function previewSource(input) {
     }
   } else if (canonicalDetectedUrl && looksLikeHtml(pasted)) {
     const adapter = detectSourceAdapter(canonicalDetectedUrl);
-    const extracted = extractByAdapter(pasted, canonicalDetectedUrl, adapter, input.pageKind || "auto");
+    const extracted = extractByAdapter(pasted, canonicalDetectedUrl, adapter, requestedPageKind);
     title = title || extracted.title || canonicalDetectedUrl;
     rawContent = pasted;
     extractedContent = extracted.text;
     rawFileName = "raw.html";
     input.comments = extracted.comments || [];
     input.sourceUpdatedAt = extracted.sourceUpdatedAt || "";
-    linkedItems = extractPreviewLinkedItems(rawContent, canonicalDetectedUrl, sourceType, input.pageKind || "auto");
+    linkedItems = extractPreviewLinkedItems(rawContent, canonicalDetectedUrl, sourceType, requestedPageKind);
     parseNote = "已按对应站点规则解析粘贴的 HTML 内容。";
   }
 
   title = title || inferTitle(extractedContent) || "Untitled material";
-  const resolvedPageKind = resolvePageKind(canonicalDetectedUrl, input.pageKind || "auto");
+  const resolvedPageKind = requestedPageKind;
   if (canonicalDetectedUrl && resolvedPageKind === "list") {
     refreshJob = await ensureRefreshJobForListUrl(canonicalDetectedUrl, {
       title,
       sourceType,
-      fetchMode: input.fetchMode || "auto"
+      fetchMode: input.fetchMode || "auto",
+      managedBy: "content-page"
     });
-  } else if (canonicalDetectedUrl && sourceType === "teams") {
+  } else if (canonicalDetectedUrl && resolvedPageKind === "content") {
     refreshJob = await ensureRefreshJobForContentUrl(canonicalDetectedUrl, {
       title,
       sourceType,
-      fetchMode: input.fetchMode || "webdriver"
+      fetchMode: input.fetchMode || "auto"
     });
   }
 
@@ -604,8 +665,9 @@ function extractPreviewLinkedItems(rawContent, url, sourceType, pageKind) {
 }
 
 function resolvePageKind(url, pageKind = "auto") {
-  if (pageKind && pageKind !== "auto") return pageKind;
   if (!url) return pageKind || "auto";
+  if (isKnownListUrl(url)) return "list";
+  if (pageKind && pageKind !== "auto") return pageKind;
   return inferPageKind(url, detectSourceAdapter(url));
 }
 
@@ -670,6 +732,12 @@ async function summarizeWithOpenAICompatible(content) {
 }
 
 async function refreshItem(id) {
+  const item = await refreshItemWithContext(id);
+  await rebuildIndexes();
+  return item;
+}
+
+async function refreshItemWithContext(id, refreshContext = null) {
   const item = await readItem(id);
   if (!item.metadata.url) {
     throw new Error("Only URL-backed materials can be refreshed.");
@@ -687,15 +755,16 @@ async function refreshItem(id) {
     }
   }
 
-  const fetched = await fetchForMetadata(item.metadata);
+  const fetched = await fetchForMetadata(item.metadata, refreshContext);
   const previousLength = item.document.length;
   const previousBody = extractBodyFromDocument(item.document).trim();
   const currentBody = fetched.text.trim();
-  const nextSourceUpdatedAt = cleanText(fetched.sourceUpdatedAt || item.metadata.sourceUpdatedAt || "");
+  const fetchedSourceUpdatedAt = cleanText(fetched.sourceUpdatedAt || "");
+  const nextSourceUpdatedAt = fetchedSourceUpdatedAt || item.metadata.sourceUpdatedAt || "";
   const sourceChanged = nextSourceUpdatedAt
     && normalizeSourceUpdatedAt(nextSourceUpdatedAt) !== normalizeSourceUpdatedAt(item.metadata.sourceUpdatedAt || "");
   const contentChanged = previousBody !== currentBody;
-  const hasUpdate = Boolean(sourceChanged || contentChanged);
+  const hasUpdate = Boolean((fetchedSourceUpdatedAt && sourceChanged) || contentChanged);
   const { updateSummary: _ignoredUpdateSummary, ...previousMetadata } = item.metadata;
   const metadata = {
     ...previousMetadata,
@@ -717,14 +786,16 @@ async function refreshItem(id) {
   await fs.writeFile(path.join(itemDir, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
   await fs.writeFile(path.join(itemDir, "comments.jsonl"), renderJsonLines(fetched.comments || []), "utf8");
   await fs.writeFile(path.join(itemDir, "document.md"), renderDocument(metadata, fetched.text), "utf8");
-  await rebuildIndexes();
-
   return readItem(id);
 }
 
-async function fetchForMetadata(metadata) {
+async function fetchForMetadata(metadata, refreshContext = null) {
   if (metadata.fetchMode === "webdriver" || metadata.sourceType === "jira" || metadata.sourceType === "teams") {
-    return fetchUrlWithWebdriver(metadata.url, { pageKind: metadata.pageKind || "auto" });
+    return fetchUrlWithWebdriver(metadata.url, {
+      pageKind: metadata.pageKind || "auto",
+      session: refreshContext?.webdriverSession,
+      page: refreshContext?.webdriverPage
+    });
   }
   return fetchUrl(metadata.url, { pageKind: metadata.pageKind || "auto" });
 }
@@ -746,6 +817,7 @@ async function upsertFetchedItem(input) {
       pageKind: input.pageKind,
       fetchMode: input.fetchMode,
       parentUrl: input.parentUrl,
+      managedBy: input.managedBy,
       sourceUpdatedAt: input.sourceUpdatedAt
     });
   }
@@ -764,11 +836,12 @@ async function upsertFetchedItem(input) {
 
   const previousBody = extractBodyFromDocument(item.document).trim();
   const currentBody = cleanText(input.text).trim();
-  const nextSourceUpdatedAt = cleanText(input.sourceUpdatedAt || item.metadata.sourceUpdatedAt || "");
+  const fetchedSourceUpdatedAt = cleanText(input.sourceUpdatedAt || "");
+  const nextSourceUpdatedAt = fetchedSourceUpdatedAt || item.metadata.sourceUpdatedAt || "";
   const sourceChanged = nextSourceUpdatedAt
     && normalizeSourceUpdatedAt(nextSourceUpdatedAt) !== normalizeSourceUpdatedAt(item.metadata.sourceUpdatedAt || "");
   const contentChanged = previousBody !== currentBody;
-  const hasUpdate = Boolean(sourceChanged || contentChanged);
+  const hasUpdate = Boolean((fetchedSourceUpdatedAt && sourceChanged) || contentChanged);
   const { updateSummary: _ignoredUpdateSummary, ...previousMetadata } = item.metadata;
   const metadata = {
     ...previousMetadata,
@@ -785,6 +858,7 @@ async function upsertFetchedItem(input) {
     pageKind: input.pageKind || item.metadata.pageKind || null,
     fetchMode: input.fetchMode || item.metadata.fetchMode || null,
     parentUrl: input.parentUrl || item.metadata.parentUrl || null,
+    managedBy: input.managedBy || item.metadata.managedBy || null,
     refreshNote: {
       previousDocumentLength: item.document.length,
       currentDocumentLength: input.text.length,
@@ -797,7 +871,9 @@ async function upsertFetchedItem(input) {
   await fs.writeFile(path.join(itemDir, "comments.jsonl"), renderJsonLines(input.comments || []), "utf8");
   await fs.writeFile(path.join(itemDir, "document.md"), renderDocument(metadata, input.text), "utf8");
   await rebuildIndexes();
-  return readItem(existing.id);
+  const refreshed = await readItem(existing.id);
+  refreshed.refreshChanged = hasUpdate;
+  return refreshed;
 }
 
 async function findItemByUrl(url) {
@@ -874,6 +950,7 @@ async function ensureRefreshJobForListUrl(url, options = {}) {
       enabled: Boolean(existing.enabled),
       intervalMinutes: existing.intervalMinutes,
       maxItems: existing.maxItems,
+      managedBy: existing.managedBy || "",
       created: false
     };
   }
@@ -926,6 +1003,7 @@ async function ensureRefreshJobForContentUrl(url, options = {}) {
       enabled: Boolean(existing.enabled),
       intervalMinutes: existing.intervalMinutes,
       maxItems: existing.maxItems,
+      managedBy: existing.managedBy || "",
       created: false
     };
   }
@@ -940,6 +1018,7 @@ async function ensureRefreshJobForContentUrl(url, options = {}) {
     tags: [],
     fetchMode: defaultRefreshFetchModeForAdapter(adapter, options.fetchMode),
     pageKind: "content",
+    managedBy: options.managedBy || "content-page",
     status: "idle",
     lastRunAt: "",
     lastStartedAt: "",
@@ -963,6 +1042,98 @@ async function ensureRefreshJobForContentUrl(url, options = {}) {
     maxItems: job.maxItems,
     created: true
   };
+}
+
+async function syncContentRefreshJobsFromItems() {
+  const items = await listItems({ includeLists: true });
+  const itemsByUrl = new Map(items
+    .filter((item) => item.url)
+    .map((item) => [normalizeUrlForMatch(item.url), item])
+    .filter(([url]) => Boolean(url)));
+  const existingByUrl = new Map((settings.refreshJobs || [])
+    .map((job) => [normalizeUrlForMatch(job.url || ""), job])
+    .filter(([url]) => Boolean(url)));
+  const existingUrls = new Set(existingByUrl.keys());
+  const jobsToAdd = [];
+  let touchedExisting = false;
+
+  for (const [url, job] of existingByUrl.entries()) {
+    const item = itemsByUrl.get(url);
+    if (!item) continue;
+    if (isSubscriptionManagedItem(item) && job.pageKind === "content" && job.managedBy === "content-page") {
+      job.managedBy = "subscription";
+      touchedExisting = true;
+    }
+  }
+
+  for (const item of items) {
+    if (!item.url || item.pageKind === "list") continue;
+    if (isSubscriptionManagedItem(item)) {
+      await markItemManagedBySubscription(item);
+      continue;
+    }
+    const canonicalUrl = canonicalizeMaterialUrl(item.url);
+    const normalizedUrl = normalizeUrlForMatch(canonicalUrl);
+    if (!normalizedUrl) continue;
+    const existing = existingByUrl.get(normalizedUrl);
+    if (existing) {
+      if (existing.pageKind === "content" && existing.managedBy !== "content-page") {
+        existing.managedBy = "content-page";
+        touchedExisting = true;
+      }
+      continue;
+    }
+    const adapter = detectSourceAdapter(canonicalUrl);
+    const job = normalizeRefreshJob({
+      id: defaultRefreshJobIdForContentUrl(canonicalUrl, adapter),
+      name: defaultRefreshJobNameForContentUrl(canonicalUrl, item.title),
+      url: canonicalUrl,
+      managedBy: "content-page",
+      enabled: false,
+      intervalMinutes: 60,
+      maxItems: 1,
+      tags: item.tags || [],
+      fetchMode: defaultRefreshFetchModeForAdapter(adapter, item.fetchMode || "auto"),
+      pageKind: "content",
+      status: "idle",
+      lastRunAt: "",
+      lastStartedAt: "",
+      lastError: "",
+      lastResult: null
+    }, {});
+    jobsToAdd.push(job);
+    existingUrls.add(normalizedUrl);
+  }
+
+  if (!jobsToAdd.length && !touchedExisting) return 0;
+  settings = {
+    ...settings,
+    refreshJobs: mergeRefreshJobs(settings.refreshJobs || [], jobsToAdd)
+  };
+  await fs.mkdir(configDir, { recursive: true });
+  await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  return jobsToAdd.length;
+}
+
+function isSubscriptionManagedItem(item) {
+  return item.managedBy === "subscription" || Boolean(item.parentUrl) || item.sourceType === "teams";
+}
+
+async function markItemManagedBySubscription(item) {
+  if (item.managedBy === "subscription") return;
+  const itemDir = path.join(itemsDir, item.id);
+  const metadataPath = path.join(itemDir, "metadata.json");
+  if (!(await exists(metadataPath))) return;
+  const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
+  if (metadata.managedBy === "subscription") return;
+  metadata.managedBy = "subscription";
+  metadata.updatedAt = metadata.updatedAt || new Date().toISOString();
+  await fs.writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+  const documentPath = path.join(itemDir, "document.md");
+  if (await exists(documentPath)) {
+    const document = await fs.readFile(documentPath, "utf8");
+    await fs.writeFile(documentPath, renderDocument(metadata, extractBodyFromDocument(document), extractSummaryFromDocument(document)), "utf8");
+  }
 }
 
 function defaultRefreshJobIdForContentUrl(url, adapter) {
@@ -1038,6 +1209,7 @@ async function importLinkedItemsFromList(input) {
         fetchedAt: new Date().toISOString(),
         pageKind: "content",
         fetchMode,
+        managedBy: "subscription",
         parentUrl: input.parentUrl || input.url
       });
       imported.push({
@@ -2807,15 +2979,23 @@ function startRefreshScheduler() {
 
 async function runDueRefreshJobs() {
   const now = new Date();
+  const dueJobs = [];
   for (const job of settings.refreshJobs || []) {
     if (!job.enabled || refreshRuntime.running.has(job.id)) continue;
     const dueAt = nextDueRefreshSlot(job, now, settings.refreshSchedule);
-    if (dueAt) {
-      try {
-        await runRefreshJob(job);
-      } catch (error) {
-        console.error(`Scheduled refresh failed for ${job.id}:`, error.message || error);
-      }
+    if (dueAt) dueJobs.push(job);
+  }
+  if (!dueJobs.length) return;
+
+  const result = await runRefreshJobsBatch(dueJobs);
+  for (const entry of result.results || []) {
+    if (entry.status === "failed") {
+      console.error(`Scheduled refresh failed for ${entry.id}:`, entry.error || "unknown error");
+    }
+  }
+  for (const entry of result.contentResults || []) {
+    if (entry.status === "failed") {
+      console.error(`Scheduled content refresh failed for ${entry.id}:`, entry.error || "unknown error");
     }
   }
 }
@@ -2853,10 +3033,180 @@ async function runRefreshJobById(id, options = {}) {
   const job = (settings.refreshJobs || []).find((candidate) => candidate.id === id);
   if (!job) throw new Error("Refresh job not found.");
   if (!options.force && !job.enabled) throw new Error("Refresh job is disabled.");
-  return runRefreshJob(job);
+  const result = await runRefreshJobsBatch([job], options);
+  return {
+    ...result,
+    id: job.id
+  };
 }
 
-async function runRefreshJob(job) {
+async function runRefreshJobsByIds(ids, options = {}) {
+  const requestedIds = Array.isArray(ids) ? ids.map((id) => String(id)) : [];
+  const requested = new Set(requestedIds);
+  const jobs = (settings.refreshJobs || []).filter((job) => requested.has(job.id));
+  if (requestedIds.length && jobs.length !== requested.size) {
+    throw new Error("Some refresh jobs were not found.");
+  }
+  if (!options.force) {
+    const disabled = jobs.find((job) => !job.enabled);
+    if (disabled) throw new Error(`Refresh job is disabled: ${disabled.name || disabled.id}`);
+  }
+  return runRefreshJobsBatch(jobs, options);
+}
+
+async function runRefreshJobsBatch(jobs, options = {}) {
+  const runnableJobs = jobs.filter((job) => options.force || job.enabled);
+  const groups = await buildRefreshGroups(runnableJobs, options);
+  const results = [];
+  const contentResults = [];
+  const startedAt = new Date().toISOString();
+
+  for (const group of groups) {
+    let refreshContext = null;
+    const refreshedUrls = new Set(group.jobs.map((job) => normalizeUrlForMatch(job.url)).filter(Boolean));
+    try {
+      refreshContext = await createRefreshGroupContext(group);
+      for (const job of group.jobs) {
+        try {
+          const result = await runRefreshJob(job, { refreshContext });
+          results.push({ id: job.id, status: result.status || "ok", result });
+          rememberRefreshedContentUrls(refreshedUrls, result);
+        } catch (error) {
+          results.push({
+            id: job.id,
+            status: "failed",
+            error: error.message || String(error)
+          });
+        }
+      }
+    } catch (error) {
+      for (const job of group.jobs) {
+        if (results.some((entry) => entry.id === job.id)) continue;
+        await markRefreshJobFailed(job, error);
+        results.push({
+          id: job.id,
+          status: "failed",
+          error: error.message || String(error)
+        });
+      }
+    } finally {
+      await closeRefreshGroupContext(refreshContext);
+    }
+  }
+
+  return summarizeRefreshBatch(results, startedAt, groups, contentResults);
+}
+
+async function markRefreshJobFailed(job, error) {
+  const unreachable = isNetworkUnavailableForJob(job, error);
+  const lastError = unreachable ? networkUnavailableMessage(job) : error.message || String(error);
+  await updateRefreshJobState(job.id, {
+    status: unreachable ? "unreachable" : "failed",
+    lastRunAt: new Date().toISOString(),
+    lastError
+  });
+}
+
+function groupRefreshJobsBySource(jobs) {
+  const byKey = new Map();
+  for (const job of jobs) {
+    const adapter = detectSourceAdapter(job.url || "");
+    const key = `${adapter.sourceType || "web"}:${adapter.hostname || safeHostname(job.url || "") || "unknown"}`;
+    if (!byKey.has(key)) {
+      byKey.set(key, {
+        key,
+        sourceType: adapter.sourceType || "web",
+        hostname: adapter.hostname || safeHostname(job.url || ""),
+        seedUrl: job.url || "",
+        jobs: []
+      });
+    }
+    byKey.get(key).jobs.push(job);
+  }
+  return sortRefreshGroups([...byKey.values()]);
+}
+
+async function buildRefreshGroups(jobs, options = {}) {
+  return groupRefreshJobsBySource(jobs);
+}
+
+function sortRefreshGroups(groups) {
+  return [...groups].sort((a, b) => {
+    const priority = { jira: 1, teams: 2 };
+    return (priority[a.sourceType] || 10) - (priority[b.sourceType] || 10);
+  });
+}
+
+async function createRefreshGroupContext(group) {
+  if (!["jira", "teams"].includes(group.sourceType)) return null;
+  const targetUrl = group.seedUrl || group.jobs[0]?.url || "";
+  const adapter = detectSourceAdapter(targetUrl);
+  const session = await ensureWebdriverSession(adapter.hostname, targetUrl, {
+    autoClose: false
+  });
+  const page = await ensureSessionPage(session);
+  session.page = page;
+
+  if (group.sourceType === "teams") {
+    await page.goto(`https://${adapter.hostname}`, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await resolveTeamsLauncher(page, targetUrl || `https://${adapter.hostname}`);
+  }
+
+  return {
+    adapter,
+    webdriverSession: session,
+    webdriverPage: page,
+    closeWhenDone: !session.manual
+  };
+}
+
+async function closeRefreshGroupContext(refreshContext) {
+  if (!refreshContext?.webdriverSession || !refreshContext.closeWhenDone) return;
+  await closeWebdriverSession(refreshContext.webdriverSession);
+}
+
+function rememberRefreshedContentUrls(refreshedUrls, result) {
+  const entries = [
+    ...(result?.updatedItems || []),
+    ...(result?.skippedItems || []),
+    ...(result?.errors || [])
+  ];
+  for (const entry of entries) {
+    for (const value of [entry.url, entry.sourceUrl]) {
+      const normalized = normalizeUrlForMatch(value || "");
+      if (normalized) refreshedUrls.add(normalized);
+    }
+  }
+}
+
+function summarizeRefreshBatch(results, startedAt, groups, contentResults = []) {
+  const successful = results.filter((entry) => entry.status !== "failed" && entry.status !== "running");
+  const failed = results.filter((entry) => entry.status === "failed");
+  const running = results.filter((entry) => entry.status === "running");
+  const successfulContent = contentResults.filter((entry) => entry.status !== "failed");
+  const failedContent = contentResults.filter((entry) => entry.status === "failed");
+  const updatedContent = successfulContent.filter((entry) => entry.updated);
+  return {
+    id: "batch-refresh",
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    groupCount: groups.length,
+    jobCount: results.length,
+    contentItemCount: contentResults.length,
+    successCount: successful.length,
+    runningCount: running.length,
+    contentSuccessCount: successfulContent.length,
+    failureCount: failed.length + failedContent.length,
+    linkCount: successful.reduce((sum, entry) => sum + Number(entry.result?.linkCount ?? entry.result?.issueCount ?? 0), 0) + contentResults.length,
+    updatedItemCount: successful.reduce((sum, entry) => sum + Number(entry.result?.updatedItemCount ?? entry.result?.updatedIssueCount ?? 0), 0) + updatedContent.length,
+    skippedItemCount: successful.reduce((sum, entry) => sum + Number(entry.result?.skippedItemCount || 0), 0) + (successfulContent.length - updatedContent.length),
+    errorCount: failed.length + failedContent.length + successful.reduce((sum, entry) => sum + Number(entry.result?.errorCount || 0), 0),
+    results,
+    contentResults
+  };
+}
+
+async function runRefreshJob(job, options = {}) {
   if (refreshRuntime.running.has(job.id)) {
     return { id: job.id, status: "running" };
   }
@@ -2871,8 +3221,8 @@ async function runRefreshJob(job) {
 
   try {
     const result = job.pageKind === "content"
-      ? await refreshContentJob({ ...job, lastStartedAt: startedAt })
-      : await refreshListJob({ ...job, lastStartedAt: startedAt });
+      ? await refreshContentJob({ ...job, lastStartedAt: startedAt }, options.refreshContext)
+      : await refreshListJob({ ...job, lastStartedAt: startedAt }, options.refreshContext);
     await notifyRefreshResult(job, result);
     await updateRefreshJobState(job.id, {
       status: "idle",
@@ -2967,14 +3317,14 @@ async function sendSystemNotification(title, message) {
   });
 }
 
-async function refreshListJob(job) {
+async function refreshListJob(job, refreshContext = null) {
   const adapter = detectSourceAdapter(job.url);
   if (job.pageKind !== "list" && inferPageKind(job.url, adapter) !== "list") {
     throw new Error("当前批量刷新任务需要配置为列表/过滤页。");
   }
 
   const fetchedAt = new Date().toISOString();
-  const listFetched = await fetchForRefreshJob(job.url, { ...job, pageKind: "list" }, adapter);
+  const listFetched = await fetchForRefreshJob(job.url, { ...job, pageKind: "list" }, adapter, refreshContext);
   const listUrl = listFetched.url || job.url;
   const tags = normalizeTags(job.tags || []);
   const listItem = await upsertFetchedItem({
@@ -3011,7 +3361,7 @@ async function refreshListJob(job) {
         });
         continue;
       }
-      const contentFetched = await fetchForRefreshJob(contentUrl, { ...job, pageKind: "content" }, adapter);
+      const contentFetched = await fetchForRefreshJob(contentUrl, { ...job, pageKind: "content" }, adapter, refreshContext);
       const contentItem = await upsertFetchedItem({
         title: contentFetched.title || link.title || link.key || contentUrl,
         sourceType: adapter.sourceType,
@@ -3024,16 +3374,25 @@ async function refreshListJob(job) {
         fetchedAt: new Date().toISOString(),
         pageKind: "content",
         fetchMode: resolvedRefreshFetchMode(job, adapter),
+        managedBy: "subscription",
         parentUrl: listUrl
       });
-      updatedItems.push({
+      const contentResult = {
         key: link.key || link.number || "",
         title: contentItem.metadata.title,
         itemId: contentItem.metadata.id,
         url: contentItem.metadata.url,
         sourceUpdatedAt: contentItem.metadata.sourceUpdatedAt || "",
         sourceUrl: link.href
-      });
+      };
+      if (contentItem.refreshChanged) {
+        updatedItems.push(contentResult);
+      } else {
+        skippedItems.push({
+          ...contentResult,
+          reason: "unchanged-content"
+        });
+      }
     } catch (error) {
       errors.push({ key: link.key || link.number || "", url: contentUrl, error: error.message || String(error) });
     }
@@ -3055,10 +3414,10 @@ async function refreshListJob(job) {
   };
 }
 
-async function refreshContentJob(job) {
+async function refreshContentJob(job, refreshContext = null) {
   const adapter = detectSourceAdapter(job.url);
   const fetchedAt = new Date().toISOString();
-  const fetched = await fetchForRefreshJob(job.url, { ...job, pageKind: "content" }, adapter);
+  const fetched = await fetchForRefreshJob(job.url, { ...job, pageKind: "content" }, adapter, refreshContext);
   const item = await upsertFetchedItem({
     title: fetched.title || job.name || job.url,
     sourceType: adapter.sourceType,
@@ -3072,6 +3431,7 @@ async function refreshContentJob(job) {
     pageKind: "content",
     fetchMode: resolvedRefreshFetchMode(job, adapter)
   });
+  const changed = Boolean(item.refreshChanged);
 
   await rebuildIndexes();
   return {
@@ -3080,16 +3440,16 @@ async function refreshContentJob(job) {
     itemId: item.metadata.id,
     url: item.metadata.url,
     linkCount: 1,
-    updatedItemCount: item.metadata.contentUpdatedAt === fetchedAt ? 1 : 0,
-    skippedItemCount: item.metadata.contentUpdatedAt === fetchedAt ? 0 : 1,
+    updatedItemCount: changed ? 1 : 0,
+    skippedItemCount: changed ? 0 : 1,
     errorCount: 0,
-    updatedItems: item.metadata.contentUpdatedAt === fetchedAt ? [{
+    updatedItems: changed ? [{
       title: item.metadata.title,
       itemId: item.metadata.id,
       url: item.metadata.url,
       sourceUpdatedAt: item.metadata.sourceUpdatedAt || ""
     }] : [],
-    skippedItems: item.metadata.contentUpdatedAt === fetchedAt ? [] : [{
+    skippedItems: changed ? [] : [{
       title: item.metadata.title,
       itemId: item.metadata.id,
       url: item.metadata.url,
@@ -3141,9 +3501,12 @@ async function refreshJiraFilterJob(job) {
         fetchedAt: new Date().toISOString(),
         pageKind: "content",
         fetchMode: "webdriver",
+        managedBy: "subscription",
         parentUrl: listUrl
       });
-      updatedIssues.push({ key: issue.key, itemId: issueItem.metadata.id, url: issueItem.metadata.url });
+      if (issueItem.refreshChanged) {
+        updatedIssues.push({ key: issue.key, itemId: issueItem.metadata.id, url: issueItem.metadata.url });
+      }
     } catch (error) {
       errors.push({ key: issue.key, url: issue.href, error: error.message || String(error) });
     }
@@ -3162,9 +3525,13 @@ async function refreshJiraFilterJob(job) {
   };
 }
 
-async function fetchForRefreshJob(url, job, adapter = detectSourceAdapter(url)) {
+async function fetchForRefreshJob(url, job, adapter = detectSourceAdapter(url), refreshContext = null) {
   if (resolvedRefreshFetchMode(job, adapter) === "webdriver") {
-    return fetchUrlWithWebdriver(url, { pageKind: job.pageKind || "auto" });
+    return fetchUrlWithWebdriver(url, {
+      pageKind: job.pageKind || "auto",
+      session: refreshContext?.webdriverSession,
+      page: refreshContext?.webdriverPage
+    });
   }
   return fetchUrl(url, { pageKind: job.pageKind || "auto" });
 }
@@ -3231,12 +3598,14 @@ async function fetchUrl(url, options = {}) {
 async function fetchUrlWithWebdriver(url, options = {}) {
   if (!url) throw new Error("URL is required.");
   const adapter = detectSourceAdapter(url);
-  const session = await ensureWebdriverSession(adapter.hostname, url, {
+  const session = options.session || await ensureWebdriverSession(adapter.hostname, url, {
     headed: Boolean(options.headed),
     autoClose: options.keepSession !== true
   });
   try {
-    const page = await ensureSessionPage(session);
+    const page = options.page && !options.page.isClosed()
+      ? options.page
+      : await ensureSessionPage(session);
     session.page = page;
     const navigationUrl = adapter.sourceType === "teams" ? normalizeTeamsNavigationUrl(url) : url;
     await page.goto(navigationUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
@@ -3246,7 +3615,8 @@ async function fetchUrlWithWebdriver(url, options = {}) {
     }
     const raw = await page.content();
     const currentUrl = page.url();
-    const extracted = extractByAdapter(raw, currentUrl || url, adapter, options.pageKind || "auto");
+    const extractionUrl = resolvePageKind(url, options.pageKind || "auto") === "list" ? url : currentUrl || url;
+    const extracted = extractByAdapter(raw, extractionUrl, adapter, options.pageKind || "auto");
     return {
       raw,
       title: extracted.title || await page.title(),
@@ -3256,7 +3626,7 @@ async function fetchUrlWithWebdriver(url, options = {}) {
       url: currentUrl
     };
   } finally {
-    if (session.autoClose) {
+    if (!options.session && session.autoClose) {
       await closeWebdriverSession(session);
     }
   }
@@ -3752,6 +4122,7 @@ function extractByAdapter(html, url, adapter, pageKind) {
 function inferPageKind(url, adapter) {
   const pathname = safePathname(url);
   const search = safeSearch(url);
+  if (isKnownListUrl(url, adapter)) return "list";
   if (adapter.sourceType === "jira" && pathname === "/issues/" && /[?&]filter=\d+/i.test(search)) return "list";
   if (adapter.sourceType === "jira" && pathname === "/issues" && /[?&]filter=\d+/i.test(search)) return "list";
   if (adapter.sourceType === "jira" && /\/browse\/[A-Z][A-Z0-9]+-\d+/i.test(pathname)) return "content";
@@ -3760,6 +4131,14 @@ function inferPageKind(url, adapter) {
   if (adapter.sourceType === "teams") return "content";
   if (adapter.sourceType === "confluence" && (/\/pages\/viewpage\.action/i.test(pathname) || /\/display\//i.test(pathname))) return "content";
   return "content";
+}
+
+function isKnownListUrl(url, adapter = detectSourceAdapter(url)) {
+  const pathname = safePathname(url);
+  const search = safeSearch(url);
+  if (adapter.sourceType === "jira" && (pathname === "/issues/" || pathname === "/issues") && /[?&]filter=\d+/i.test(search)) return true;
+  if (adapter.sourceType === "github" && pathname === "/notifications") return true;
+  return false;
 }
 
 function extractListPage(html, url, adapter) {
@@ -5597,6 +5976,7 @@ function normalizeRefreshJob(input, previous = {}) {
     tags: normalizeTags(input.tags ?? previous.tags ?? []),
     fetchMode: cleanText(input.fetchMode ?? previous.fetchMode ?? "webdriver"),
     pageKind: cleanText(input.pageKind ?? previous.pageKind ?? "list"),
+    managedBy: cleanText(input.managedBy ?? previous.managedBy ?? ""),
     status: cleanText(input.status ?? previous.status ?? "idle"),
     lastRunAt: cleanText(input.lastRunAt ?? previous.lastRunAt ?? ""),
     lastStartedAt: cleanText(input.lastStartedAt ?? previous.lastStartedAt ?? ""),

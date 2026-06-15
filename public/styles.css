@@ -312,10 +312,20 @@ button {
   margin: 0;
 }
 
-.chat-history-header button {
+.chat-history-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.chat-history-actions button {
   min-height: 34px;
   border-radius: 8px;
   padding: 0 12px;
+}
+
+#clearChatHistoryButton {
+  border-color: #fecaca;
+  color: #b42318;
 }
 
 .chat-history-list {
@@ -933,6 +943,7 @@ textarea {
 .subscriptions-panel {
   display: grid;
   gap: 12px;
+  align-content: start;
   min-height: 0;
   overflow: auto;
   border: 1px solid var(--line);
@@ -1011,6 +1022,10 @@ textarea {
   border-radius: 8px;
   background: #fff;
   padding: 12px;
+}
+
+.content-refresh-group {
+  gap: 12px;
 }
 
 .refresh-job-title,
@@ -1497,24 +1512,50 @@ textarea {
 }
 
 .detail-content-layout {
+  position: relative;
   display: block;
 }
 
 .detail-content-layout.has-toc {
-  display: grid;
-  grid-template-columns: minmax(160px, 220px) minmax(0, 1fr);
-  gap: 20px;
-  align-items: start;
+  display: block;
+}
+
+.detail-toc-wrap {
+  position: sticky;
+  z-index: 4;
+  top: 12px;
+  float: right;
+  margin: 0 0 12px 12px;
+  width: 0;
+  height: 0;
+  overflow: visible;
+}
+
+.detail-toc-toggle {
+  position: absolute;
+  right: 0;
+  top: 0;
+  min-width: 64px;
+  min-height: 34px;
+  border-color: var(--accent);
+  background: var(--panel);
+  color: var(--accent-dark);
+  font-weight: 800;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.12);
+  white-space: nowrap;
 }
 
 .detail-toc {
-  position: sticky;
-  top: 12px;
+  position: absolute;
+  right: 0;
+  top: 42px;
+  width: min(280px, calc(100vw - 56px));
   max-height: calc(100vh - 120px);
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: var(--panel-soft);
+  background: rgba(248, 251, 252, 0.98);
+  box-shadow: var(--shadow);
   padding: 12px;
 }
 
@@ -1665,12 +1706,7 @@ textarea {
 }
 
 @media (max-width: 960px) {
-  .detail-content-layout.has-toc {
-    grid-template-columns: 1fr;
-  }
-
   .detail-toc {
-    position: static;
     max-height: 180px;
   }
 }
