@@ -31,7 +31,7 @@ const refreshRuntime = {
   running: new Set()
 };
 
-const port = Number(process.env.PORT || 5173);
+const port = Number(process.env.PORT || 8020);
 
 await ensureKnowledgeBase();
 await syncContentRefreshJobsFromItems();
@@ -362,6 +362,13 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (req.method === "DELETE" && url.pathname.startsWith("/api/refresh-jobs/") && url.pathname.endsWith("/items")) {
+    const id = decodeURIComponent(url.pathname.split("/")[3] || "");
+    const result = await deleteRefreshJobItems(id);
+    sendJson(res, 200, { result, jobs: publicRefreshJobs() });
+    return;
+  }
+
   if (req.method === "DELETE" && url.pathname.startsWith("/api/refresh-jobs/")) {
     const id = decodeURIComponent(url.pathname.split("/")[3] || "");
     const jobs = await deleteRefreshJob(id);
@@ -441,7 +448,8 @@ async function createItem(input) {
     pageKind: input.pageKind || null,
     fetchMode: input.fetchMode || null,
     parentUrl: input.parentUrl || null,
-    managedBy: input.managedBy || null
+    managedBy: input.managedBy || null,
+    pendingContentUpdatedAt: cleanText(input.pendingContentUpdatedAt || "")
   };
 
   await fs.writeFile(path.join(itemDir, rawFileName), rawContent, "utf8");
@@ -755,7 +763,17 @@ async function refreshItemWithContext(id, refreshContext = null) {
     }
   }
 
-  const fetched = await fetchForMetadata(item.metadata, refreshContext);
+  let fetched = await fetchForMetadata(item.metadata, refreshContext);
+  fetched = mergeFetchedTeamsInputWithExisting(item, {
+    ...fetched,
+    sourceType: item.metadata.sourceType,
+    title: fetched.title || item.metadata.title,
+    url: item.metadata.url
+  });
+  validateFetchedItemNotRegressed(item, {
+    sourceType: item.metadata.sourceType,
+    comments: fetched.comments || []
+  });
   const previousLength = item.document.length;
   const previousBody = extractBodyFromDocument(item.document).trim();
   const currentBody = fetched.text.trim();
@@ -772,7 +790,8 @@ async function refreshItemWithContext(id, refreshContext = null) {
     updatedAt: now,
     lastFetchedAt: now,
     sourceUpdatedAt: nextSourceUpdatedAt,
-    contentUpdatedAt: hasUpdate ? now : item.metadata.contentUpdatedAt || "",
+    contentUpdatedAt: item.metadata.contentUpdatedAt || "",
+    pendingContentUpdatedAt: hasUpdate ? now : item.metadata.pendingContentUpdatedAt || "",
     processedStale: hasUpdate && item.metadata.processedAt ? true : item.metadata.processedStale || false,
     refreshNote: {
       previousDocumentLength: previousLength,
@@ -804,7 +823,7 @@ async function upsertFetchedItem(input) {
   const itemUrl = canonicalizeMaterialUrl(input.url || "");
   const existing = await findItemByUrl(itemUrl);
   if (!existing) {
-    return createItem({
+    const created = await createItem({
       title: input.title,
       sourceType: input.sourceType,
       url: itemUrl,
@@ -818,11 +837,16 @@ async function upsertFetchedItem(input) {
       fetchMode: input.fetchMode,
       parentUrl: input.parentUrl,
       managedBy: input.managedBy,
-      sourceUpdatedAt: input.sourceUpdatedAt
+      sourceUpdatedAt: input.sourceUpdatedAt,
+      pendingContentUpdatedAt: input.fetchedAt
     });
+    created.refreshChanged = true;
+    return created;
   }
 
   const item = await readItem(existing.id);
+  input = mergeFetchedTeamsInputWithExisting(item, input);
+  validateFetchedItemNotRegressed(item, input);
   const itemDir = path.join(itemsDir, existing.id);
   const snapshotDir = path.join(itemDir, "snapshots", input.fetchedAt.replace(/[:.]/g, "-"));
   await fs.mkdir(snapshotDir, { recursive: true });
@@ -852,7 +876,8 @@ async function upsertFetchedItem(input) {
     updatedAt: input.fetchedAt,
     lastFetchedAt: input.fetchedAt,
     sourceUpdatedAt: nextSourceUpdatedAt,
-    contentUpdatedAt: hasUpdate ? input.fetchedAt : item.metadata.contentUpdatedAt || "",
+    contentUpdatedAt: item.metadata.contentUpdatedAt || "",
+    pendingContentUpdatedAt: hasUpdate ? input.fetchedAt : item.metadata.pendingContentUpdatedAt || "",
     processedStale: hasUpdate && item.metadata.processedAt ? true : item.metadata.processedStale || false,
     rawFileName: item.metadata.rawFileName || "raw.html",
     pageKind: input.pageKind || item.metadata.pageKind || null,
@@ -876,6 +901,59 @@ async function upsertFetchedItem(input) {
   return refreshed;
 }
 
+function validateFetchedItemNotRegressed(item, input) {
+  const sourceType = input.sourceType || item.metadata.sourceType || "";
+  if (sourceType !== "teams") return;
+  const previousCount = Array.isArray(item.comments) ? item.comments.length : 0;
+  const nextCount = Array.isArray(input.comments) ? input.comments.length : 0;
+  if (previousCount < 10) return;
+  if (nextCount >= 3) return;
+  throw new Error([
+    "Teams 抓取到的消息数量明显少于已有内容，已跳过覆盖以避免资料变少。",
+    `已有 ${previousCount} 条，本次 ${nextCount} 条。`,
+    "请确认 Teams 页面打开的是目标会话，并等待消息加载完成后再刷新。"
+  ].join(" "));
+}
+
+function mergeFetchedTeamsInputWithExisting(item, input) {
+  const sourceType = input.sourceType || item.metadata.sourceType || "";
+  if (sourceType !== "teams") return input;
+  const previousComments = Array.isArray(item.comments) ? item.comments : [];
+  const nextComments = Array.isArray(input.comments) ? input.comments : [];
+  if (!previousComments.length || !nextComments.length) return input;
+  if (previousComments.length >= 10 && nextComments.length < 3) return input;
+  if (previousComments.length >= 10 && nextComments.length < previousComments.length) {
+    const title = cleanText(item.metadata.title || input.title || "Microsoft Teams conversation");
+    const url = canonicalizeMaterialUrl(item.metadata.url || input.url || "");
+    const adapter = detectSourceAdapter(url || input.url || "");
+    return {
+      ...input,
+      title,
+      url: url || input.url,
+      comments: previousComments,
+      text: renderTeamsTextFromComments(title, url || input.url || item.metadata.url || "", adapter, previousComments),
+      sourceUpdatedAt: item.metadata.sourceUpdatedAt || input.sourceUpdatedAt || ""
+    };
+  }
+  const mergedComments = mergeTeamsComments([...previousComments, ...nextComments]);
+  if (mergedComments.length <= nextComments.length) return input;
+  const title = cleanText(input.title || item.metadata.title || "Microsoft Teams conversation");
+  const url = canonicalizeMaterialUrl(input.url || item.metadata.url || "");
+  const adapter = detectSourceAdapter(url || item.metadata.url || "");
+  return {
+    ...input,
+    title,
+    url: url || input.url,
+    comments: mergedComments,
+    text: renderTeamsTextFromComments(title, url || input.url || item.metadata.url || "", adapter, mergedComments),
+    sourceUpdatedAt: latestTimestampValue([
+      input.sourceUpdatedAt,
+      item.metadata.sourceUpdatedAt,
+      ...mergedComments.map((comment) => comment.createdAt)
+    ]) || input.sourceUpdatedAt || item.metadata.sourceUpdatedAt || ""
+  };
+}
+
 async function findItemByUrl(url) {
   const normalized = normalizeUrlForMatch(url);
   if (!normalized) return null;
@@ -889,7 +967,8 @@ async function findItemByUrl(url) {
   return null;
 }
 
-function shouldSkipContentRefresh(existingMetadata, listUpdatedAt) {
+function shouldSkipContentRefresh(existingMetadata, listUpdatedAt, adapter = detectSourceAdapter(existingMetadata?.url || "")) {
+  if (adapter.sourceType === "github") return false;
   if (!existingMetadata || !listUpdatedAt || !existingMetadata.sourceUpdatedAt) return false;
   if (isSameRelativeSourceDay(existingMetadata.sourceUpdatedAt, existingMetadata.lastFetchedAt, listUpdatedAt)) return true;
   const existingTime = parseSourceUpdatedAt(existingMetadata.sourceUpdatedAt, existingMetadata.lastFetchedAt);
@@ -919,6 +998,19 @@ function normalizeSourceUpdatedAt(value, referenceDate = "") {
   const parsed = parseSourceUpdatedAt(clean, referenceDate);
   if (!Number.isNaN(parsed)) return new Date(parsed).toISOString();
   return clean.toLowerCase().replace(/\s+/g, " ");
+}
+
+function latestTimestampValue(values) {
+  let latestValue = "";
+  let latestTime = Number.NEGATIVE_INFINITY;
+  for (const value of values) {
+    const clean = cleanText(value || "");
+    const parsed = Date.parse(clean);
+    if (!clean || Number.isNaN(parsed) || parsed <= latestTime) continue;
+    latestValue = clean;
+    latestTime = parsed;
+  }
+  return latestValue;
 }
 
 function parseSourceUpdatedAt(value, referenceDate = "") {
@@ -1068,6 +1160,7 @@ async function syncContentRefreshJobsFromItems() {
 
   for (const item of items) {
     if (!item.url || item.pageKind === "list") continue;
+    if (isInvalidTeamsRootCapture(item)) continue;
     if (isSubscriptionManagedItem(item)) {
       await markItemManagedBySubscription(item);
       continue;
@@ -1874,6 +1967,8 @@ async function processItemWithAi(id) {
     processedModel: settings.ai.model,
     processedPromptSource: item.metadata.sourceType || "default",
     processedStale: false,
+    contentUpdatedAt: item.metadata.contentUpdatedAt || item.metadata.pendingContentUpdatedAt || "",
+    pendingContentUpdatedAt: "",
     updatedAt: now
   };
   const itemDir = path.join(itemsDir, id);
@@ -1997,6 +2092,7 @@ async function listItems(filters = {}) {
     const searchText = `${metadata.title} ${(metadata.tags || []).join(" ")} ${processedDocument} ${document}`.toLowerCase();
 
     if (!isTruthyFilter(filters.includeLists) && metadata.pageKind === "list") continue;
+    if (!isTruthyFilter(filters.includeInvalidTeamsRoot) && isInvalidTeamsRootCapture(metadata)) continue;
     if (filters.tag && !(metadata.tags || []).includes(filters.tag)) continue;
     if (filters.sourceType && metadata.sourceType !== filters.sourceType) continue;
     if (isTruthyFilter(filters.updates) && !metadata.contentUpdatedAt) continue;
@@ -3055,7 +3151,9 @@ async function runRefreshJobsByIds(ids, options = {}) {
 }
 
 async function runRefreshJobsBatch(jobs, options = {}) {
-  const runnableJobs = jobs.filter((job) => options.force || job.enabled);
+  const runnableJobs = jobs
+    .filter((job) => options.force || job.enabled)
+    .filter((job) => !isInvalidTeamsRootRefreshJob(job));
   const groups = await buildRefreshGroups(runnableJobs, options);
   const results = [];
   const contentResults = [];
@@ -3094,7 +3192,11 @@ async function runRefreshJobsBatch(jobs, options = {}) {
     }
   }
 
-  return summarizeRefreshBatch(results, startedAt, groups, contentResults);
+  const aiProcessing = await processUpdatedItemsAfterRefresh(results);
+  await annotateRefreshResultsWithAiProcessing(results, aiProcessing);
+  const summary = summarizeRefreshBatch(results, startedAt, groups, contentResults, aiProcessing);
+  await notifyRefreshBatchResult(summary);
+  return summary;
 }
 
 async function markRefreshJobFailed(job, error) {
@@ -3138,18 +3240,23 @@ function sortRefreshGroups(groups) {
 }
 
 async function createRefreshGroupContext(group) {
-  if (!["jira", "teams"].includes(group.sourceType)) return null;
+  const needsWebdriver = group.jobs.some((job) => {
+    const adapter = detectSourceAdapter(job.url || "");
+    return resolvedRefreshFetchMode(job, adapter) === "webdriver";
+  });
+  if (!needsWebdriver) return null;
   const targetUrl = group.seedUrl || group.jobs[0]?.url || "";
   const adapter = detectSourceAdapter(targetUrl);
-  const session = await ensureWebdriverSession(adapter.hostname, targetUrl, {
-    autoClose: false
+  const sessionUrl = group.sourceType === "teams" ? `https://${adapter.hostname}` : targetUrl;
+  const session = await ensureWebdriverSession(adapter.hostname, sessionUrl, {
+    autoClose: false,
+    windowMode: group.sourceType === "teams" ? "normal" : undefined
   });
   const page = await ensureSessionPage(session);
   session.page = page;
 
   if (group.sourceType === "teams") {
-    await page.goto(`https://${adapter.hostname}`, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await resolveTeamsLauncher(page, targetUrl || `https://${adapter.hostname}`);
+    await prepareTeamsRefreshGroup(page, adapter);
   }
 
   return {
@@ -3158,6 +3265,17 @@ async function createRefreshGroupContext(group) {
     webdriverPage: page,
     closeWhenDone: !session.manual
   };
+}
+
+async function prepareTeamsRefreshGroup(page, adapter) {
+  const homeUrl = `https://${adapter.hostname}`;
+  await page.goto(homeUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await resolveTeamsLauncher(page, homeUrl);
+  try {
+    await page.waitForLoadState("networkidle", { timeout: 8000 });
+  } catch {
+    // Teams may keep background requests open; a loaded shell is enough before opening each subscription link.
+  }
 }
 
 async function closeRefreshGroupContext(refreshContext) {
@@ -3179,13 +3297,131 @@ function rememberRefreshedContentUrls(refreshedUrls, result) {
   }
 }
 
-function summarizeRefreshBatch(results, startedAt, groups, contentResults = []) {
+async function processUpdatedItemsAfterRefresh(results) {
+  const itemIds = await collectRefreshItemIdsNeedingAi(results);
+  if (!itemIds.length) {
+    return { requestedCount: 0, processedCount: 0, skippedCount: 0, errorCount: 0, processedItems: [], errors: [] };
+  }
+  if (!settings.ai?.baseUrl || !settings.ai?.apiKey || !settings.ai?.model) {
+    return {
+      requestedCount: itemIds.length,
+      processedCount: 0,
+      skippedCount: itemIds.length,
+      errorCount: itemIds.length,
+      processedItems: [],
+      errors: itemIds.map((itemId) => ({ itemId, error: "AI 接口未配置，刷新内容已暂存，未显示 NEW。" }))
+    };
+  }
+
+  const processedItems = [];
+  const errors = [];
+  for (const itemId of itemIds) {
+    try {
+      const item = await processItemWithAi(itemId);
+      processedItems.push({
+        itemId,
+        title: item.metadata.title,
+        url: item.metadata.url,
+        sourceType: item.metadata.sourceType,
+        contentUpdatedAt: item.metadata.contentUpdatedAt || ""
+      });
+    } catch (error) {
+      errors.push({ itemId, error: error.message || String(error) });
+    }
+  }
+  return {
+    requestedCount: itemIds.length,
+    processedCount: processedItems.length,
+    skippedCount: 0,
+    errorCount: errors.length,
+    processedItems,
+    errors
+  };
+}
+
+async function collectRefreshItemIdsNeedingAi(results) {
+  const candidateIds = collectRefreshCandidateItemIds(results);
+  const itemIds = [];
+  for (const itemId of candidateIds) {
+    try {
+      const item = await readItem(itemId);
+      if (item.metadata.pendingContentUpdatedAt || item.metadata.processedStale) {
+        itemIds.push(itemId);
+      }
+    } catch {
+      // Ignore missing items; the refresh result may be stale.
+    }
+  }
+  return itemIds;
+}
+
+function collectRefreshCandidateItemIds(results) {
+  const ids = [];
+  const seen = new Set();
+  for (const entry of results || []) {
+    const result = entry?.result || {};
+    const candidates = [
+      ...(result.updatedItems || []),
+      ...(result.updatedIssues || []),
+      ...(result.skippedItems || [])
+    ];
+    for (const item of candidates) {
+      const itemId = cleanText(item.itemId || "");
+      if (!itemId || seen.has(itemId)) continue;
+      seen.add(itemId);
+      ids.push(itemId);
+    }
+  }
+  return ids;
+}
+
+async function annotateRefreshResultsWithAiProcessing(results, aiProcessing) {
+  const processed = new Set((aiProcessing.processedItems || []).map((item) => item.itemId));
+  const failed = new Set((aiProcessing.errors || []).map((item) => item.itemId));
+  for (const entry of results || []) {
+    if (!entry?.result) continue;
+    const updatedEntries = [
+      ...(entry.result.updatedItems || []),
+      ...(entry.result.updatedIssues || []),
+      ...(entry.result.skippedItems || [])
+    ];
+    const aiProcessedCount = updatedEntries.filter((item) => processed.has(item.itemId)).length;
+    const aiProcessErrorCount = updatedEntries.filter((item) => failed.has(item.itemId)).length;
+    entry.result = {
+      ...entry.result,
+      newItemCount: aiProcessedCount,
+      aiProcessedCount,
+      aiProcessErrorCount,
+      aiProcessingErrors: (aiProcessing.errors || []).filter((item) => updatedEntries.some((updated) => updated.itemId === item.itemId))
+    };
+  }
+  await updateRefreshJobsLastResults(results);
+}
+
+async function updateRefreshJobsLastResults(results) {
+  const byId = new Map((results || [])
+    .filter((entry) => entry?.id && entry.result)
+    .map((entry) => [entry.id, entry.result]));
+  if (!byId.size) return;
+  settings = {
+    ...settings,
+    refreshJobs: (settings.refreshJobs || []).map((job) => (
+      byId.has(job.id) ? { ...job, lastResult: byId.get(job.id) } : job
+    ))
+  };
+  await fs.mkdir(configDir, { recursive: true });
+  await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+}
+
+function summarizeRefreshBatch(results, startedAt, groups, contentResults = [], aiProcessing = null) {
   const successful = results.filter((entry) => entry.status !== "failed" && entry.status !== "running");
   const failed = results.filter((entry) => entry.status === "failed");
   const running = results.filter((entry) => entry.status === "running");
   const successfulContent = contentResults.filter((entry) => entry.status !== "failed");
   const failedContent = contentResults.filter((entry) => entry.status === "failed");
   const updatedContent = successfulContent.filter((entry) => entry.updated);
+  const aiProcessedCount = Number(aiProcessing?.processedCount || 0);
+  const aiProcessErrorCount = Number(aiProcessing?.errorCount || 0);
   return {
     id: "batch-refresh",
     startedAt,
@@ -3199,6 +3435,10 @@ function summarizeRefreshBatch(results, startedAt, groups, contentResults = []) 
     failureCount: failed.length + failedContent.length,
     linkCount: successful.reduce((sum, entry) => sum + Number(entry.result?.linkCount ?? entry.result?.issueCount ?? 0), 0) + contentResults.length,
     updatedItemCount: successful.reduce((sum, entry) => sum + Number(entry.result?.updatedItemCount ?? entry.result?.updatedIssueCount ?? 0), 0) + updatedContent.length,
+    newItemCount: aiProcessedCount,
+    aiProcessedCount,
+    aiProcessErrorCount,
+    aiProcessing: aiProcessing || { requestedCount: 0, processedCount: 0, skippedCount: 0, errorCount: 0, processedItems: [], errors: [] },
     skippedItemCount: successful.reduce((sum, entry) => sum + Number(entry.result?.skippedItemCount || 0), 0) + (successfulContent.length - updatedContent.length),
     errorCount: failed.length + failedContent.length + successful.reduce((sum, entry) => sum + Number(entry.result?.errorCount || 0), 0),
     results,
@@ -3223,7 +3463,6 @@ async function runRefreshJob(job, options = {}) {
     const result = job.pageKind === "content"
       ? await refreshContentJob({ ...job, lastStartedAt: startedAt }, options.refreshContext)
       : await refreshListJob({ ...job, lastStartedAt: startedAt }, options.refreshContext);
-    await notifyRefreshResult(job, result);
     await updateRefreshJobState(job.id, {
       status: "idle",
       lastRunAt: new Date().toISOString(),
@@ -3273,17 +3512,17 @@ function networkUnavailableMessage(job) {
   return `当前网络无法访问 ${hostname}。如果不在公司网络或 VPN 未连接，本次刷新会跳过；连接公司网络后再刷新即可。`;
 }
 
-async function notifyRefreshResult(job, result) {
-  const updatedItems = result?.updatedItems || [];
-  if (!updatedItems.length) return;
-  const sourceType = result.sourceType || detectSourceAdapter(job.url).sourceType || "web";
+async function notifyRefreshBatchResult(summary) {
+  const processedItems = summary?.aiProcessing?.processedItems || [];
+  if (!processedItems.length) return;
+  const sourceType = processedItems[0]?.sourceType || "web";
   if (!shouldNotifySource(sourceType)) return;
 
-  const title = `资料更新：${sourceLabel(sourceType)} ${updatedItems.length} 条`;
-  const firstTitle = cleanText(updatedItems[0]?.title || updatedItems[0]?.key || job.name || "");
-  const message = updatedItems.length === 1
+  const title = `资料更新：AI 已整理 ${processedItems.length} 条`;
+  const firstTitle = cleanText(processedItems[0]?.title || "");
+  const message = processedItems.length === 1
     ? firstTitle || "检测到 1 条新内容"
-    : `${firstTitle || "检测到新内容"} 等 ${updatedItems.length} 条`;
+    : `${firstTitle || "检测到新内容"} 等 ${processedItems.length} 条`;
   await sendSystemNotification(title, message);
 }
 
@@ -3310,10 +3549,18 @@ async function sendSystemNotification(title, message) {
     return;
   }
   await new Promise((resolve) => {
-    execFile("osascript", [
+    const child = execFile("osascript", [
       "-e",
       `display notification ${JSON.stringify(message)} with title ${JSON.stringify(title)} sound name "Glass"`
     ], () => resolve());
+    setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        // The notification process may have already exited.
+      }
+      resolve();
+    }, 3000).unref();
   });
 }
 
@@ -3351,7 +3598,7 @@ async function refreshListJob(job, refreshContext = null) {
     try {
       const existing = await findItemByUrl(contentUrl);
       const listUpdatedAt = cleanText(link.updatedAt || link.updated || "");
-      if (shouldSkipContentRefresh(existing, listUpdatedAt)) {
+      if (shouldSkipContentRefresh(existing, listUpdatedAt, adapter)) {
         skippedItems.push({
           key: link.key || link.number || "",
           itemId: existing.id,
@@ -3537,6 +3784,13 @@ async function fetchForRefreshJob(url, job, adapter = detectSourceAdapter(url), 
 }
 
 function resolvedRefreshFetchMode(job, adapter) {
+  if (
+    adapter.sourceType === "github"
+    && resolvePageKind(job.url || "", job.pageKind || "auto") === "content"
+    && /\/[^/]+\/[^/]+\/(issues|pull|discussions)\/\d+/i.test(safePathname(job.url || ""))
+  ) {
+    return "webdriver";
+  }
   if (job.fetchMode === "fetch") return "fetch";
   if (job.fetchMode === "webdriver") return "webdriver";
   return adapter.sourceType === "jira" || adapter.sourceType === "teams" ? "webdriver" : "fetch";
@@ -3567,6 +3821,56 @@ async function deleteRefreshJob(id) {
   await fs.mkdir(configDir, { recursive: true });
   await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
   return publicRefreshJobs();
+}
+
+async function deleteRefreshJobItems(id) {
+  const job = (settings.refreshJobs || []).find((candidate) => candidate.id === id);
+  if (!job) throw new Error("Refresh job not found.");
+  if (job.managedBy === "content-page") {
+    throw new Error("普通页面整体管理的内容不能通过订阅清空。");
+  }
+
+  const dirs = await safeReaddir(itemsDir);
+  const deletedItems = [];
+  for (const itemId of dirs) {
+    const metadataPath = path.join(itemsDir, itemId, "metadata.json");
+    if (!(await exists(metadataPath))) continue;
+    const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
+    if (!isRefreshJobCapturedItem(job, metadata)) continue;
+    await fs.rm(path.join(itemsDir, itemId), { recursive: true, force: true });
+    deletedItems.push({
+      id: metadata.id || itemId,
+      title: metadata.title || itemId,
+      url: metadata.url || ""
+    });
+  }
+
+  const now = new Date().toISOString();
+  await updateRefreshJobState(job.id, {
+    status: "idle",
+    lastError: "",
+    lastResult: {
+      clearedAt: now,
+      deletedItemCount: deletedItems.length,
+      deletedItems
+    }
+  });
+  await rebuildIndexes();
+  return {
+    id: job.id,
+    deletedItemCount: deletedItems.length,
+    deletedItems
+  };
+}
+
+function isRefreshJobCapturedItem(job, metadata) {
+  if (!metadata || metadata.pageKind === "list") return false;
+  if (metadata.managedBy !== "subscription" && !metadata.parentUrl) return false;
+  const jobUrl = normalizeUrlForMatch(job.url || "");
+  if (!jobUrl) return false;
+  const itemUrl = normalizeUrlForMatch(metadata.url || "");
+  const parentUrl = normalizeUrlForMatch(metadata.parentUrl || "");
+  return itemUrl === jobUrl || parentUrl === jobUrl;
 }
 
 async function fetchUrl(url, options = {}) {
@@ -3600,7 +3904,8 @@ async function fetchUrlWithWebdriver(url, options = {}) {
   const adapter = detectSourceAdapter(url);
   const session = options.session || await ensureWebdriverSession(adapter.hostname, url, {
     headed: Boolean(options.headed),
-    autoClose: options.keepSession !== true
+    autoClose: options.keepSession !== true,
+    windowMode: adapter.sourceType === "teams" ? "normal" : undefined
   });
   try {
     const page = options.page && !options.page.isClosed()
@@ -3610,6 +3915,7 @@ async function fetchUrlWithWebdriver(url, options = {}) {
     const navigationUrl = adapter.sourceType === "teams" ? normalizeTeamsNavigationUrl(url) : url;
     await page.goto(navigationUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await waitForJiraIssueNavigator(page, adapter, options.pageKind || "auto");
+    await waitForGithubIssueTimeline(page, adapter, options.pageKind || "auto");
     if (adapter.sourceType === "teams") {
       return await fetchTeamsWithWebdriver(page, url, adapter);
     }
@@ -3635,18 +3941,19 @@ async function fetchUrlWithWebdriver(url, options = {}) {
 async function fetchTeamsWithWebdriver(page, url, adapter) {
   await resolveTeamsLauncher(page, url);
   await waitForTeamsConversation(page);
-  await scrollTeamsMessages(page, 8);
+  const observedMessages = await scrollTeamsMessages(page, 18);
   const raw = await page.content();
   const currentUrl = page.url();
-  const extracted = await extractTeamsFromPage(page, currentUrl || url, adapter);
-  validateTeamsExtraction(extracted, currentUrl || url);
+  const stableUrl = canonicalizeMaterialUrl(url) || currentUrl || url;
+  const extracted = await extractTeamsFromPage(page, stableUrl, adapter, observedMessages);
+  validateTeamsExtraction(extracted, stableUrl);
   return {
     raw,
     title: extracted.title || await page.title(),
     text: extracted.text,
     comments: extracted.comments || [],
     sourceUpdatedAt: extracted.sourceUpdatedAt || "",
-    url: currentUrl
+    url: stableUrl
   };
 }
 
@@ -3840,7 +4147,7 @@ async function ensureWebdriverSession(hostname, url, options = {}) {
   const profile = settings.sources?.[key] || {};
   const headless = headed ? false : Boolean(profile.webdriverHeadless);
   const autoClose = Boolean(normalizedOptions.autoClose && !manual);
-  const windowMode = normalizeWebdriverWindowMode(profile.webdriverWindowMode);
+  const windowMode = normalizeWebdriverWindowMode(normalizedOptions.windowMode || profile.webdriverWindowMode);
   const existing = webdriverSessions.get(key);
   if (existing) {
     if ((headed && existing.headless) || existing.windowMode !== windowMode) {
@@ -3966,6 +4273,60 @@ async function waitForJiraIssueNavigator(page, adapter, pageKind) {
   }
 }
 
+async function waitForGithubIssueTimeline(page, adapter, pageKind) {
+  if (adapter.sourceType !== "github") return;
+  if (pageKind === "list") return;
+  if (!/\/[^/]+\/[^/]+\/(issues|pull|discussions)\/\d+/i.test(safePathname(page.url()))) return;
+  try {
+    await page.waitForSelector("[data-target='react-app.embeddedData'], [id^='issuecomment-'], [data-testid='issue-viewer-issue-container']", {
+      timeout: 15000
+    });
+  } catch {
+    // Keep current DOM; extraction will fall back to embedded data or plain HTML.
+  }
+  try {
+    await page.waitForLoadState("networkidle", { timeout: 8000 });
+  } catch {
+    // GitHub can keep background subscriptions open.
+  }
+
+  let stableCount = 0;
+  for (let index = 0; index < 10; index += 1) {
+    const before = await page.evaluate(() => ({
+      height: document.documentElement.scrollHeight,
+      y: window.scrollY
+    }));
+    await clickGithubTimelineMore(page);
+    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+    await page.waitForTimeout(900);
+    const after = await page.evaluate(() => ({
+      height: document.documentElement.scrollHeight,
+      y: window.scrollY
+    }));
+    if (after.height <= before.height && after.y === before.y) {
+      stableCount += 1;
+      if (stableCount >= 2) break;
+    } else {
+      stableCount = 0;
+    }
+  }
+}
+
+async function clickGithubTimelineMore(page) {
+  const clicked = await page.evaluate(() => {
+    const candidates = [...document.querySelectorAll("button, a")]
+      .filter((el) => el instanceof HTMLElement)
+      .filter((el) => /show more|load more|more items|查看更多|加载更多/i.test(el.innerText || el.getAttribute("aria-label") || ""));
+    const target = candidates.find((el) => !el.hasAttribute("disabled"));
+    if (!target) return false;
+    target.click();
+    return true;
+  });
+  if (clicked) {
+    await page.waitForTimeout(1200);
+  }
+}
+
 async function waitForTeamsConversation(page) {
   try {
     await page.waitForLoadState("networkidle", { timeout: 15000 });
@@ -3985,30 +4346,8 @@ async function waitForTeamsConversation(page) {
   }
 }
 
-async function scrollTeamsMessages(page, maxScrolls = 6) {
-  for (let index = 0; index < maxScrolls; index += 1) {
-    const moved = await page.evaluate(() => {
-      const candidates = [...document.querySelectorAll("main, [role='main'], [data-tid*='chat'], [data-tid*='message'], div")]
-        .filter((el) => el instanceof HTMLElement)
-        .map((el) => ({
-          el,
-          score: (el.scrollHeight - el.clientHeight) * Math.max(1, el.getBoundingClientRect().height)
-        }))
-        .filter((entry) => entry.score > 0)
-        .sort((a, b) => b.score - a.score);
-      const target = candidates[0]?.el;
-      if (!target) return false;
-      const before = target.scrollTop;
-      target.scrollTop = 0;
-      return target.scrollTop !== before;
-    });
-    if (!moved) break;
-    await page.waitForTimeout(900);
-  }
-}
-
-async function extractTeamsFromPage(page, url, adapter) {
-  const data = await page.evaluate(() => {
+async function readVisibleTeamsMessages(page) {
+  return page.evaluate(() => {
     const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
     const pickTitle = () => {
       const selectors = [
@@ -4026,54 +4365,102 @@ async function extractTeamsFromPage(page, url, adapter) {
     };
     const messageSelectors = [
       "[data-tid='chat-pane-message']",
+      "[data-tid='chat-pane-item']",
+      "[data-tid='message-container']",
       "[data-tid*='message-item']",
       "[data-tid*='message'][role='listitem']",
+      "[data-mid]",
       "[role='listitem'][aria-label*='message' i]",
       "[role='listitem'][aria-label*='消息']"
     ];
-    const nodes = [...document.querySelectorAll(messageSelectors.join(","))]
-      .filter((node, index, list) => node instanceof HTMLElement && list.findIndex((candidate) => candidate === node || candidate.contains(node)) === index);
-    const fallbackNodes = nodes.length ? nodes : [...document.querySelectorAll("[role='listitem']")]
-      .filter((node) => clean(node.textContent).length > 12)
-      .slice(-80);
+    const candidates = [...document.querySelectorAll(messageSelectors.join(","))]
+      .filter((node) => node instanceof HTMLElement && clean(node.textContent).length > 8);
+    const nodes = candidates.filter((node, index, list) => (
+      list.findIndex((candidate) => candidate !== node && candidate.contains(node)) === -1
+        && list.findIndex((candidate) => candidate === node || node.contains(candidate)) === index
+    ));
+    const fallbackNodes = nodes.length ? nodes : [...document.querySelectorAll("[role='listitem'], [data-tid*='messageBody'], [data-tid*='message-body']")]
+      .filter((node) => node instanceof HTMLElement && clean(node.textContent).length > 12)
+      .slice(-120);
     const messages = fallbackNodes.map((node, index) => {
-      const author = clean(node.querySelector("[data-tid*='author'], [data-tid*='sender'], [class*='author'], [class*='sender']")?.textContent)
+      const author = clean(node.querySelector([
+        "[data-tid*='author']",
+        "[data-tid*='sender']",
+        "[data-tid*='message-author']",
+        "[class*='author']",
+        "[class*='sender']"
+      ].join(","))?.textContent)
         || clean(node.getAttribute("data-author"))
         || "";
       const time = node.querySelector("time")?.getAttribute("datetime")
         || node.querySelector("[datetime]")?.getAttribute("datetime")
-        || clean(node.querySelector("[data-tid*='timestamp'], [class*='timestamp'], [aria-label*='sent'], [aria-label*='发送']")?.textContent)
+        || clean(node.querySelector([
+          "[data-tid*='timestamp']",
+          "[class*='timestamp']",
+          "[aria-label*='sent']",
+          "[aria-label*='发送']"
+        ].join(","))?.textContent)
         || "";
-      const bodyNode = node.querySelector("[data-tid*='messageBody'], [data-tid*='message-body'], [data-tid*='content'], [class*='messageBody'], [class*='message-body']")
-        || node;
+      const bodyNode = node.querySelector([
+        "[data-tid='messageBodyContent']",
+        "[data-tid*='messageBody']",
+        "[data-tid*='message-body']",
+        "[data-tid*='content']",
+        "[class*='messageBody']",
+        "[class*='message-body']"
+      ].join(",")) || node;
       const text = clean(bodyNode.innerText || bodyNode.textContent);
       const links = [...node.querySelectorAll("a[href]")].map((link) => ({
         text: clean(link.textContent),
         href: link.href
       })).filter((link) => link.href);
       return {
-        id: node.id || node.getAttribute("data-tid") || `teams-message-${index + 1}`,
+        id: node.id || node.getAttribute("data-mid") || node.getAttribute("data-tid") || `teams-message-${index + 1}`,
         author,
         createdAt: time,
         body: text,
         links
       };
-    }).filter((message, index, list) => (
-      message.body && list.findIndex((candidate) => candidate.body === message.body && candidate.createdAt === message.createdAt) === index
-    )).slice(-120);
+    }).filter((message) => message.body);
     return { title: pickTitle(), messages };
   });
+}
 
-  const comments = data.messages.map((message) => ({
-    id: message.id,
-    author: message.author,
-    createdAt: message.createdAt,
-    body: message.body,
-    url
+function mergeTeamsMessages(messages) {
+  const byKey = new Map();
+  for (const message of messages) {
+    const body = cleanText(message?.body || "");
+    if (!body) continue;
+    const createdAt = cleanText(message.createdAt || "");
+    const key = `${createdAt}\n${body}`;
+    if (!byKey.has(key)) {
+      byKey.set(key, {
+        id: cleanText(message.id || `teams-message-${byKey.size + 1}`),
+        author: cleanText(message.author || ""),
+        createdAt,
+        body,
+        links: Array.isArray(message.links) ? message.links : []
+      });
+    }
+  }
+  return [...byKey.values()];
+}
+
+function mergeTeamsComments(comments) {
+  return mergeTeamsMessages(comments).map((comment, index) => ({
+    id: cleanText(comment.id || `teams-message-${index + 1}`),
+    author: cleanText(comment.author || ""),
+    createdAt: cleanText(comment.createdAt || ""),
+    body: cleanText(comment.body || ""),
+    links: Array.isArray(comment.links) ? comment.links : [],
+    url: cleanText(comment.url || "")
   }));
+}
+
+function renderTeamsTextFromComments(title, url, adapter, comments) {
   const sourceUpdatedAt = comments.map((comment) => comment.createdAt).filter(Boolean).at(-1) || "";
   const lines = [
-    `# ${data.title || "Microsoft Teams conversation"}`,
+    `# ${title || "Microsoft Teams conversation"}`,
     "",
     `Source: ${url}`,
     `Adapter: ${adapter.id}`,
@@ -4089,10 +4476,84 @@ async function extractTeamsFromPage(page, url, adapter) {
         })
       : ["_No Teams messages captured. Make sure the WebDriver window is logged in and the target chat or channel is open._"])
   ].filter((line) => line !== "");
+  return lines.join("\n");
+}
+
+async function scrollTeamsMessages(page, maxScrolls = 18) {
+  const observed = [];
+  const remember = async () => {
+    const visible = await readVisibleTeamsMessages(page);
+    observed.push(...(visible.messages || []));
+  };
+
+  await remember();
+  try {
+    const box = await page.locator("[data-tid='chat-pane-list'], [role='main'], main").first().boundingBox({ timeout: 3000 });
+    if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  } catch {
+    // Keyboard/mouse focus is best-effort; direct scroll fallback below still applies.
+  }
+
+  let stableRounds = 0;
+  for (let index = 0; index < maxScrolls; index += 1) {
+    const beforeCount = mergeTeamsMessages(observed).length;
+    const moved = await page.evaluate(() => {
+      const candidates = [...document.querySelectorAll("[data-tid='chat-pane-list'], [role='main'], main, [data-tid*='chat'], [data-tid*='message'], div")]
+        .filter((el) => el instanceof HTMLElement)
+        .map((el) => ({
+          el,
+          score: (el.scrollHeight - el.clientHeight) * Math.max(1, el.getBoundingClientRect().height)
+        }))
+        .filter((entry) => entry.score > 0)
+        .sort((a, b) => b.score - a.score);
+      const target = candidates[0]?.el;
+      if (!target) return false;
+      const before = target.scrollTop;
+      target.scrollTop = Math.max(0, target.scrollTop - Math.max(420, Math.floor(target.clientHeight * 0.85)));
+      target.dispatchEvent(new Event("scroll", { bubbles: true }));
+      return target.scrollTop !== before;
+    });
+    try {
+      await page.mouse.wheel(0, -900);
+    } catch {
+      // Some environments do not allow wheel injection; direct scroll was already attempted.
+    }
+    await page.waitForTimeout(1200);
+    await remember();
+    const afterCount = mergeTeamsMessages(observed).length;
+    stableRounds = moved || afterCount > beforeCount ? 0 : stableRounds + 1;
+    if (stableRounds >= 3) break;
+  }
+
+  try {
+    await page.mouse.wheel(0, 2400);
+  } catch {
+    // Returning near the latest messages is best-effort only.
+  }
+  await page.waitForTimeout(800);
+  await remember();
+  return mergeTeamsMessages(observed).slice(-240);
+}
+
+async function extractTeamsFromPage(page, url, adapter, observedMessages = []) {
+  const visible = await readVisibleTeamsMessages(page);
+  const data = {
+    title: visible.title,
+    messages: mergeTeamsMessages([...(observedMessages || []), ...(visible.messages || [])]).slice(-240)
+  };
+
+  const comments = data.messages.map((message) => ({
+    id: message.id,
+    author: message.author,
+    createdAt: message.createdAt,
+    body: message.body,
+    url
+  }));
+  const sourceUpdatedAt = comments.map((comment) => comment.createdAt).filter(Boolean).at(-1) || "";
 
   return {
     title: data.title || "Microsoft Teams conversation",
-    text: lines.join("\n"),
+    text: renderTeamsTextFromComments(data.title || "Microsoft Teams conversation", url, adapter, comments),
     comments,
     sourceUpdatedAt
   };
@@ -4535,8 +4996,15 @@ function extractGithubIssuePage(html, url, adapter) {
   const author = githubActorName(issue.author);
   const labels = extractGithubLabels(issue);
   const assignees = extractGithubAssignees(issue);
-  const comments = extractGithubComments(issue);
+  const embeddedComments = extractGithubComments(issue);
+  const htmlComments = extractGithubHtmlComments(html, url);
+  const comments = htmlComments.length > embeddedComments.length ? htmlComments : embeddedComments;
   const events = extractGithubTimelineEvents(issue);
+  const sourceUpdatedAt = latestTimestampValue([
+    issue.updatedAt,
+    ...comments.map((comment) => comment.createdAt),
+    ...githubTimelineNodes(issue).map((node) => node.createdAt)
+  ]) || issue.updatedAt || "";
   const body = cleanText(issue.body || htmlToText(issue.bodyHTML || "")) || "_No description captured._";
   const title = `${repository ? `${repository}#` : "#"}${number} ${titleText}`.trim();
   const fields = [
@@ -4584,7 +5052,7 @@ function extractGithubIssuePage(html, url, adapter) {
     title,
     text: lines.join("\n"),
     comments,
-    sourceUpdatedAt: issue.updatedAt || ""
+    sourceUpdatedAt
   };
 }
 
@@ -4748,11 +5216,44 @@ function githubTimelineEventText(node) {
 
 function extractGithubHtmlComments(html, baseUrl) {
   const comments = [];
+  const seen = new Set();
+  const idMatches = [...String(html || "").matchAll(/\bid=["']issuecomment-(\d+)["']/gi)];
+  for (let index = 0; index < idMatches.length; index += 1) {
+    const match = idMatches[index];
+    const id = cleanText(match[1] || "");
+    if (!id || seen.has(id)) continue;
+    const start = Math.max(0, match.index || 0);
+    const end = idMatches[index + 1]?.index || html.length;
+    const block = html.slice(start, end);
+    const author = cleanInlineText(
+      block.match(/data-testid=["']avatar-link["'][^>]*>([\s\S]*?)<\/a>/i)?.[1]
+      || block.match(/<a\b[^>]*class=["'][^"']*(?:author|Link--primary)[^"']*["'][^>]*>([\s\S]*?)<\/a>/i)?.[1]
+      || ""
+    );
+    const createdAt = decodeHtml(block.match(/<relative-time\b[^>]*datetime=["']([^"']+)["']/i)?.[1] || block.match(/<time\b[^>]*datetime=["']([^"']+)["']/i)?.[1] || "");
+    const bodyHtml = block.match(/<div\b[^>]*data-testid=["']markdown-body["'][^>]*>([\s\S]*?)(?:<\/div>\s*<\/div>\s*<div\b[^>]*role=["']toolbar["']|<\/div>\s*<\/div>\s*<\/div>\s*<\/div>)/i)?.[1]
+      || block.match(/<td\b[^>]*class=["'][^"']*comment-body[^"']*["'][^>]*>([\s\S]*?)<\/td>/i)?.[1]
+      || block.match(/<div\b[^>]*class=["'][^"']*markdown-body[^"']*["'][^>]*>([\s\S]*?)<\/div>/i)?.[1]
+      || "";
+    const comment = {
+      id,
+      author,
+      createdAt,
+      body: htmlToText(bodyHtml),
+      url: resolveHref(`#issuecomment-${id}`, baseUrl)
+    };
+    if (comment.body || comment.author) {
+      seen.add(id);
+      comments.push(comment);
+    }
+  }
+
   const pattern = /<div\b[^>]*(?:id=["']issuecomment-(\d+)["']|class=["'][^"']*js-comment-container[^"']*["'])[^>]*>([\s\S]*?)(?=<div\b[^>]*(?:id=["']issuecomment-\d+["']|class=["'][^"']*js-comment-container)|<\/div>\s*<\/div>\s*<\/div>\s*<\/div>)/gi;
   let match;
   while ((match = pattern.exec(html))) {
     const block = match[0] || "";
     const id = match[1] || cleanText(block.match(/\bid=["']issuecomment-(\d+)["']/i)?.[1] || "");
+    if (id && seen.has(id)) continue;
     const author = cleanInlineText(block.match(/<a\b[^>]*class=["'][^"']*(?:author|Link--primary)[^"']*["'][^>]*>([\s\S]*?)<\/a>/i)?.[1] || "");
     const createdAt = decodeHtml(block.match(/<relative-time\b[^>]*datetime=["']([^"']+)["']/i)?.[1] || block.match(/<time\b[^>]*datetime=["']([^"']+)["']/i)?.[1] || "");
     const bodyHtml = block.match(/<td\b[^>]*class=["'][^"']*comment-body[^"']*["'][^>]*>([\s\S]*?)<\/td>/i)?.[1]
@@ -4765,7 +5266,10 @@ function extractGithubHtmlComments(html, baseUrl) {
       body: htmlToText(bodyHtml),
       url: id ? resolveHref(`#issuecomment-${id}`, baseUrl) : ""
     };
-    if (comment.body || comment.author) comments.push(comment);
+    if (comment.body || comment.author) {
+      if (id) seen.add(id);
+      comments.push(comment);
+    }
   }
   return comments;
 }
@@ -5102,6 +5606,30 @@ function normalizeUrlForMatch(url) {
     return parsed.toString();
   } catch {
     return cleanText(canonical);
+  }
+}
+
+function isInvalidTeamsRootRefreshJob(job) {
+  return isInvalidTeamsRootUrl(job?.url || "");
+}
+
+function isInvalidTeamsRootCapture(metadata) {
+  return metadata?.sourceType === "teams" && isInvalidTeamsRootUrl(metadata.url || "");
+}
+
+function isInvalidTeamsRootUrl(url) {
+  const value = cleanText(url);
+  if (!value) return false;
+  const adapter = detectSourceAdapter(value);
+  if (adapter.sourceType !== "teams") return false;
+  if (extractTeamsDeepPath(value)) return false;
+  try {
+    const parsed = new URL(value);
+    const hostname = parsed.hostname.toLowerCase();
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    return (hostname === "teams.cloud.microsoft" || hostname === "teams.microsoft.com") && !pathname;
+  } catch {
+    return false;
   }
 }
 
@@ -5986,10 +6514,12 @@ function normalizeRefreshJob(input, previous = {}) {
 }
 
 function publicRefreshJobs() {
-  return (settings.refreshJobs || []).map((job) => ({
-    ...job,
-    running: refreshRuntime.running.has(job.id)
-  }));
+  return (settings.refreshJobs || [])
+    .filter((job) => !isInvalidTeamsRootRefreshJob(job))
+    .map((job) => ({
+      ...job,
+      running: refreshRuntime.running.has(job.id)
+    }));
 }
 
 function defaultSourceProfile(hostname, sourceType) {

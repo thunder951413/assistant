@@ -48,7 +48,7 @@ node scripts/service.js --status
 打开：
 
 ```text
-http://localhost:5173
+http://localhost:8020
 ```
 
 ## 资料库
@@ -80,7 +80,7 @@ AI 对话也会调用同一个 OpenAI 兼容接口。调用前，后端会先检
 检索本地知识库：
 
 ```bash
-curl -X POST http://127.0.0.1:5173/api/knowledge-search \
+curl -X POST http://127.0.0.1:8020/api/knowledge-search \
   -H 'Content-Type: application/json' \
   --data '{"query":"Jira 导入页面","limit":5}'
 ```
@@ -88,7 +88,7 @@ curl -X POST http://127.0.0.1:5173/api/knowledge-search \
 基于本地知识库问答：
 
 ```bash
-curl -X POST http://127.0.0.1:5173/api/chat \
+curl -X POST http://127.0.0.1:8020/api/chat \
   -H 'Content-Type: application/json' \
   --data '{"message":"Jira 导入页面现在有什么资料？"}'
 ```

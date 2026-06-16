@@ -2465,7 +2465,10 @@ function renderRefreshJobs(jobs) {
         </label>
         <div class="refresh-job-actions">
           <button type="button" data-run-job="${escapeHtml(job.id)}">${job.running ? "运行中" : "立即刷新"}</button>
-          ${isManagedContentPageJob(job) ? "" : `<button type="button" class="danger-button" data-delete-job="${escapeHtml(job.id)}">删除</button>`}
+          ${isManagedContentPageJob(job) ? "" : `
+            <button type="button" class="danger-button" data-clear-job-items="${escapeHtml(job.id)}">清空内容</button>
+            <button type="button" class="danger-button" data-delete-job="${escapeHtml(job.id)}">删除</button>
+          `}
         </div>
       </div>
       <label>
@@ -2498,6 +2501,9 @@ function renderRefreshJobs(jobs) {
 
   refreshJobs.querySelectorAll("[data-run-job]").forEach((button) => {
     button.addEventListener("click", () => runRefreshJob(button.dataset.runJob));
+  });
+  refreshJobs.querySelectorAll("[data-clear-job-items]").forEach((button) => {
+    button.addEventListener("click", () => clearRefreshJobItems(button.dataset.clearJobItems));
   });
   refreshJobs.querySelectorAll("[data-delete-job]").forEach((button) => {
     button.addEventListener("click", () => deleteRefreshJob(button.dataset.deleteJob));
@@ -2717,11 +2723,13 @@ async function runRefreshJob(id) {
     const { result, jobs } = await api(`/api/refresh-jobs/${encodeURIComponent(id)}/run`, { method: "POST" });
     renderRefreshJobs(jobs || []);
     const updated = Number(result.updatedItemCount ?? result.updatedIssueCount ?? 0);
-    refreshJobStatus.textContent = `刷新完成：更新 ${updated} / ${result.linkCount ?? result.issueCount ?? 0} 个内容页，跳过 ${result.skippedItemCount || 0} 个，失败 ${result.errorCount} 个。`;
+    const newCount = Number(result.newItemCount || 0);
+    const aiFailed = Number(result.aiProcessErrorCount || 0);
+    refreshJobStatus.textContent = `刷新完成：更新 ${updated} / ${result.linkCount ?? result.issueCount ?? 0} 个内容页，AI 已整理 ${newCount} 个，AI 失败 ${aiFailed} 个，跳过 ${result.skippedItemCount || 0} 个，失败 ${result.errorCount} 个。`;
     if (state.view === "materials") {
       await loadAll();
     }
-    scheduleReloadAfterRefreshUpdates(updated);
+    scheduleReloadAfterRefreshUpdates(newCount);
   } catch (error) {
     refreshJobStatus.textContent = error.message;
     await loadSettings();
@@ -2753,14 +2761,16 @@ async function runAllRefreshJobs() {
     });
     renderRefreshJobs(jobs || []);
     updated = Number(result.updatedItemCount ?? result.updatedIssueCount ?? 0);
+    const newCount = Number(result.newItemCount || 0);
+    const aiFailed = Number(result.aiProcessErrorCount || 0);
     total = Number(result.linkCount ?? result.issueCount ?? 0);
     skipped = Number(result.skippedItemCount || 0);
     failed = Number(result.errorCount || 0);
-    refreshJobStatus.textContent = `全部刷新完成：更新 ${updated} / ${total} 个内容页，跳过 ${skipped} 个，失败 ${failed} 个。`;
+    refreshJobStatus.textContent = `全部刷新完成：更新 ${updated} / ${total} 个内容页，AI 已整理 ${newCount} 个，AI 失败 ${aiFailed} 个，跳过 ${skipped} 个，失败 ${failed} 个。`;
     if (state.view === "materials") {
       await loadAll();
     }
-    scheduleReloadAfterRefreshUpdates(updated);
+    scheduleReloadAfterRefreshUpdates(newCount);
   } catch (error) {
     refreshJobStatus.textContent = error.message;
     await loadSettings();
@@ -2773,7 +2783,7 @@ async function runAllRefreshJobs() {
 function scheduleReloadAfterRefreshUpdates(updatedCount) {
   if (!updatedCount) return;
   clearTimeout(state.refreshReloadTimer);
-  refreshJobStatus.textContent = `${refreshJobStatus.textContent} 页面将在 1.2 秒后刷新以显示 NEW 状态。`;
+  refreshJobStatus.textContent = `${refreshJobStatus.textContent} AI 整理已完成，页面将在 1.2 秒后刷新以显示 NEW 状态。`;
   state.refreshReloadTimer = setTimeout(() => {
     window.location.reload();
   }, 1200);
@@ -2820,6 +2830,9 @@ function latestUpdatedRefreshRun(jobs) {
 }
 
 function refreshResultUpdatedCount(result) {
+  if (Object.prototype.hasOwnProperty.call(result || {}, "newItemCount")) {
+    return Number(result?.newItemCount || 0);
+  }
   return Number(result?.updatedItemCount ?? result?.updatedIssueCount ?? 0);
 }
 
@@ -2843,6 +2856,27 @@ async function deleteRefreshJob(id) {
     const { jobs } = await api(`/api/refresh-jobs/${encodeURIComponent(id)}`, { method: "DELETE" });
     renderRefreshJobs(jobs || []);
     refreshJobStatus.textContent = "自动刷新任务已删除。";
+  } catch (error) {
+    refreshJobStatus.textContent = error.message;
+    await loadSettings();
+  }
+}
+
+async function clearRefreshJobItems(id) {
+  syncRefreshJobsFromDom();
+  const section = refreshJobs.querySelector(`.refresh-job[data-id="${CSS.escape(id)}"]`);
+  const name = section?.querySelector("strong")?.textContent || id;
+  const ok = confirm(`清空订阅“${name}”已经抓取的内容？订阅设置会保留，下次刷新会重新抓取。`);
+  if (!ok) return;
+
+  refreshJobStatus.textContent = "正在清空订阅抓取内容...";
+  try {
+    const { result, jobs } = await api(`/api/refresh-jobs/${encodeURIComponent(id)}/items`, { method: "DELETE" });
+    renderRefreshJobs(jobs || []);
+    refreshJobStatus.textContent = `已清空 ${result.deletedItemCount || 0} 条订阅抓取内容。`;
+    if (state.view === "materials") {
+      await loadAll();
+    }
   } catch (error) {
     refreshJobStatus.textContent = error.message;
     await loadSettings();

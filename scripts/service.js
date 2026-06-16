@@ -10,7 +10,7 @@ const rootDir = path.resolve(__dirname, "..");
 const runtimeDir = path.join(rootDir, ".config", "runtime");
 const pidPath = path.join(runtimeDir, "assistant.pid");
 const logPath = path.join(runtimeDir, "assistant.log");
-const port = Number(process.env.PORT || 5173);
+const port = Number(process.env.PORT || 8020);
 const command = process.argv[2] || "--status";
 
 function ensureRuntimeDir() {
