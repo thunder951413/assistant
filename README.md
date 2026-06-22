@@ -1,21 +1,66 @@
 # 资料整理助手
 
-这是一个本地资料整理助手的 MVP。它把资料保存成目录、Markdown、JSON 和 JSONL，并通过后端 API 读取本地知识库、检索相关资料、执行 AI 问答。
+资料整理助手是一个本地运行的知识库整理与问答工具。它可以导入文本、网页、Jira、Confluence、GitHub 等资料，把内容保存为目录、Markdown、JSON 和 JSONL，并通过本地检索与 OpenAI 兼容接口完成总结、标签推荐、批量整理和资料库问答。
 
-## 当前能力
+项目当前定位为 MVP：优先保证资料可被直接读取、迁移和备份，前端与后端都运行在本机。
 
-- 新增资料独立页面：支持拖入文本文件、粘贴文本、粘贴页面内容或输入 URL。
-- 新增资料会先解析预览，重点提取正文内容，用户确认标题、正文和标签后再导入。
-- URL 资料可以尝试抓取网页并过滤为可读正文。
-- 解析后可以生成 AI 总结；未配置 AI 接口时会使用本地提取式摘要兜底。
-- 有 URL 也可以选择使用粘贴内容，适合需要登录的 Jira 或内部页面。
-- 手动标签保存、编辑、按标签浏览。
-- 本地搜索。
-- 默认进入 AI 对话主界面：后端会读取本地 `knowledge-base/`，检索相关资料，再调用配置的 AI 接口回答。
-- 提供 `/api/knowledge-search`，可通过 API 直接检索本地知识库。
-- 资料整理作为独立视图，切换后显示来源、标签、搜索、列表和详情。
-- 保存原始内容和历史快照。
-- 设置页支持配置 OpenAI 兼容接口、模型和资料保存路径。
+## 功能特性
+
+- 本地 Web 应用，默认监听 `127.0.0.1:8020`。
+- AI 对话：后端先检索本地知识库，再把匹配片段交给模型回答。
+- 资料导入：支持粘贴文本、拖入文本文件、输入 URL、粘贴网页内容。
+- 网页抓取：支持普通网页、Jira、Confluence、GitHub、Teams 等来源类型。
+- Webdriver 抓取：可用 Playwright Chromium 登录需要认证的页面，并复用登录态抓取。
+- 资料预览：导入前可确认标题、正文、标签和 AI 总结。
+- 资料管理：按来源、标签、关键词浏览，支持详情查看、标题编辑、标签编辑、删除。
+- AI 整理：支持生成标题、正文整理、标签推荐、列表分类和批量处理。
+- 订阅刷新：可为列表页或内容页创建刷新任务，并保存历史快照。
+- 补充资料：维护额外上下文，并可让 AI 分析候选补充项。
+- 导入导出：支持设置导入导出、知识库数据导入导出。
+- Embedding 配置：可启用 OpenAI 兼容 embedding 接口作为检索增强配置。
+
+## 技术栈
+
+- Node.js 18+
+- 原生 `node:http` 后端
+- 原生 HTML / CSS / JavaScript 前端
+- Playwright，用于 Webdriver 登录和页面抓取
+- Node 内置测试框架 `node:test`
+
+## 目录结构
+
+```text
+.
+├── src/
+│   ├── server.js        # HTTP 服务、API、知识库读写、AI 调用、抓取与刷新逻辑
+│   └── utils.js         # 文本、URL、标签和 slug 工具函数
+├── public/
+│   ├── index.html       # 前端页面
+│   ├── app.js           # 前端交互逻辑
+│   └── styles.css       # 页面样式
+├── scripts/
+│   └── service.js       # 后台服务启停脚本
+├── test/
+│   └── utils.test.js    # 工具函数测试
+├── docs/
+│   └── mvp-plan.md      # MVP 设计记录
+├── knowledge-base/      # 默认知识库目录
+├── .config/             # 本地设置、运行日志、Webdriver session
+├── package.json
+└── README.md
+```
+
+## 安装
+
+```bash
+npm install
+```
+
+如果使用 Webdriver 抓取，首次安装后可能需要安装 Playwright 浏览器：
+
+```bash
+npx playwright install chromium
+```
 
 ## 启动
 
@@ -25,7 +70,21 @@
 npm start
 ```
 
-后台启动和控制：
+打开浏览器访问：
+
+```text
+http://localhost:8020
+```
+
+可以通过 `PORT` 指定端口：
+
+```bash
+PORT=8030 npm start
+```
+
+## 后台服务
+
+后台启动、停止、重启和查看状态：
 
 ```bash
 npm run service:start
@@ -34,7 +93,7 @@ npm run service:restart
 npm run service:status
 ```
 
-也可以直接使用脚本参数：
+也可以直接调用脚本：
 
 ```bash
 node scripts/service.js --start
@@ -43,41 +102,120 @@ node scripts/service.js --restart
 node scripts/service.js --status
 ```
 
-后台日志保存在 `.config/runtime/assistant.log`。
-
-打开：
+后台运行文件：
 
 ```text
-http://localhost:8020
+.config/runtime/assistant.pid
+.config/runtime/assistant.log
 ```
 
-## 资料库
+## 配置
 
-资料保存在：
+首次启动会生成本地配置：
+
+```text
+.config/settings.json
+```
+
+也可以在页面的“设置”里维护这些配置：
+
+- AI：OpenAI 兼容 `Base URL`、`API Key`、`Model`。
+- 抓取：页面来源认证、Cookie、Bearer Token、Basic Auth、Webdriver 登录入口。
+- 标签：新增、选择、删除标签。
+- 存储：知识库保存路径、设置导入导出、数据导入导出。
+- 提醒：资料更新提醒来源、刷新时间窗口。
+- Embedding：OpenAI 兼容 embedding 接口、模型和维度。
+
+AI 接口会调用：
+
+```text
+<baseUrl>/chat/completions
+```
+
+如果没有配置 AI 接口，应用仍可导入资料，并在问答或总结场景返回本地检索结果或本地提取式摘要。
+
+## 知识库存储
+
+默认资料库路径：
 
 ```text
 knowledge-base/
 ```
 
-程序会直接读取 `knowledge-base/items/*/document.md`、`metadata.json` 和 `comments.jsonl` 做检索与问答。`knowledge-base/AGENTS.md` 仍保留给 opencode 等 agent 使用。
+可以在设置页修改为其他本地目录。资料会按以下协议保存：
 
-## 设置
+```text
+knowledge-base/
+├── AGENTS.md
+├── supplemental-context.md
+├── supplemental-context.json
+├── items/
+│   └── <item-id>/
+│       ├── document.md
+│       ├── metadata.json
+│       ├── comments.jsonl
+│       ├── raw.html 或 raw.txt
+│       └── snapshots/
+├── tags/
+│   └── <tag>.json
+└── indexes/
+    ├── by-tag.json
+    ├── by-source.json
+    └── by-updated.json
+```
 
-设置页目前支持：
+核心文件说明：
 
-- OpenAI 兼容接口 Base URL，例如 `https://api.openai.com/v1`
-- API Key
-- Model
-- 文档保存路径
-- 页面来源认证配置
+- `document.md`：可读正文，包含元信息、整理内容和总结。
+- `metadata.json`：标题、来源、URL、标签、刷新任务、更新时间等结构化信息。
+- `comments.jsonl`：评论、时间线或讨论内容。
+- `raw.html` / `raw.txt`：原始抓取或导入内容。
+- `snapshots/`：刷新前的历史快照。
+- `supplemental-context.md` / `.json`：问答时额外注入的补充上下文。
 
-AI 总结会调用配置的 `Base URL + /chat/completions`。如果没有配置接口，应用会先使用本地提取式摘要。
+## 使用流程
 
-AI 对话也会调用同一个 OpenAI 兼容接口。调用前，后端会先检索本地知识库，只把匹配到的资料片段、来源 URL、文件路径和更新时间交给模型；如果没有配置接口，则返回本地检索结果。
+1. 启动服务并打开 `http://localhost:8020`。
+2. 在“设置”里配置 AI 接口和资料保存路径。
+3. 在“新增资料”里粘贴文本、拖入文件或输入 URL。
+4. 点击解析预览，确认标题、正文、标签和总结。
+5. 点击确认导入，资料会写入知识库目录。
+6. 在“资料整理”里搜索、筛选、编辑标签或批量处理。
+7. 在“AI 对话”里基于本地资料库提问。
 
-## 知识库 API
+## Webdriver 登录抓取
 
-检索本地知识库：
+对于需要登录、SSO 或动态渲染的页面，可以使用 Webdriver 抓取：
+
+1. 进入“设置”。
+2. 在“抓取”里点击对应站点的 Webdriver 登录入口。
+3. 在弹出的 Chromium 窗口中手动登录。
+4. 登录态会保存到 `.config/webdriver/<hostname>/`。
+5. 回到“新增资料”，抓取方式选择“Webdriver 抓取”。
+6. 输入过滤页或内容页 URL，点击解析预览。
+
+默认内置来源包括：
+
+- `confluence.amlogic.com`
+- `jira.amlogic.com`
+- `roku.atlassian.net`
+- `github.ecodesamsung.com`
+- `teams.microsoft.com`
+
+## 订阅刷新
+
+导入 URL 资料后，系统会为列表页或内容页创建刷新任务。可以在“订阅管理”里：
+
+- 查看刷新任务。
+- 手动刷新单个任务。
+- 批量刷新所有或指定来源任务。
+- 删除任务或删除任务导入的资料。
+
+刷新时会保存原资料快照，并根据来源更新时间判断是否出现新内容。
+
+## API 示例
+
+检索知识库：
 
 ```bash
 curl -X POST http://127.0.0.1:8020/api/knowledge-search \
@@ -85,7 +223,7 @@ curl -X POST http://127.0.0.1:8020/api/knowledge-search \
   --data '{"query":"Jira 导入页面","limit":5}'
 ```
 
-基于本地知识库问答：
+基于知识库问答：
 
 ```bash
 curl -X POST http://127.0.0.1:8020/api/chat \
@@ -93,53 +231,86 @@ curl -X POST http://127.0.0.1:8020/api/chat \
   --data '{"message":"Jira 导入页面现在有什么资料？"}'
 ```
 
-`/api/chat` 不依赖 agent 自主读文件。它由后端先读取 `knowledge-base/items/*`，检索相关资料，再把受控上下文交给 AI 接口。
+流式问答：
 
-## 页面抓取
-
-当前内置识别这些来源：
-
-- `confluence.amlogic.com`
-- `jira.amlogic.com`
-- `roku.atlassian.net`
-- `github.ecodesamsung.com`
-
-新增资料页支持两种页面类型：
-
-- 过滤页/列表页：提取页面中的内容页链接，例如 Jira issue、GitHub issue/PR、Confluence 页面。
-- 内容页：提取页面正文，后续可总结并导入知识库。
-
-设置页的“页面来源认证”支持：
-
-- 无认证
-- Cookie：从已登录浏览器请求里复制 Cookie 请求头
-- 用户名密码 / Basic：适用于服务端支持 Basic Auth 的页面
-- Bearer Token：适用于 GitHub Enterprise 或其他 token 认证入口
-
-账号密码表单登录、SSO、动态加载和无限滚动页面后续会接 webdriver adapter。
-
-### Webdriver 登录
-
-设置页提供“Webdriver 登录”入口。使用方式：
-
-1. 点击对应站点，例如“打开 Amlogic Jira”。
-2. 在弹出的 Chromium 窗口里手动登录。
-3. 登录态会保存到 `.config/webdriver/<hostname>/`。
-4. 回到新增资料页，抓取方式选择“Webdriver 抓取”。
-5. 输入过滤页或内容页 URL，点击“解析预览”。
-
-例如 Jira filter：
-
-```text
-https://jira.amlogic.com/issues/?filter=50724
+```bash
+curl -N -X POST http://127.0.0.1:8020/api/chat-stream \
+  -H 'Content-Type: application/json' \
+  --data '{"message":"最近有哪些资料更新？"}'
 ```
 
-如果已经在 webdriver 窗口登录，程序会复用该 session 抓取页面，再按 Jira filter 规则提取 issue 列表。
+预览来源：
 
-## 下一步
+```bash
+curl -X POST http://127.0.0.1:8020/api/preview-source \
+  -H 'Content-Type: application/json' \
+  --data '{"url":"https://example.com","sourceType":"web","fetchMode":"auto"}'
+```
 
-- Jira webdriver adapter。
-- GitHub issue / PR adapter。
-- 评论结构化提取。
-- 定期刷新任务。
-- AI 自动摘要和自动标签。
+导出数据：
+
+```bash
+curl -o assistant-data.json http://127.0.0.1:8020/api/export/data
+```
+
+常用接口：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/items` | 查询资料列表 |
+| `POST` | `/api/items` | 创建资料 |
+| `GET` | `/api/items/:id` | 查看资料详情 |
+| `DELETE` | `/api/items/:id` | 删除资料 |
+| `PATCH` | `/api/items/:id/title` | 修改标题 |
+| `PATCH` | `/api/items/:id/tags` | 修改标签 |
+| `POST` | `/api/items/:id/refresh` | 刷新 URL 资料 |
+| `POST` | `/api/items/:id/process` | AI 整理资料 |
+| `POST` | `/api/items/:id/recommend-title` | AI 推荐标题 |
+| `POST` | `/api/items/:id/recommend-tags` | AI 推荐标签 |
+| `GET` | `/api/tags` | 查询标签 |
+| `POST` | `/api/tags` | 新增标签 |
+| `PATCH` | `/api/tags` | 重命名标签 |
+| `DELETE` | `/api/tags` | 删除标签 |
+| `POST` | `/api/search` | 本地搜索 |
+| `POST` | `/api/knowledge-search` | 知识库检索 |
+| `POST` | `/api/chat` | 知识库问答 |
+| `POST` | `/api/chat-stream` | 流式知识库问答 |
+| `GET` | `/api/settings` | 获取公开设置 |
+| `PATCH` | `/api/settings` | 保存设置 |
+| `GET` | `/api/export/settings` | 导出设置 |
+| `POST` | `/api/import/settings` | 导入设置 |
+| `GET` | `/api/export/data` | 导出知识库数据 |
+| `POST` | `/api/import/data` | 导入知识库数据 |
+| `GET` | `/api/refresh-jobs` | 查询刷新任务 |
+| `POST` | `/api/refresh-jobs/:id/run` | 运行单个刷新任务 |
+| `POST` | `/api/refresh-jobs/run-batch` | 批量运行刷新任务 |
+| `GET` | `/api/supplemental-context` | 获取补充上下文 |
+| `PATCH` | `/api/supplemental-context` | 保存补充上下文 |
+| `POST` | `/api/supplemental-context/suggest` | AI 建议补充上下文 |
+| `GET` | `/api/webdriver/status` | 查看 Webdriver session |
+| `POST` | `/api/webdriver/open` | 打开 Webdriver 登录窗口 |
+| `POST` | `/api/webdriver/fetch` | 使用 Webdriver 抓取页面 |
+
+## 开发与检查
+
+语法检查：
+
+```bash
+npm run check
+```
+
+运行测试：
+
+```bash
+npm test
+```
+
+当前测试覆盖 `src/utils.js` 中的文本清理、URL 解析、标签规范化和 slug 生成。
+
+## 注意事项
+
+- 本项目面向本地使用，默认只监听 `127.0.0.1`。
+- `.config/settings.json` 可能包含 API Key、Cookie 或 Token，不要提交到公共仓库。
+- `knowledge-base/` 是默认数据目录，迁移前建议使用页面内“导出数据”功能备份。
+- Webdriver 登录态保存在 `.config/webdriver/`，如果登录状态异常，可以删除对应 hostname 目录后重新登录。
+- 页面抓取对站点 HTML 结构有依赖，遇到复杂动态页面时优先使用 Webdriver 抓取。
