@@ -1075,7 +1075,7 @@ function renderDetail(item) {
       </div>
       <div class="detail-meta-block">
         <div class="item-meta">${escapeHtml(metadata.sourceType)} · ${escapeHtml(metadata.url || "local input")}</div>
-        ${metadata.processedAt ? `<div class="item-meta">AI 整理：${escapeHtml(formatDate(metadata.processedAt))} · ${escapeHtml(metadata.processedModel || "")}</div>` : ""}
+        ${metadata.processedAt ? `<div class="item-meta">AI 整理：${escapeHtml(formatDate(metadata.processedAt))}</div>` : ""}
       </div>
     </div>
     <div class="item-meta">标签：${escapeHtml((metadata.tags || []).join(", ") || "no tags")}</div>
