@@ -580,7 +580,7 @@ async function previewSource(input) {
 
   if (canonicalDetectedUrl && shouldFetchForPreview(input, pasted)) {
     try {
-      const fetched = input.fetchMode === "webdriver" || sourceType === "teams"
+      const fetched = shouldFetchWithWebdriver(canonicalDetectedUrl, input.fetchMode, requestedPageKind)
         ? await fetchUrlWithWebdriver(canonicalDetectedUrl, { pageKind: requestedPageKind })
         : await fetchUrl(canonicalDetectedUrl, { pageKind: requestedPageKind });
       title = title || fetched.title || canonicalDetectedUrl;
@@ -809,7 +809,7 @@ async function refreshItemWithContext(id, refreshContext = null) {
 }
 
 async function fetchForMetadata(metadata, refreshContext = null) {
-  if (metadata.fetchMode === "webdriver" || metadata.sourceType === "jira" || metadata.sourceType === "teams") {
+  if (shouldFetchWithWebdriver(metadata.url, metadata.fetchMode, metadata.pageKind || "auto", metadata.sourceType)) {
     return fetchUrlWithWebdriver(metadata.url, {
       pageKind: metadata.pageKind || "auto",
       session: refreshContext?.webdriverSession,
@@ -1271,8 +1271,26 @@ function defaultRefreshTagsForListUrl(url, adapter) {
 }
 
 function defaultRefreshFetchModeForAdapter(adapter, requestedMode) {
+  if (requiresWebdriverExpansion(adapter)) return "webdriver";
   if (requestedMode === "fetch" || requestedMode === "webdriver") return requestedMode;
-  return adapter.sourceType === "jira" || adapter.sourceType === "teams" ? "webdriver" : "fetch";
+  return adapterPrefersWebdriver(adapter) ? "webdriver" : "fetch";
+}
+
+function shouldFetchWithWebdriver(url, requestedMode, pageKind = "auto", sourceType = "") {
+  const adapter = detectSourceAdapter(url || "");
+  if (requiresWebdriverExpansion(adapter)) return true;
+  if (requestedMode === "webdriver") return true;
+  if (requestedMode === "fetch") return false;
+  if (sourceType === "jira" || sourceType === "teams") return true;
+  return adapterPrefersWebdriver(adapter);
+}
+
+function adapterPrefersWebdriver(adapter) {
+  return adapter.sourceType === "jira" || adapter.sourceType === "teams";
+}
+
+function requiresWebdriverExpansion(adapter) {
+  return adapter.sourceType === "github" && adapter.hostname === "github.ecodesamsung.com";
 }
 
 async function importLinkedItemsFromList(input) {
@@ -1281,7 +1299,9 @@ async function importLinkedItemsFromList(input) {
     .slice(0, Math.max(1, Number(input.maxItems) || 50));
   const imported = [];
   const errors = [];
-  const fetchMode = input.fetchMode === "webdriver" ? "webdriver" : input.fetchMode === "fetch" ? "fetch" : resolvedRefreshFetchMode({}, adapter);
+  const fetchMode = requiresWebdriverExpansion(adapter)
+    ? "webdriver"
+    : input.fetchMode === "webdriver" ? "webdriver" : input.fetchMode === "fetch" ? "fetch" : resolvedRefreshFetchMode({}, adapter);
 
   for (const link of links) {
     const contentUrl = normalizeContentFetchUrl(link.href, adapter);
@@ -3784,6 +3804,7 @@ async function fetchForRefreshJob(url, job, adapter = detectSourceAdapter(url), 
 }
 
 function resolvedRefreshFetchMode(job, adapter) {
+  if (requiresWebdriverExpansion(adapter)) return "webdriver";
   if (
     adapter.sourceType === "github"
     && resolvePageKind(job.url || "", job.pageKind || "auto") === "content"
@@ -3793,7 +3814,7 @@ function resolvedRefreshFetchMode(job, adapter) {
   }
   if (job.fetchMode === "fetch") return "fetch";
   if (job.fetchMode === "webdriver") return "webdriver";
-  return adapter.sourceType === "jira" || adapter.sourceType === "teams" ? "webdriver" : "fetch";
+  return adapterPrefersWebdriver(adapter) ? "webdriver" : "fetch";
 }
 
 async function updateRefreshJobState(id, patch) {
@@ -3915,7 +3936,7 @@ async function fetchUrlWithWebdriver(url, options = {}) {
     const navigationUrl = adapter.sourceType === "teams" ? normalizeTeamsNavigationUrl(url) : url;
     await page.goto(navigationUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await waitForJiraIssueNavigator(page, adapter, options.pageKind || "auto");
-    await waitForGithubIssueTimeline(page, adapter, options.pageKind || "auto");
+    await expandGithubDynamicContent(page, adapter, options.pageKind || "auto");
     if (adapter.sourceType === "teams") {
       return await fetchTeamsWithWebdriver(page, url, adapter);
     }
@@ -4273,14 +4294,19 @@ async function waitForJiraIssueNavigator(page, adapter, pageKind) {
   }
 }
 
-async function waitForGithubIssueTimeline(page, adapter, pageKind) {
+async function expandGithubDynamicContent(page, adapter, pageKind) {
   if (adapter.sourceType !== "github") return;
-  if (pageKind === "list") return;
-  if (!/\/[^/]+\/[^/]+\/(issues|pull|discussions)\/\d+/i.test(safePathname(page.url()))) return;
+  const kind = resolvePageKind(page.url(), pageKind || "auto");
+  const shouldWaitForTimeline = kind !== "list" && /\/[^/]+\/[^/]+\/(issues|pull|discussions)\/\d+/i.test(safePathname(page.url()));
+  const shouldExpandLoadMore = adapter.hostname === "github.ecodesamsung.com" || shouldWaitForTimeline;
+  if (!shouldExpandLoadMore) return;
+
   try {
-    await page.waitForSelector("[data-target='react-app.embeddedData'], [id^='issuecomment-'], [data-testid='issue-viewer-issue-container']", {
-      timeout: 15000
-    });
+    if (shouldWaitForTimeline) {
+      await page.waitForSelector("[data-target='react-app.embeddedData'], [id^='issuecomment-'], [data-testid='issue-viewer-issue-container']", {
+        timeout: 15000
+      });
+    }
   } catch {
     // Keep current DOM; extraction will fall back to embedded data or plain HTML.
   }
@@ -4291,19 +4317,23 @@ async function waitForGithubIssueTimeline(page, adapter, pageKind) {
   }
 
   let stableCount = 0;
-  for (let index = 0; index < 10; index += 1) {
+  for (let index = 0; index < 20; index += 1) {
     const before = await page.evaluate(() => ({
       height: document.documentElement.scrollHeight,
-      y: window.scrollY
+      y: window.scrollY,
+      textLength: document.body?.innerText?.length || 0
     }));
-    await clickGithubTimelineMore(page);
+    const clicked = await clickGithubLoadMore(page);
     await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
     await page.waitForTimeout(900);
     const after = await page.evaluate(() => ({
       height: document.documentElement.scrollHeight,
-      y: window.scrollY
+      y: window.scrollY,
+      textLength: document.body?.innerText?.length || 0
     }));
-    if (after.height <= before.height && after.y === before.y) {
+    if (clicked) {
+      stableCount = 0;
+    } else if (after.height <= before.height && after.y === before.y && after.textLength <= before.textLength) {
       stableCount += 1;
       if (stableCount >= 2) break;
     } else {
@@ -4312,13 +4342,33 @@ async function waitForGithubIssueTimeline(page, adapter, pageKind) {
   }
 }
 
-async function clickGithubTimelineMore(page) {
+async function clickGithubLoadMore(page) {
   const clicked = await page.evaluate(() => {
-    const candidates = [...document.querySelectorAll("button, a")]
+    const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+    const loadMorePattern = /(?:show|load|view)\s+more|more\s+items|remaining\s+items|查看更多|加载更多/i;
+    const candidates = [...document.querySelectorAll("button, a, [role='button']")]
       .filter((el) => el instanceof HTMLElement)
-      .filter((el) => /show more|load more|more items|查看更多|加载更多/i.test(el.innerText || el.getAttribute("aria-label") || ""));
-    const target = candidates.find((el) => !el.hasAttribute("disabled"));
+      .filter((el) => {
+        const text = [
+          el.innerText,
+          el.textContent,
+          el.getAttribute("aria-label"),
+          el.getAttribute("title")
+        ].map(clean).filter(Boolean).join(" ");
+        return loadMorePattern.test(text);
+      });
+    const target = candidates.find((el) => {
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return !el.hasAttribute("disabled")
+        && el.getAttribute("aria-disabled") !== "true"
+        && style.visibility !== "hidden"
+        && style.display !== "none"
+        && rect.width > 0
+        && rect.height > 0;
+    });
     if (!target) return false;
+    target.scrollIntoView({ block: "center", inline: "center" });
     target.click();
     return true;
   });
