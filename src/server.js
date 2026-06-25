@@ -792,7 +792,7 @@ async function refreshItemWithContext(id, refreshContext = null) {
     sourceUpdatedAt: nextSourceUpdatedAt,
     contentUpdatedAt: item.metadata.contentUpdatedAt || "",
     pendingContentUpdatedAt: hasUpdate ? now : item.metadata.pendingContentUpdatedAt || "",
-    processedStale: hasUpdate && item.metadata.processedAt ? true : item.metadata.processedStale || false,
+    processedStale: hasUpdate && item.metadata.processedAt ? true : false,
     refreshNote: {
       previousDocumentLength: previousLength,
       currentDocumentLength: fetched.text.length,
@@ -878,7 +878,7 @@ async function upsertFetchedItem(input) {
     sourceUpdatedAt: nextSourceUpdatedAt,
     contentUpdatedAt: item.metadata.contentUpdatedAt || "",
     pendingContentUpdatedAt: hasUpdate ? input.fetchedAt : item.metadata.pendingContentUpdatedAt || "",
-    processedStale: hasUpdate && item.metadata.processedAt ? true : item.metadata.processedStale || false,
+    processedStale: hasUpdate && item.metadata.processedAt ? true : false,
     rawFileName: item.metadata.rawFileName || "raw.html",
     pageKind: input.pageKind || item.metadata.pageKind || null,
     fetchMode: input.fetchMode || item.metadata.fetchMode || null,
@@ -1003,14 +1003,21 @@ function normalizeSourceUpdatedAt(value, referenceDate = "") {
 function latestTimestampValue(values) {
   let latestValue = "";
   let latestTime = Number.NEGATIVE_INFINITY;
+  let lastNonEmpty = "";
   for (const value of values) {
     const clean = cleanText(value || "");
+    if (!clean) continue;
+    lastNonEmpty = clean;
     const parsed = Date.parse(clean);
-    if (!clean || Number.isNaN(parsed) || parsed <= latestTime) continue;
+    if (Number.isNaN(parsed) || parsed <= latestTime) continue;
     latestValue = clean;
     latestTime = parsed;
   }
-  return latestValue;
+  // Prefer the chronologically latest parseable timestamp. When none of the
+  // values parse (e.g. Teams captured only localized/relative time strings),
+  // fall back to the last non-empty raw value so callers don't lose the
+  // field entirely — matching the previous `.at(-1)` behavior in that case.
+  return latestValue || lastNonEmpty;
 }
 
 function parseSourceUpdatedAt(value, referenceDate = "") {
@@ -3934,6 +3941,23 @@ async function fetchUrlWithWebdriver(url, options = {}) {
       : await ensureSessionPage(session);
     session.page = page;
     const navigationUrl = adapter.sourceType === "teams" ? normalizeTeamsNavigationUrl(url) : url;
+    if (adapter.sourceType === "teams") {
+      // Refresh batches reuse one page across multiple Teams conversations.
+      // Navigating between two `https://teams.microsoft.com/v2/#/l/chat/...` URLs
+      // is a same-document hash change, so the SPA switches conversations
+      // asynchronously while the previous conversation's header and messages
+      // linger in the DOM — causing titles and captured content to cross
+      // between jobs. Reset to a blank document first so the target loads as a
+      // fresh cross-document navigation, guaranteeing the header and messages
+      // belong to the requested conversation.
+      if (safeHostname(page.url()) === "teams.microsoft.com" || safeHostname(page.url()) === "teams.cloud.microsoft") {
+        try {
+          await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: 15000 });
+        } catch {
+          // Best-effort reset; the target navigation below still loads fresh.
+        }
+      }
+    }
     await page.goto(navigationUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await waitForJiraIssueNavigator(page, adapter, options.pageKind || "auto");
     await expandGithubDynamicContent(page, adapter, options.pageKind || "auto");
@@ -4317,23 +4341,35 @@ async function expandGithubDynamicContent(page, adapter, pageKind) {
   }
 
   let stableCount = 0;
-  for (let index = 0; index < 20; index += 1) {
+  for (let index = 0; index < 30; index += 1) {
     const before = await page.evaluate(() => ({
       height: document.documentElement.scrollHeight,
       y: window.scrollY,
+      comments: document.querySelectorAll("[id^='issuecomment-']").length,
       textLength: document.body?.innerText?.length || 0
     }));
     const clicked = await clickGithubLoadMore(page);
     await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+    // Wait for the lazy-loaded page to arrive. GitHub's "Load more" fires a
+    // GraphQL request; give it room, then settle on network idle.
+    try {
+      await page.waitForLoadState("networkidle", { timeout: 6000 });
+    } catch {
+      // GitHub keeps subscriptions open; fall back to a fixed settle delay.
+    }
     await page.waitForTimeout(900);
     const after = await page.evaluate(() => ({
       height: document.documentElement.scrollHeight,
       y: window.scrollY,
+      comments: document.querySelectorAll("[id^='issuecomment-']").length,
       textLength: document.body?.innerText?.length || 0
     }));
     if (clicked) {
       stableCount = 0;
-    } else if (after.height <= before.height && after.y === before.y && after.textLength <= before.textLength) {
+    } else if (after.comments <= before.comments
+      && after.height <= before.height
+      && after.y === before.y
+      && after.textLength <= before.textLength) {
       stableCount += 1;
       if (stableCount >= 2) break;
     } else {
@@ -4343,6 +4379,32 @@ async function expandGithubDynamicContent(page, adapter, pageKind) {
 }
 
 async function clickGithubLoadMore(page) {
+  // GitHub's issue/PR timeline lazily loads older items behind a button such
+  // as `data-testid="issue-timeline-load-more-load-top"` ("Load more"). A DOM
+  // `.click()` from page.evaluate does not always trigger the React handler,
+  // so prefer a real Playwright pointer click on the known testid first, then
+  // fall back to a text-based match for other "load more" controls.
+  const knownSelectors = [
+    "[data-testid='issue-timeline-load-more-load-top']",
+    "[data-testid^='issue-timeline-load-more']"
+  ];
+  for (const selector of knownSelectors) {
+    try {
+      const locator = page.locator(selector).first();
+      const visible = await locator.isVisible({ timeout: 1500 }).catch(() => false);
+      if (!visible) continue;
+      const disabled = await locator.isDisabled().catch(() => true)
+        || await locator.getAttribute("aria-disabled") === "true";
+      if (disabled) continue;
+      await locator.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+      await locator.click({ timeout: 5000 });
+      await page.waitForTimeout(1200);
+      return true;
+    } catch {
+      // Button may have disappeared or be mid-render; try the next strategy.
+    }
+  }
+
   const clicked = await page.evaluate(() => {
     const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
     const loadMorePattern = /(?:show|load|view)\s+more|more\s+items|remaining\s+items|查看更多|加载更多/i;
@@ -4375,6 +4437,7 @@ async function clickGithubLoadMore(page) {
   if (clicked) {
     await page.waitForTimeout(1200);
   }
+  return clicked;
 }
 
 async function waitForTeamsConversation(page) {
@@ -4508,7 +4571,7 @@ function mergeTeamsComments(comments) {
 }
 
 function renderTeamsTextFromComments(title, url, adapter, comments) {
-  const sourceUpdatedAt = comments.map((comment) => comment.createdAt).filter(Boolean).at(-1) || "";
+  const sourceUpdatedAt = latestTimestampValue(comments.map((comment) => comment.createdAt)) || "";
   const lines = [
     `# ${title || "Microsoft Teams conversation"}`,
     "",
@@ -4599,7 +4662,7 @@ async function extractTeamsFromPage(page, url, adapter, observedMessages = []) {
     body: message.body,
     url
   }));
-  const sourceUpdatedAt = comments.map((comment) => comment.createdAt).filter(Boolean).at(-1) || "";
+  const sourceUpdatedAt = latestTimestampValue(comments.map((comment) => comment.createdAt)) || "";
 
   return {
     title: data.title || "Microsoft Teams conversation",
