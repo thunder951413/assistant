@@ -849,6 +849,21 @@ button {
   }
 }
 
+.task-progress-track.is-indeterminate i {
+  width: 40%;
+  background: linear-gradient(90deg, #2563eb, #0ea5e9);
+  animation: task-progress-indeterminate 1.2s ease-in-out infinite;
+}
+
+@keyframes task-progress-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
+
 .task-delta-hot {
   color: #16a34a;
   font-weight: 900;

@@ -552,12 +552,17 @@ function renderHomeRefreshTasks(jobs) {
   homeRefreshTaskRows.innerHTML = summaries.map((summary) => {
     const isConfirming = state.homeSourceRefresh.confirmSource === summary.source;
     const isRunning = state.homeSourceRefresh.runningSource === summary.source;
+    const summaryRunning = !isRunning && summary.status.kind === "running";
     const runningTotal = Math.max(1, Number(state.homeSourceRefresh.total || summary.total || 0));
     const runningCompleted = Math.min(runningTotal, Number(state.homeSourceRefresh.completed || 0));
     const progress = isRunning
       ? Math.round((runningCompleted / runningTotal) * 100)
       : summary.progress;
-    const progressText = isRunning ? `${runningCompleted}/${runningTotal}` : `${summary.progress}%`;
+    const progressText = isRunning
+      ? `${runningCompleted}/${runningTotal}`
+      : summaryRunning ? "运行中" : `${summary.progress}%`;
+    const trackClass = isRunning ? "is-running" : summaryRunning ? "is-indeterminate" : "";
+    const barStyle = (isRunning || summaryRunning) ? "" : `width: ${escapeHtml(String(progress))}%`;
     const status = isRunning ? { kind: "running", label: "运行中" } : summary.status;
     return `
       <tr>
@@ -574,7 +579,7 @@ function renderHomeRefreshTasks(jobs) {
         <td>
           <div class="task-progress-cell">
             <span>${escapeHtml(progressText)}</span>
-            <div class="task-progress-track ${isRunning ? "is-running" : ""}"><i style="width: ${escapeHtml(String(progress))}%"></i></div>
+            <div class="task-progress-track ${trackClass}"><i style="${barStyle}"></i></div>
           </div>
         </td>
         <td><span class="${summary.updated > 0 ? "task-delta-hot" : ""}">${escapeHtml(`${summary.updated} / ${summary.totalResult}`)}</span></td>
@@ -770,7 +775,6 @@ function resetHomeSourceRefreshState() {
 }
 
 function homeRefreshJobProgress(job) {
-  if (job.running) return { percent: 62 };
   if (job.status === "failed" || job.status === "unreachable") return { percent: 0 };
   if (job.lastResult) {
     const total = Number(job.lastResult.linkCount ?? job.lastResult.issueCount ?? 0);
