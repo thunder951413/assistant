@@ -3853,10 +3853,24 @@ async function fetchForRefreshJob(url, job, adapter = detectSourceAdapter(url), 
       pageKind: job.pageKind || "auto",
       session: refreshContext?.webdriverSession,
       page: refreshContext?.webdriverPage,
-      maxGithubExpansionPasses: resolvePageKind(url, job.pageKind || "auto") === "content" ? 3 : 0
+      maxGithubExpansionPasses: resolvePageKind(url, job.pageKind || "auto") === "content" ? 3 : 0,
+      existingGithubComments: await readExistingGithubComments(url, adapter)
     });
   }
   return fetchUrl(url, { pageKind: job.pageKind || "auto" });
+}
+
+async function readExistingGithubComments(url, adapter = detectSourceAdapter(url)) {
+  if (adapter.sourceType !== "github") return [];
+  if (resolvePageKind(url, "auto") !== "content") return [];
+  const existing = await findItemByUrl(normalizeContentFetchUrl(url, adapter) || url);
+  if (!existing?.id) return [];
+  try {
+    const item = await readItem(existing.id);
+    return Array.isArray(item.comments) ? item.comments : [];
+  } catch {
+    return [];
+  }
 }
 
 function resolvedRefreshFetchMode(job, adapter) {
@@ -4083,7 +4097,8 @@ async function fetchUrlWithWebdriver(url, options = {}) {
     await navigateWebdriverPage(page, navigationUrl, adapter);
     await waitForJiraIssueNavigator(page, adapter, options.pageKind || "auto");
     await expandGithubDynamicContent(page, adapter, options.pageKind || "auto", {
-      maxPasses: options.maxGithubExpansionPasses
+      maxPasses: options.maxGithubExpansionPasses,
+      existingComments: options.existingGithubComments || []
     });
     if (adapter.sourceType === "teams") {
       return await fetchTeamsWithWebdriver(page, url, adapter);
@@ -4595,6 +4610,10 @@ async function expandGithubDynamicContent(page, adapter, pageKind, options = {})
     // GitHub can keep background subscriptions open.
   }
 
+  if (await currentGithubPageOverlapsExisting(page, adapter, options.existingComments || [])) {
+    return;
+  }
+
   let stableCount = 0;
   const configuredPasses = Number(options.maxPasses);
   const maxPasses = Number.isFinite(configuredPasses)
@@ -4624,6 +4643,40 @@ async function expandGithubDynamicContent(page, adapter, pageKind, options = {})
       stableCount = 0;
     }
   }
+}
+
+async function currentGithubPageOverlapsExisting(page, adapter, existingComments) {
+  if (!Array.isArray(existingComments) || !existingComments.length) return false;
+  const raw = await page.content();
+  const extracted = extractByAdapter(raw, page.url(), adapter, "content");
+  return githubCommentsOverlap(extracted.comments || [], existingComments);
+}
+
+function githubCommentsOverlap(currentComments, existingComments) {
+  const existingKeys = githubCommentKeySet(existingComments);
+  if (!existingKeys.size) return false;
+  return (currentComments || []).some((comment) => githubCommentKeys(comment).some((key) => existingKeys.has(key)));
+}
+
+function githubCommentKeySet(comments) {
+  const keys = new Set();
+  for (const comment of comments || []) {
+    for (const key of githubCommentKeys(comment)) keys.add(key);
+  }
+  return keys;
+}
+
+function githubCommentKeys(comment) {
+  const id = cleanText(comment?.id || "");
+  const url = normalizeUrlForMatch(comment?.url || "");
+  const author = cleanText(comment?.author || "").toLowerCase();
+  const createdAt = cleanText(comment?.createdAt || "");
+  const body = cleanText(comment?.body || "").slice(0, 240).toLowerCase();
+  return [
+    id ? `id:${id}` : "",
+    url ? `url:${url}` : "",
+    author && createdAt && body ? `body:${author}|${createdAt}|${body}` : ""
+  ].filter(Boolean);
 }
 
 async function githubPageGrowthSnapshot(page) {
