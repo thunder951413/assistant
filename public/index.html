@@ -3,32 +3,52 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>资料整理助手</title>
+    <title>工作助理</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <div class="app-shell">
       <aside class="sidebar">
         <div class="brand">
-          <div class="brand-mark">M</div>
+          <div class="brand-mark">W</div>
           <div>
             <div class="brand-title-row">
-              <h1>资料整理助手</h1>
+              <h1>工作助理</h1>
             </div>
             <p>本地资料库</p>
           </div>
         </div>
 
         <nav class="nav-block">
-          <button class="nav-item is-active" data-view="chat">AI 对话</button>
+          <button class="nav-item is-active" data-view="home">
+            <span class="nav-icon" aria-hidden="true">⌂</span>
+            <span>首页</span>
+          </button>
+          <button class="nav-item" data-view="chat">
+            <span class="nav-icon" aria-hidden="true">◉</span>
+            <span>AI 对话</span>
+          </button>
           <button class="nav-item" data-view="materials">
+            <span class="nav-icon" aria-hidden="true">□</span>
             <span>资料整理</span>
             <span id="materialsNewBadge" class="new-badge" hidden>NEW!</span>
           </button>
-          <button class="nav-item" data-view="import">新增资料</button>
-          <button class="nav-item" data-view="supplemental">补充资料</button>
-          <button class="nav-item" data-view="subscriptions">订阅管理</button>
-          <button class="nav-item" data-view="settings">设置</button>
+          <button class="nav-item" data-view="import">
+            <span class="nav-icon" aria-hidden="true">＋</span>
+            <span>新增资料</span>
+          </button>
+          <button class="nav-item" data-view="supplemental">
+            <span class="nav-icon" aria-hidden="true">◇</span>
+            <span>补充资料</span>
+          </button>
+          <button class="nav-item" data-view="subscriptions">
+            <span class="nav-icon" aria-hidden="true">◷</span>
+            <span>订阅管理</span>
+          </button>
+          <button class="nav-item" data-view="settings">
+            <span class="nav-icon" aria-hidden="true">⚙</span>
+            <span>设置</span>
+          </button>
         </nav>
 
         <div id="materialSidebar" class="material-sidebar" hidden>
@@ -56,7 +76,126 @@
       </aside>
 
       <main class="workspace">
-        <section id="chatView" class="chat-view">
+        <section id="homeView" class="home-view">
+          <div class="view-heading">
+            <h2>首页</h2>
+            <p>查看资料更新、订阅刷新和 AI 检索状态。</p>
+          </div>
+
+          <section class="home-overview" aria-label="首页概览">
+            <div class="overview-hero">
+              <div>
+                <span class="section-kicker">首页</span>
+                <h3>本地知识库工作台</h3>
+                <p>查看资料更新、订阅刷新和 AI 检索状态，然后直接在下方继续提问。</p>
+              </div>
+              <div class="overview-status-row">
+                <span class="status-pill is-local">本地模型</span>
+                <span class="status-pill is-search">混合检索</span>
+                <span class="status-pill is-online">联网资料</span>
+              </div>
+            </div>
+
+            <div class="overview-metrics">
+              <article class="metric-card">
+                <span>资料总数</span>
+                <strong id="homeTotalItems">--</strong>
+                <small id="homeSourceSummary">等待载入</small>
+              </article>
+              <article class="metric-card">
+                <span>待处理更新</span>
+                <strong id="homeUpdateCount">--</strong>
+                <small>来自订阅刷新和内容快照</small>
+              </article>
+              <article class="metric-card">
+                <span>订阅任务</span>
+                <strong id="homeSubscriptionCount">--</strong>
+                <small id="homeSubscriptionStatus">等待载入</small>
+              </article>
+              <article class="metric-card">
+                <span>知识范围</span>
+                <strong id="homeTagCount">--</strong>
+                <small>可用于问答过滤和整理</small>
+              </article>
+            </div>
+
+            <div class="overview-lower">
+              <section class="overview-panel">
+                <div class="overview-panel-header">
+                  <h4>导入来源</h4>
+                  <button type="button" data-view-shortcut="import">新增</button>
+                </div>
+                <div class="source-shortcuts">
+                  <button type="button" data-source-shortcut="confluence">Confluence <span class="source-shortcut-counts"><span class="source-total" id="homeSourceConfluence">0</span><span class="source-new" id="homeSourceConfluenceNew" hidden>新 0</span></span></button>
+                  <button type="button" data-source-shortcut="jira">Jira <span class="source-shortcut-counts"><span class="source-total" id="homeSourceJira">0</span><span class="source-new" id="homeSourceJiraNew" hidden>新 0</span></span></button>
+                  <button type="button" data-source-shortcut="github">GitHub <span class="source-shortcut-counts"><span class="source-total" id="homeSourceGithub">0</span><span class="source-new" id="homeSourceGithubNew" hidden>新 0</span></span></button>
+                  <button type="button" data-source-shortcut="teams">Teams <span class="source-shortcut-counts"><span class="source-total" id="homeSourceTeams">0</span><span class="source-new" id="homeSourceTeamsNew" hidden>新 0</span></span></button>
+                  <button type="button" data-source-shortcut="web">网页 <span class="source-shortcut-counts"><span class="source-total" id="homeSourceWeb">0</span><span class="source-new" id="homeSourceWebNew" hidden>新 0</span></span></button>
+                </div>
+              </section>
+              <section class="overview-panel">
+                <div class="overview-panel-header">
+                  <h4>刷新状态</h4>
+                  <button type="button" data-view-shortcut="subscriptions">管理</button>
+                </div>
+                <div class="refresh-snapshot">
+                  <div>
+                    <span>运行中</span>
+                    <strong id="homeRunningJobs">0</strong>
+                  </div>
+                  <div>
+                    <span>异常</span>
+                    <strong id="homeFailedJobs">0</strong>
+                  </div>
+                  <div>
+                    <span>已启用</span>
+                    <strong id="homeEnabledJobs">0</strong>
+                  </div>
+                </div>
+              </section>
+            </div>
+          </section>
+
+          <section class="home-task-panel" aria-label="数据源状态">
+            <div class="home-task-header">
+              <div>
+                <h3>数据源状态</h3>
+                <p>按来源汇总刷新健康度，具体任务可在订阅管理里查看。</p>
+              </div>
+              <div class="home-task-actions">
+                <button type="button" data-view-shortcut="subscriptions">管理订阅</button>
+                <button type="button" data-view-shortcut="subscriptions" aria-label="刷新状态">↻</button>
+              </div>
+            </div>
+            <div class="home-task-table-wrap">
+              <table class="home-task-table">
+                <thead>
+                  <tr>
+                    <th>数据源</th>
+                    <th>任务</th>
+                    <th>状态</th>
+                    <th>最近刷新</th>
+                    <th>成功率</th>
+                    <th>进度</th>
+                    <th>新增/变更</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="homeRefreshTaskRows">
+                  <tr>
+                    <td colspan="8">正在载入数据源状态。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="home-task-footer">
+              <span id="homeRefreshTaskCount">共 0 个数据源</span>
+              <button type="button" data-view-shortcut="subscriptions">查看任务明细</button>
+            </div>
+          </section>
+        </section>
+
+        <section id="chatView" class="chat-view" hidden>
           <div class="view-heading">
             <h2>AI 对话</h2>
             <p>从资料库里查找、总结和回到原文。</p>

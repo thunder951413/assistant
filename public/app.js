@@ -1,5 +1,5 @@
 const state = {
-  view: "chat",
+  view: "home",
   items: [],
   tags: [],
   chatSessions: [],
@@ -26,6 +26,14 @@ const state = {
   updateCount: 0,
   refreshReloadTimer: null,
   refreshMonitorTimer: null,
+  homeSourceRefresh: {
+    confirmSource: "",
+    runningSource: "",
+    startedAt: "",
+    total: 0,
+    completed: 0,
+    pollTimer: null
+  },
   seenRefreshRunKey: localStorage.getItem("materialOrganizer.seenRefreshRunKey") || "",
   listClassification: null,
   listClassifying: false,
@@ -44,9 +52,36 @@ const state = {
 const itemList = document.querySelector("#itemList");
 const tagList = document.querySelector("#tagList");
 const materialsNewBadge = document.querySelector("#materialsNewBadge");
+const sidebar = document.querySelector(".sidebar");
 const materialSidebar = document.querySelector("#materialSidebar");
+const homeTotalItems = document.querySelector("#homeTotalItems");
+const homeSourceSummary = document.querySelector("#homeSourceSummary");
+const homeUpdateCount = document.querySelector("#homeUpdateCount");
+const homeSubscriptionCount = document.querySelector("#homeSubscriptionCount");
+const homeSubscriptionStatus = document.querySelector("#homeSubscriptionStatus");
+const homeTagCount = document.querySelector("#homeTagCount");
+const homeRunningJobs = document.querySelector("#homeRunningJobs");
+const homeFailedJobs = document.querySelector("#homeFailedJobs");
+const homeEnabledJobs = document.querySelector("#homeEnabledJobs");
+const homeRefreshTaskRows = document.querySelector("#homeRefreshTaskRows");
+const homeRefreshTaskCount = document.querySelector("#homeRefreshTaskCount");
+const homeSourceCounts = {
+  confluence: document.querySelector("#homeSourceConfluence"),
+  jira: document.querySelector("#homeSourceJira"),
+  github: document.querySelector("#homeSourceGithub"),
+  teams: document.querySelector("#homeSourceTeams"),
+  web: document.querySelector("#homeSourceWeb")
+};
+const homeSourceNewCounts = {
+  confluence: document.querySelector("#homeSourceConfluenceNew"),
+  jira: document.querySelector("#homeSourceJiraNew"),
+  github: document.querySelector("#homeSourceGithubNew"),
+  teams: document.querySelector("#homeSourceTeamsNew"),
+  web: document.querySelector("#homeSourceWebNew")
+};
 const filterTabs = [...document.querySelectorAll("[data-filter-tab]")];
 const filterPanels = [...document.querySelectorAll("[data-filter-panel]")];
+const homeView = document.querySelector("#homeView");
 const chatView = document.querySelector("#chatView");
 const materialsView = document.querySelector("#materialsView");
 const importView = document.querySelector("#importView");
@@ -262,6 +297,34 @@ document.querySelectorAll(".nav-item").forEach((button) => {
   });
 });
 
+sidebar?.addEventListener("mouseleave", resetSidebarScroll);
+sidebar?.addEventListener("focusout", () => {
+  requestAnimationFrame(() => {
+    if (!sidebar.matches(":focus-within")) {
+      resetSidebarScroll();
+    }
+  });
+});
+
+document.querySelectorAll("[data-view-shortcut]").forEach((button) => {
+  button.addEventListener("click", async () => {
+    await switchView(button.dataset.viewShortcut);
+  });
+});
+
+document.querySelectorAll("[data-source-shortcut]").forEach((button) => {
+  button.addEventListener("click", async () => {
+    await switchView("materials");
+    document.querySelectorAll(".source-item").forEach((item) => {
+      item.classList.toggle("is-active", item.dataset.source === button.dataset.sourceShortcut);
+    });
+    state.sourceType = button.dataset.sourceShortcut;
+    state.tag = "";
+    await loadItems();
+    renderTags();
+  });
+});
+
 document.querySelectorAll(".source-item").forEach((button) => {
   button.addEventListener("click", async () => {
     document.querySelectorAll(".source-item").forEach((item) => item.classList.remove("is-active"));
@@ -286,6 +349,7 @@ await loadAgentConfig();
 await loadSettings();
 startRefreshJobMonitor();
 await loadMaterialUpdateCount();
+await loadHomeOverview();
 loadChatSessions();
 renderView();
 
@@ -299,6 +363,7 @@ function renderView() {
   });
 
   chatView.hidden = state.view !== "chat";
+  homeView.hidden = state.view !== "home";
   materialsView.hidden = state.view !== "materials";
   importView.hidden = state.view !== "import";
   supplementalView.hidden = state.view !== "supplemental";
@@ -310,6 +375,11 @@ function renderView() {
     setSettingsTab(state.settingsTab);
   }
   renderMaterialsNewBadge();
+}
+
+function resetSidebarScroll() {
+  if (!sidebar) return;
+  sidebar.scrollTop = 0;
 }
 
 function setFilterTab(tabName) {
@@ -342,6 +412,9 @@ function setSettingsTab(tabName) {
 async function switchView(view) {
   state.view = view;
   renderView();
+  if (state.view === "home") {
+    await loadHomeOverview();
+  }
   if (state.view === "materials") {
     await loadAll();
   }
@@ -381,6 +454,7 @@ async function loadMaterialUpdateCount() {
     const { items } = await api("/api/items?updates=1");
     state.updateCount = items?.length || 0;
     renderMaterialsNewBadge();
+    renderHomeOverview();
   } catch (error) {
     console.warn("Failed to load material update count:", error);
   }
@@ -397,6 +471,387 @@ function renderMaterialsNewBadge() {
   if (!materialsNewBadge) return;
   materialsNewBadge.hidden = !state.updateCount;
   materialsNewBadge.title = state.updateCount ? `${state.updateCount} 条资料有新内容` : "";
+}
+
+async function loadHomeOverview() {
+  if (!homeTotalItems) return;
+  try {
+    const [{ items }, { tags }] = await Promise.all([
+      api("/api/items"),
+      api("/api/tags")
+    ]);
+    state.homeOverview = {
+      items: items || [],
+      tags: tags || []
+    };
+    renderHomeOverview();
+  } catch (error) {
+    console.warn("Failed to load home overview:", error);
+  }
+}
+
+function renderHomeOverview() {
+  if (!homeTotalItems) return;
+  const items = state.homeOverview?.items || [];
+  const tags = state.homeOverview?.tags || [];
+  const sourceCounts = countSources(items);
+  const sourceNewCounts = countNewSources(items);
+  const refreshJobsList = state.refreshJobs || [];
+  const enabledJobs = refreshJobsList.filter((job) => job.enabled).length;
+  const runningJobs = refreshJobsList.filter((job) => job.running).length;
+  const failedJobs = refreshJobsList.filter((job) => ["failed", "unreachable"].includes(job.status)).length;
+
+  homeTotalItems.textContent = String(items.length);
+  homeUpdateCount.textContent = String(state.updateCount || 0);
+  homeSubscriptionCount.textContent = String(refreshJobsList.length);
+  homeTagCount.textContent = String(tags.length);
+  homeRunningJobs.textContent = String(runningJobs);
+  homeFailedJobs.textContent = String(failedJobs);
+  homeEnabledJobs.textContent = String(enabledJobs);
+  homeSubscriptionStatus.textContent = failedJobs
+    ? `${failedJobs} 个任务需要检查`
+    : enabledJobs
+      ? `${enabledJobs} 个任务已启用`
+      : "还没有启用刷新任务";
+
+  for (const [source, element] of Object.entries(homeSourceCounts)) {
+    if (element) element.textContent = String(sourceCounts.get(source) || 0);
+  }
+  for (const [source, element] of Object.entries(homeSourceNewCounts)) {
+    if (!element) continue;
+    const newCount = sourceNewCounts.get(source) || 0;
+    element.textContent = `新 ${newCount}`;
+    element.hidden = newCount <= 0;
+    element.closest("button")?.classList.toggle("has-new-content", newCount > 0);
+  }
+
+  const topSources = [...sourceCounts.entries()]
+    .filter(([, count]) => count > 0)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([source, count]) => `${sourceLabel(source)} ${count}`);
+  homeSourceSummary.textContent = topSources.length ? topSources.join(" · ") : "暂无资料来源";
+  renderHomeRefreshTasks(refreshJobsList);
+}
+
+function renderHomeRefreshTasks(jobs) {
+  if (!homeRefreshTaskRows) return;
+  const summaries = summarizeRefreshSources(jobs || []);
+  if (homeRefreshTaskCount) {
+    homeRefreshTaskCount.textContent = `共 ${summaries.length} 个数据源 · ${(jobs || []).length} 个任务`;
+  }
+  if (!summaries.length) {
+    homeRefreshTaskRows.innerHTML = `
+      <tr>
+        <td colspan="8">还没有刷新任务。</td>
+      </tr>
+    `;
+    return;
+  }
+
+  homeRefreshTaskRows.innerHTML = summaries.map((summary) => {
+    const isConfirming = state.homeSourceRefresh.confirmSource === summary.source;
+    const isRunning = state.homeSourceRefresh.runningSource === summary.source;
+    const runningTotal = Math.max(1, Number(state.homeSourceRefresh.total || summary.total || 0));
+    const runningCompleted = Math.min(runningTotal, Number(state.homeSourceRefresh.completed || 0));
+    const progress = isRunning
+      ? Math.round((runningCompleted / runningTotal) * 100)
+      : summary.progress;
+    const progressText = isRunning ? `${runningCompleted}/${runningTotal}` : `${summary.progress}%`;
+    const status = isRunning ? { kind: "running", label: "运行中" } : summary.status;
+    return `
+      <tr>
+        <td>
+          <div class="home-task-name">
+            <span class="home-source-icon home-source-${escapeHtml(summary.source)}">${escapeHtml(sourceIcon(summary.source))}</span>
+            <strong>${escapeHtml(subscriptionSourceLabel(summary.source))}</strong>
+          </div>
+        </td>
+        <td>${escapeHtml(`${summary.enabled}/${summary.total} 已启用`)}</td>
+        <td><span class="task-status task-status-${escapeHtml(status.kind)}">${escapeHtml(status.label)}</span></td>
+        <td>${escapeHtml(summary.latestRunAt ? relativeTime(summary.latestRunAt) : "未运行")}</td>
+        <td>${escapeHtml(`${summary.successRate}%`)}</td>
+        <td>
+          <div class="task-progress-cell">
+            <span>${escapeHtml(progressText)}</span>
+            <div class="task-progress-track ${isRunning ? "is-running" : ""}"><i style="width: ${escapeHtml(String(progress))}%"></i></div>
+          </div>
+        </td>
+        <td><span class="${summary.updated > 0 ? "task-delta-hot" : ""}">${escapeHtml(`${summary.updated} / ${summary.totalResult}`)}</span></td>
+        <td>
+          <div class="source-refresh-actions">
+            ${isConfirming ? `
+              <button type="button" class="source-refresh-confirm" data-source-refresh-confirm="${escapeHtml(summary.source)}">确认刷新</button>
+              <button type="button" class="source-refresh-all" data-source-refresh-all="${escapeHtml(summary.source)}">刷新所有</button>
+              <button type="button" class="task-icon-button" data-source-refresh-cancel aria-label="取消刷新">×</button>
+            ` : `
+              <button
+                type="button"
+                class="source-refresh-button"
+                data-source-refresh="${escapeHtml(summary.source)}"
+                ${isRunning ? "disabled" : ""}
+              >${isRunning ? "刷新中" : "刷新"}</button>
+            `}
+          </div>
+        </td>
+      </tr>
+    `;
+  }).join("");
+
+  homeRefreshTaskRows.querySelectorAll("[data-source-refresh]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.homeSourceRefresh.confirmSource = button.dataset.sourceRefresh;
+      renderHomeOverview();
+    });
+  });
+  homeRefreshTaskRows.querySelectorAll("[data-source-refresh-confirm]").forEach((button) => {
+    button.addEventListener("click", () => refreshHomeSource(button.dataset.sourceRefreshConfirm));
+  });
+  homeRefreshTaskRows.querySelectorAll("[data-source-refresh-all]").forEach((button) => {
+    button.addEventListener("click", () => refreshHomeSource(button.dataset.sourceRefreshAll, { clearFirst: true }));
+  });
+  homeRefreshTaskRows.querySelectorAll("[data-source-refresh-cancel]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.homeSourceRefresh.confirmSource = "";
+      renderHomeOverview();
+    });
+  });
+}
+
+function countNewSources(items) {
+  const counts = new Map();
+  for (const item of items || []) {
+    if (!isNewContentItem(item)) continue;
+    const source = item.sourceType || "text";
+    counts.set(source, (counts.get(source) || 0) + 1);
+  }
+  return counts;
+}
+
+function isNewContentItem(item) {
+  return Boolean(item?.contentUpdatedAt || item?.pendingContentUpdatedAt || item?.processedStale);
+}
+
+function summarizeRefreshSources(jobs) {
+  const groups = new Map();
+  for (const job of jobs || []) {
+    const source = sourceTypeForSubscription(job);
+    if (!groups.has(source)) {
+      groups.set(source, {
+        source,
+        total: 0,
+        enabled: 0,
+        running: 0,
+        failed: 0,
+        warning: 0,
+        succeeded: 0,
+        latestRunAt: "",
+        progressSum: 0,
+        updated: 0,
+        totalResult: 0
+      });
+    }
+    const group = groups.get(source);
+    const status = homeRefreshJobStatus(job);
+    const progress = homeRefreshJobProgress(job);
+    const delta = homeRefreshJobDelta(job);
+    group.total += 1;
+    group.enabled += job.enabled ? 1 : 0;
+    group.running += status.kind === "running" ? 1 : 0;
+    group.failed += status.kind === "failed" ? 1 : 0;
+    group.warning += status.kind === "warning" ? 1 : 0;
+    group.succeeded += status.kind === "success" ? 1 : 0;
+    group.progressSum += progress.percent;
+    group.updated += delta.updated;
+    group.totalResult += delta.total;
+    if (job.lastRunAt && (!group.latestRunAt || job.lastRunAt > group.latestRunAt)) {
+      group.latestRunAt = job.lastRunAt;
+    }
+  }
+
+  return [...groups.values()]
+    .map((group) => {
+      const status = sourceSummaryStatus(group);
+      const finished = group.succeeded + group.failed + group.warning;
+      const successRate = finished ? Math.round((group.succeeded / finished) * 100) : 0;
+      return {
+        ...group,
+        status,
+        successRate,
+        progress: group.total ? Math.round(group.progressSum / group.total) : 0
+      };
+    })
+    .sort((a, b) => {
+      const order = { running: 0, failed: 1, warning: 2, success: 3, idle: 4, skipped: 5 };
+      return (order[a.status.kind] ?? 9) - (order[b.status.kind] ?? 9)
+        || subscriptionSourceLabel(a.source).localeCompare(subscriptionSourceLabel(b.source));
+    });
+}
+
+function sourceSummaryStatus(group) {
+  if (group.running) return { kind: "running", label: `${group.running} 运行中` };
+  if (group.failed) return { kind: "failed", label: `${group.failed} 失败` };
+  if (group.warning) return { kind: "warning", label: `${group.warning} 警告` };
+  if (group.succeeded) return { kind: "success", label: "正常" };
+  if (!group.enabled) return { kind: "skipped", label: "未启用" };
+  return { kind: "idle", label: "空闲" };
+}
+
+async function refreshHomeSource(source, options = {}) {
+  const jobsToRun = (state.refreshJobs || []).filter((job) => sourceTypeForSubscription(job) === source);
+  const startedAt = new Date().toISOString();
+  state.homeSourceRefresh.confirmSource = "";
+  state.homeSourceRefresh.runningSource = source;
+  state.homeSourceRefresh.startedAt = startedAt;
+  state.homeSourceRefresh.total = jobsToRun.length;
+  state.homeSourceRefresh.completed = 0;
+  startHomeSourceRefreshPolling(source, startedAt, jobsToRun.length);
+  renderHomeOverview();
+  if (!jobsToRun.length) {
+    resetHomeSourceRefreshState();
+    renderHomeOverview();
+    return;
+  }
+
+  try {
+    if (options.clearFirst) {
+      const { jobs } = await api(`/api/refresh-jobs/source/${encodeURIComponent(source)}/items`, { method: "DELETE" });
+      state.refreshJobs = jobs || state.refreshJobs;
+      renderHomeOverview();
+    }
+    const { jobs } = await api("/api/refresh-jobs/run-batch", {
+      method: "POST",
+      body: JSON.stringify({
+        ids: jobsToRun.map((job) => job.id),
+        sourceType: source
+      })
+    });
+    state.refreshJobs = jobs || [];
+    renderRefreshJobs(state.refreshJobs);
+    await loadMaterialUpdateCount();
+  } catch (error) {
+    console.warn(`Failed to refresh ${source}:`, error);
+    await loadSettings();
+  } finally {
+    resetHomeSourceRefreshState();
+    renderHomeOverview();
+  }
+}
+
+function startHomeSourceRefreshPolling(source, startedAt, total) {
+  stopHomeSourceRefreshPolling();
+  state.homeSourceRefresh.pollTimer = setInterval(async () => {
+    try {
+      const { jobs } = await api("/api/refresh-jobs");
+      state.refreshJobs = jobs || state.refreshJobs;
+      const sourceJobs = (state.refreshJobs || []).filter((job) => sourceTypeForSubscription(job) === source);
+      const completed = sourceJobs.filter((job) => job.lastRunAt && job.lastRunAt >= startedAt).length;
+      state.homeSourceRefresh.total = total || sourceJobs.length;
+      state.homeSourceRefresh.completed = completed;
+      renderHomeOverview();
+    } catch (error) {
+      console.warn(`Failed to poll ${source} refresh progress:`, error);
+    }
+  }, 1000);
+}
+
+function stopHomeSourceRefreshPolling() {
+  if (!state.homeSourceRefresh.pollTimer) return;
+  clearInterval(state.homeSourceRefresh.pollTimer);
+  state.homeSourceRefresh.pollTimer = null;
+}
+
+function resetHomeSourceRefreshState() {
+  stopHomeSourceRefreshPolling();
+  state.homeSourceRefresh.runningSource = "";
+  state.homeSourceRefresh.startedAt = "";
+  state.homeSourceRefresh.total = 0;
+  state.homeSourceRefresh.completed = 0;
+}
+
+function homeRefreshJobProgress(job) {
+  if (job.running) return { percent: 62 };
+  if (job.status === "failed" || job.status === "unreachable") return { percent: 0 };
+  if (job.lastResult) {
+    const total = Number(job.lastResult.linkCount ?? job.lastResult.issueCount ?? 0);
+    const skipped = Number(job.lastResult.skippedItemCount || 0);
+    const updated = Number(job.lastResult.updatedItemCount ?? job.lastResult.updatedIssueCount ?? 0);
+    if (total > 0) {
+      return { percent: Math.max(0, Math.min(100, Math.round(((updated + skipped) / total) * 100))) };
+    }
+  }
+  return { percent: job.lastRunAt ? 100 : 0 };
+}
+
+function homeRefreshJobStatus(job) {
+  if (job.running) return { kind: "running", label: "运行中" };
+  if (job.status === "failed" || job.status === "unreachable") return { kind: "failed", label: "失败" };
+  if (!job.enabled) return { kind: "skipped", label: "跳过" };
+  if (job.lastError) return { kind: "warning", label: "警告" };
+  if (job.lastRunAt) return { kind: "success", label: "成功" };
+  return { kind: "idle", label: "空闲" };
+}
+
+function homeRefreshJobDelta(job) {
+  const updated = Number(job.lastResult?.updatedItemCount ?? job.lastResult?.updatedIssueCount ?? 0);
+  const total = Number(job.lastResult?.linkCount ?? job.lastResult?.issueCount ?? 0);
+  if (!job.lastResult) return { changed: false, text: "- / -", updated: 0, total: 0 };
+  return { changed: updated > 0, text: `${updated} / ${total}`, updated, total };
+}
+
+function sourceIcon(source) {
+  return {
+    confluence: "◆",
+    github: "●",
+    jira: "◆",
+    teams: "▣",
+    web: "◎"
+  }[source] || "□";
+}
+
+function relativeTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return formatDate(value);
+  const diffMs = Date.now() - date.getTime();
+  const minute = 60 * 1000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+  if (diffMs < minute) return "刚刚";
+  if (diffMs < hour) return `${Math.max(1, Math.round(diffMs / minute))} 分钟前`;
+  if (diffMs < day) return `${Math.round(diffMs / hour)} 小时前`;
+  if (diffMs < day * 2) return `昨天 ${date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`;
+  return formatDate(value);
+}
+
+function countSources(items) {
+  const counts = new Map();
+  for (const item of items || []) {
+    const source = normalizeSourceType(item.sourceType || item.source || "text");
+    counts.set(source, (counts.get(source) || 0) + 1);
+  }
+  return counts;
+}
+
+function normalizeSourceType(source) {
+  const value = String(source || "").toLowerCase();
+  if (value.includes("jira") || value.includes("atlassian")) return "jira";
+  if (value.includes("github")) return "github";
+  if (value.includes("teams")) return "teams";
+  if (value.includes("confluence")) return "confluence";
+  if (value.includes("web") || value.includes("http")) return "web";
+  return value || "text";
+}
+
+function sourceLabel(source) {
+  const labels = {
+    confluence: "Confluence",
+    github: "GitHub",
+    jira: "Jira",
+    teams: "Teams",
+    text: "文本",
+    web: "网页"
+  };
+  return labels[source] || source;
 }
 
 function renderItems() {
@@ -2443,6 +2898,7 @@ function updateAuthFields(section) {
 
 function renderRefreshJobs(jobs) {
   state.refreshJobs = jobs || [];
+  renderHomeOverview();
   renderSubscriptionTabs();
   const visibleJobs = refreshJobsForCurrentTab();
 

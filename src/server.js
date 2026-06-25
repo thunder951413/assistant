@@ -362,6 +362,14 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (req.method === "DELETE" && url.pathname.startsWith("/api/refresh-jobs/source/") && url.pathname.endsWith("/items")) {
+    await syncContentRefreshJobsFromItems();
+    const sourceType = cleanText(decodeURIComponent(url.pathname.split("/")[4] || ""));
+    const result = await deleteRefreshSourceItems(sourceType);
+    sendJson(res, 200, { result, jobs: publicRefreshJobs() });
+    return;
+  }
+
   if (req.method === "DELETE" && url.pathname.startsWith("/api/refresh-jobs/") && url.pathname.endsWith("/items")) {
     const id = decodeURIComponent(url.pathname.split("/")[3] || "");
     const result = await deleteRefreshJobItems(id);
@@ -507,6 +515,7 @@ async function previewSource(input) {
   let parseNote = "文本内容已读取，确认后即可导入。";
   let linkedItems = [];
   let refreshJob = null;
+  let skipRefreshJob = false;
 
   if (canonicalDetectedUrl && requestedPageKind === "list" && shouldFetchForPreview(input, pasted) && !looksLikeHtml(pasted)) {
     const adapter = detectSourceAdapter(canonicalDetectedUrl);
@@ -593,11 +602,15 @@ async function previewSource(input) {
       parseNote = "网页内容已抓取并过滤为可读文本。";
       linkedItems = extractPreviewLinkedItems(rawContent, canonicalDetectedUrl, sourceType, requestedPageKind);
     } catch (error) {
+      const authError = isAuthenticationRequiredError(error);
       title = title || canonicalDetectedUrl;
       rawContent = pasted || canonicalDetectedUrl;
       extractedContent = pasted || `无法直接抓取该页面。可以粘贴页面正文后再解析。\n\n错误：${error.message}`;
       parseStatus = "needs-review";
-      parseNote = "页面可能需要登录或 webdriver。当前保留你粘贴的内容供确认。";
+      parseNote = authError
+        ? error.message
+        : "页面可能需要登录或 webdriver。当前保留你粘贴的内容供确认。";
+      skipRefreshJob = authError;
     }
   } else if (canonicalDetectedUrl && looksLikeHtml(pasted)) {
     const adapter = detectSourceAdapter(canonicalDetectedUrl);
@@ -614,14 +627,14 @@ async function previewSource(input) {
 
   title = title || inferTitle(extractedContent) || "Untitled material";
   const resolvedPageKind = requestedPageKind;
-  if (canonicalDetectedUrl && resolvedPageKind === "list") {
+  if (!skipRefreshJob && canonicalDetectedUrl && resolvedPageKind === "list") {
     refreshJob = await ensureRefreshJobForListUrl(canonicalDetectedUrl, {
       title,
       sourceType,
       fetchMode: input.fetchMode || "auto",
       managedBy: "content-page"
     });
-  } else if (canonicalDetectedUrl && resolvedPageKind === "content") {
+  } else if (!skipRefreshJob && canonicalDetectedUrl && resolvedPageKind === "content") {
     refreshJob = await ensureRefreshJobForContentUrl(canonicalDetectedUrl, {
       title,
       sourceType,
@@ -3191,6 +3204,7 @@ async function runRefreshJobsBatch(jobs, options = {}) {
     const refreshedUrls = new Set(group.jobs.map((job) => normalizeUrlForMatch(job.url)).filter(Boolean));
     try {
       refreshContext = await createRefreshGroupContext(group);
+      await verifyRefreshGroupAuthentication(group, refreshContext);
       for (const job of group.jobs) {
         try {
           const result = await runRefreshJob(job, { refreshContext });
@@ -3292,6 +3306,40 @@ async function createRefreshGroupContext(group) {
     webdriverPage: page,
     closeWhenDone: !session.manual
   };
+}
+
+async function verifyRefreshGroupAuthentication(group, refreshContext = null) {
+  const targetUrl = group.seedUrl || group.jobs[0]?.url || "";
+  const adapter = detectSourceAdapter(targetUrl);
+  if (!shouldPrecheckAuthentication(adapter)) return;
+
+  if (refreshContext?.webdriverPage && resolvedRefreshFetchMode({ url: targetUrl, pageKind: inferPageKind(targetUrl, adapter) }, adapter) === "webdriver") {
+    await verifyWebdriverAuthentication(refreshContext.webdriverPage, targetUrl, adapter);
+    return;
+  }
+
+  await fetchUrl(targetUrl, { pageKind: inferPageKind(targetUrl, adapter) });
+}
+
+function shouldPrecheckAuthentication(adapter) {
+  return ["jira", "github", "confluence"].includes(adapter.sourceType);
+}
+
+async function verifyWebdriverAuthentication(page, url, adapter) {
+  await navigateWebdriverPage(page, url, adapter);
+  try {
+    await page.waitForLoadState("networkidle", { timeout: 5000 });
+  } catch {
+    // Auth pages and internal apps can keep background requests open.
+  }
+  const raw = await page.content();
+  assertFetchedPageIsAuthenticated({
+    adapter,
+    requestedUrl: url,
+    finalUrl: page.url(),
+    title: await page.title(),
+    raw
+  });
 }
 
 async function prepareTeamsRefreshGroup(page, adapter) {
@@ -3804,7 +3852,8 @@ async function fetchForRefreshJob(url, job, adapter = detectSourceAdapter(url), 
     return fetchUrlWithWebdriver(url, {
       pageKind: job.pageKind || "auto",
       session: refreshContext?.webdriverSession,
-      page: refreshContext?.webdriverPage
+      page: refreshContext?.webdriverPage,
+      maxGithubExpansionPasses: resolvePageKind(url, job.pageKind || "auto") === "content" ? 3 : 0
     });
   }
   return fetchUrl(url, { pageKind: job.pageKind || "auto" });
@@ -3891,6 +3940,71 @@ async function deleteRefreshJobItems(id) {
   };
 }
 
+async function deleteRefreshSourceItems(sourceType) {
+  const source = cleanText(sourceType).toLowerCase();
+  const jobs = (settings.refreshJobs || [])
+    .filter((job) => sourceTypeForRefreshJob(job) === source);
+  if (!source || !jobs.length) {
+    return { sourceType: source, deletedItemCount: 0, deletedItems: [] };
+  }
+
+  const jobUrls = new Set(jobs.map((job) => normalizeUrlForMatch(job.url || "")).filter(Boolean));
+  const dirs = await safeReaddir(itemsDir);
+  const deletedItems = [];
+  for (const itemId of dirs) {
+    const metadataPath = path.join(itemsDir, itemId, "metadata.json");
+    if (!(await exists(metadataPath))) continue;
+    const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
+    if (!isRefreshSourceCapturedItem(source, jobUrls, metadata)) continue;
+    await fs.rm(path.join(itemsDir, itemId), { recursive: true, force: true });
+    deletedItems.push({
+      id: metadata.id || itemId,
+      title: metadata.title || itemId,
+      url: metadata.url || ""
+    });
+  }
+
+  const now = new Date().toISOString();
+  settings = {
+    ...settings,
+    refreshJobs: (settings.refreshJobs || []).map((job) => (
+      sourceTypeForRefreshJob(job) === source
+        ? {
+            ...job,
+            status: "idle",
+            lastError: "",
+            lastResult: {
+              clearedAt: now,
+              deletedItemCount: deletedItems.length
+            }
+          }
+        : job
+    ))
+  };
+  await fs.mkdir(configDir, { recursive: true });
+  await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  await rebuildIndexes();
+  return {
+    sourceType: source,
+    deletedItemCount: deletedItems.length,
+    deletedItems
+  };
+}
+
+function sourceTypeForRefreshJob(job) {
+  return detectSourceAdapter(job?.url || "").sourceType || "";
+}
+
+function isRefreshSourceCapturedItem(sourceType, jobUrls, metadata) {
+  if (!metadata || metadata.pageKind === "list") return false;
+  if (String(metadata.sourceType || "").toLowerCase() !== sourceType) return false;
+  const itemUrl = normalizeUrlForMatch(metadata.url || "");
+  const parentUrl = normalizeUrlForMatch(metadata.parentUrl || "");
+  if (itemUrl && jobUrls.has(itemUrl)) return true;
+  if (parentUrl && jobUrls.has(parentUrl)) return true;
+  return metadata.managedBy === "subscription" || metadata.managedBy === "content-page";
+}
+
 function isRefreshJobCapturedItem(job, metadata) {
   if (!metadata || metadata.pageKind === "list") return false;
   if (metadata.managedBy !== "subscription" && !metadata.parentUrl) return false;
@@ -3917,9 +4031,17 @@ async function fetchUrl(url, options = {}) {
 
   const raw = await response.text();
   const extracted = extractByAdapter(raw, url, adapter, options.pageKind || "auto");
+  const title = extracted.title || extractTitle(raw);
+  assertFetchedPageIsAuthenticated({
+    adapter,
+    requestedUrl: url,
+    finalUrl: response.url || url,
+    title,
+    raw
+  });
   return {
     raw,
-    title: extracted.title || extractTitle(raw),
+    title,
     text: extracted.text,
     comments: extracted.comments || [],
     sourceUpdatedAt: extracted.sourceUpdatedAt || "",
@@ -3958,9 +4080,11 @@ async function fetchUrlWithWebdriver(url, options = {}) {
         }
       }
     }
-    await page.goto(navigationUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await navigateWebdriverPage(page, navigationUrl, adapter);
     await waitForJiraIssueNavigator(page, adapter, options.pageKind || "auto");
-    await expandGithubDynamicContent(page, adapter, options.pageKind || "auto");
+    await expandGithubDynamicContent(page, adapter, options.pageKind || "auto", {
+      maxPasses: options.maxGithubExpansionPasses
+    });
     if (adapter.sourceType === "teams") {
       return await fetchTeamsWithWebdriver(page, url, adapter);
     }
@@ -3968,9 +4092,17 @@ async function fetchUrlWithWebdriver(url, options = {}) {
     const currentUrl = page.url();
     const extractionUrl = resolvePageKind(url, options.pageKind || "auto") === "list" ? url : currentUrl || url;
     const extracted = extractByAdapter(raw, extractionUrl, adapter, options.pageKind || "auto");
+    const title = extracted.title || await page.title();
+    assertFetchedPageIsAuthenticated({
+      adapter,
+      requestedUrl: url,
+      finalUrl: currentUrl,
+      title,
+      raw
+    });
     return {
       raw,
-      title: extracted.title || await page.title(),
+      title,
       text: extracted.text,
       comments: extracted.comments || [],
       sourceUpdatedAt: extracted.sourceUpdatedAt || "",
@@ -3983,23 +4115,145 @@ async function fetchUrlWithWebdriver(url, options = {}) {
   }
 }
 
+function assertFetchedPageIsAuthenticated({ adapter, requestedUrl, finalUrl, title, raw }) {
+  const login = detectAuthenticationPage({
+    adapter,
+    requestedUrl,
+    finalUrl,
+    title,
+    raw
+  });
+  if (!login) return;
+  throw new Error([
+    `检测到 ${login.sourceName} 未登录，已停止抓取，未保存登录页。`,
+    "请先在 WebDriver 窗口完成登录，或在设置里重新保存 Cookie 后再刷新。",
+    `当前页面：${login.finalUrl || finalUrl || requestedUrl}`
+  ].join(" "));
+}
+
+function isAuthenticationRequiredError(error) {
+  return /检测到\s+.+未登录，已停止抓取/.test(error?.message || String(error));
+}
+
+function detectAuthenticationPage({ adapter, finalUrl, title, raw }) {
+  const pageTitle = cleanText(title || extractTitle(raw || ""));
+  const html = String(raw || "");
+  const pathname = safePathname(finalUrl || "");
+  if (adapter.sourceType === "jira") {
+    const jiraLogin = /\/login\.jsp$/i.test(pathname)
+      || /^Log in\b.*\bJIRA$/i.test(pageTitle)
+      || /name=["']os_username["']|id=["']login-form["']|class=["'][^"']*\blogin-link\b/i.test(html);
+    if (jiraLogin) return { sourceName: "Jira", finalUrl };
+  }
+  if (adapter.sourceType === "confluence") {
+    const confluenceLogin = /\/login(?:\.action)?$/i.test(pathname)
+      || /^Log in\b|登录/i.test(pageTitle)
+      || /name=["']os_username["']|id=["']login-form["']/i.test(html);
+    if (confluenceLogin) return { sourceName: "Confluence", finalUrl };
+  }
+  if (adapter.sourceType === "github") {
+    const githubLogin = /\/login$/i.test(pathname)
+      || /Sign in to GitHub|Sign in/i.test(pageTitle)
+      || /name=["']login["'][\s\S]{0,600}name=["']password["']/i.test(html);
+    if (githubLogin) return { sourceName: "GitHub", finalUrl };
+  }
+  return null;
+}
+
+async function navigateWebdriverPage(page, navigationUrl, adapter) {
+  try {
+    await page.goto(navigationUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    return;
+  } catch (error) {
+    if (!isRecoverableNavigationError(error) || page.isClosed()) {
+      throw error;
+    }
+
+    await waitForRecoveredNavigation(page, navigationUrl, adapter, error);
+  }
+}
+
+function isRecoverableNavigationError(error) {
+  const message = error?.message || String(error);
+  return /net::ERR_ABORTED|Execution context was destroyed|maybe frame was detached/i.test(message);
+}
+
+async function waitForRecoveredNavigation(page, navigationUrl, adapter, originalError) {
+  const targetHostname = safeHostname(navigationUrl);
+  const targetPathname = safePathname(navigationUrl);
+  try {
+    await page.waitForFunction(
+      ({ hostname, pathname }) => {
+        const currentPath = window.location.pathname || "";
+        return window.location.hostname === hostname
+          && (!pathname || currentPath === pathname || currentPath.endsWith(pathname));
+      },
+      { hostname: targetHostname, pathname: targetPathname },
+      { timeout: adapter.sourceType === "github" ? 20000 : 10000 }
+    );
+  } catch {
+    // The page may have recovered through an auth redirect; validate the DOM below.
+  }
+
+  try {
+    await page.waitForLoadState("domcontentloaded", { timeout: 10000 });
+  } catch {
+    // Some internal apps keep replacing the document while settling.
+  }
+  try {
+    await page.waitForSelector("body", { timeout: 10000 });
+  } catch {
+    // Fall through to the explicit validation below.
+  }
+  await page.waitForTimeout(adapter.sourceType === "github" ? 1200 : 500);
+
+  const recovered = await page.evaluate(() => ({
+    href: window.location.href,
+    bodyLength: document.body?.innerText?.trim().length || 0,
+    title: document.title || ""
+  })).catch(() => null);
+  const currentHostname = safeHostname(recovered?.href || page.url());
+  const sameTarget = !targetHostname || currentHostname === targetHostname;
+  const loadedDocument = Boolean(recovered && (recovered.bodyLength > 0 || recovered.title));
+  if (!sameTarget || !loadedDocument) {
+    throw originalError;
+  }
+}
+
 async function fetchTeamsWithWebdriver(page, url, adapter) {
   await resolveTeamsLauncher(page, url);
   await waitForTeamsConversation(page);
-  const observedMessages = await scrollTeamsMessages(page, 18);
+  const stableUrl = canonicalizeMaterialUrl(url) || page.url() || url;
+  const previousComments = await readExistingTeamsComments(stableUrl);
+  const observedMessages = await scrollTeamsMessages(page, {
+    maxScrolls: 18,
+    previousMessages: previousComments,
+    minScrollsBeforeOverlapStop: 2
+  });
   const raw = await page.content();
   const currentUrl = page.url();
-  const stableUrl = canonicalizeMaterialUrl(url) || currentUrl || url;
-  const extracted = await extractTeamsFromPage(page, stableUrl, adapter, observedMessages);
-  validateTeamsExtraction(extracted, stableUrl);
+  const finalUrl = stableUrl || currentUrl || url;
+  const extracted = await extractTeamsFromPage(page, finalUrl, adapter, observedMessages);
+  validateTeamsExtraction(extracted, finalUrl);
   return {
     raw,
     title: extracted.title || await page.title(),
     text: extracted.text,
     comments: extracted.comments || [],
     sourceUpdatedAt: extracted.sourceUpdatedAt || "",
-    url: stableUrl
+    url: finalUrl
   };
+}
+
+async function readExistingTeamsComments(url) {
+  const existing = await findItemByUrl(canonicalizeMaterialUrl(url) || url);
+  if (!existing?.id) return [];
+  try {
+    const item = await readItem(existing.id);
+    return Array.isArray(item.comments) ? item.comments : [];
+  } catch {
+    return [];
+  }
 }
 
 function validateTeamsExtraction(extracted, url) {
@@ -4318,11 +4572,12 @@ async function waitForJiraIssueNavigator(page, adapter, pageKind) {
   }
 }
 
-async function expandGithubDynamicContent(page, adapter, pageKind) {
+async function expandGithubDynamicContent(page, adapter, pageKind, options = {}) {
   if (adapter.sourceType !== "github") return;
   const kind = resolvePageKind(page.url(), pageKind || "auto");
+  if (kind === "list") return;
   const shouldWaitForTimeline = kind !== "list" && /\/[^/]+\/[^/]+\/(issues|pull|discussions)\/\d+/i.test(safePathname(page.url()));
-  const shouldExpandLoadMore = adapter.hostname === "github.ecodesamsung.com" || shouldWaitForTimeline;
+  const shouldExpandLoadMore = shouldWaitForTimeline;
   if (!shouldExpandLoadMore) return;
 
   try {
@@ -4341,41 +4596,42 @@ async function expandGithubDynamicContent(page, adapter, pageKind) {
   }
 
   let stableCount = 0;
-  for (let index = 0; index < 30; index += 1) {
-    const before = await page.evaluate(() => ({
-      height: document.documentElement.scrollHeight,
-      y: window.scrollY,
-      comments: document.querySelectorAll("[id^='issuecomment-']").length,
-      textLength: document.body?.innerText?.length || 0
-    }));
+  const configuredPasses = Number(options.maxPasses);
+  const maxPasses = Number.isFinite(configuredPasses)
+    ? Math.max(0, configuredPasses)
+    : adapter.hostname === "github.ecodesamsung.com" ? 12 : 30;
+  for (let index = 0; index < maxPasses; index += 1) {
+    const before = await githubPageGrowthSnapshot(page);
     const clicked = await clickGithubLoadMore(page);
     await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
     // Wait for the lazy-loaded page to arrive. GitHub's "Load more" fires a
     // GraphQL request; give it room, then settle on network idle.
     try {
-      await page.waitForLoadState("networkidle", { timeout: 6000 });
+      await page.waitForLoadState("networkidle", { timeout: clicked ? 6000 : 1500 });
     } catch {
       // GitHub keeps subscriptions open; fall back to a fixed settle delay.
     }
-    await page.waitForTimeout(900);
-    const after = await page.evaluate(() => ({
-      height: document.documentElement.scrollHeight,
-      y: window.scrollY,
-      comments: document.querySelectorAll("[id^='issuecomment-']").length,
-      textLength: document.body?.innerText?.length || 0
-    }));
+    await page.waitForTimeout(clicked ? 900 : 400);
+    const after = await githubPageGrowthSnapshot(page);
     if (clicked) {
       stableCount = 0;
     } else if (after.comments <= before.comments
-      && after.height <= before.height
-      && after.y === before.y
-      && after.textLength <= before.textLength) {
+      && after.height <= before.height + 8
+      && after.textLength <= before.textLength + 40) {
       stableCount += 1;
       if (stableCount >= 2) break;
     } else {
       stableCount = 0;
     }
   }
+}
+
+async function githubPageGrowthSnapshot(page) {
+  return page.evaluate(() => ({
+    height: document.documentElement.scrollHeight,
+    comments: document.querySelectorAll("[id^='issuecomment-']").length,
+    textLength: document.body?.innerText?.length || 0
+  }));
 }
 
 async function clickGithubLoadMore(page) {
@@ -4592,13 +4848,17 @@ function renderTeamsTextFromComments(title, url, adapter, comments) {
   return lines.join("\n");
 }
 
-async function scrollTeamsMessages(page, maxScrolls = 18) {
+async function scrollTeamsMessages(page, options = {}) {
+  const maxScrolls = Number(options.maxScrolls || 18);
+  const minScrollsBeforeOverlapStop = Number(options.minScrollsBeforeOverlapStop || 2);
+  const previousKeys = teamsMessageKeySet(options.previousMessages || []);
   const observed = [];
   const remember = async () => {
     const visible = await readVisibleTeamsMessages(page);
     observed.push(...(visible.messages || []));
   };
 
+  await jumpTeamsToLatest(page);
   await remember();
   try {
     const box = await page.locator("[data-tid='chat-pane-list'], [role='main'], main").first().boundingBox({ timeout: 3000 });
@@ -4635,6 +4895,13 @@ async function scrollTeamsMessages(page, maxScrolls = 18) {
     await remember();
     const afterCount = mergeTeamsMessages(observed).length;
     stableRounds = moved || afterCount > beforeCount ? 0 : stableRounds + 1;
+    if (
+      index + 1 >= minScrollsBeforeOverlapStop
+      && (index + 1) % minScrollsBeforeOverlapStop === 0
+      && hasTeamsMessageOverlap(observed, previousKeys)
+    ) {
+      break;
+    }
     if (stableRounds >= 3) break;
   }
 
@@ -4646,6 +4913,188 @@ async function scrollTeamsMessages(page, maxScrolls = 18) {
   await page.waitForTimeout(800);
   await remember();
   return mergeTeamsMessages(observed).slice(-240);
+}
+
+async function jumpTeamsToLatest(page) {
+  let clicked = false;
+  try {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const clickedThisRound = await page.evaluate(() => {
+        const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+        const labels = [
+          "跳转到最新",
+          "跳至最新",
+          "回到最新",
+          "Jump to latest",
+          "Go to latest",
+          "Latest"
+        ];
+        const isVisible = (node) => {
+          const style = window.getComputedStyle(node);
+          const rect = node.getBoundingClientRect();
+          return style.visibility !== "hidden"
+            && style.display !== "none"
+            && rect.width > 0
+            && rect.height > 0;
+        };
+        const candidates = [...document.querySelectorAll("button, [role='button'], [aria-label], [title]")]
+          .filter((node) => node instanceof HTMLElement && isVisible(node));
+        const target = candidates.find((node) => {
+          const text = clean([
+            node.innerText,
+            node.textContent,
+            node.getAttribute("aria-label"),
+            node.getAttribute("title")
+          ].filter(Boolean).join(" "));
+          return labels.some((label) => text.toLowerCase().includes(label.toLowerCase()));
+        });
+        if (!target) return false;
+        target.scrollIntoView({ block: "center", inline: "center" });
+        target.click();
+        return true;
+      });
+      if (!clickedThisRound) break;
+      clicked = true;
+      await page.waitForTimeout(1200);
+    }
+  } catch {
+    // Fall back to direct container scrolling below.
+  }
+
+  const settled = await settleTeamsAtBottom(page);
+  return clicked || settled;
+}
+
+async function settleTeamsAtBottom(page) {
+  try {
+    let stableBottomRounds = 0;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const result = await page.evaluate(() => {
+        const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+        const labels = ["跳转到最新", "跳至最新", "回到最新", "Jump to latest", "Go to latest", "Latest"];
+        const isVisible = (node) => {
+          const style = window.getComputedStyle(node);
+          const rect = node.getBoundingClientRect();
+          return style.visibility !== "hidden"
+            && style.display !== "none"
+            && rect.width > 0
+            && rect.height > 0;
+        };
+        const latestButtonVisible = [...document.querySelectorAll("button, [role='button'], [aria-label], [title]")]
+          .filter((node) => node instanceof HTMLElement && isVisible(node))
+          .some((node) => {
+            const text = clean([
+              node.innerText,
+              node.textContent,
+              node.getAttribute("aria-label"),
+              node.getAttribute("title")
+            ].filter(Boolean).join(" "));
+            return labels.some((label) => text.toLowerCase().includes(label.toLowerCase()));
+          });
+        const candidates = [...document.querySelectorAll("[data-tid='chat-pane-list'], [role='main'], main, [data-tid*='chat'], [data-tid*='message'], div")]
+          .filter((el) => el instanceof HTMLElement)
+          .map((el) => ({
+            el,
+            score: (el.scrollHeight - el.clientHeight) * Math.max(1, el.getBoundingClientRect().height)
+          }))
+          .filter((entry) => entry.score > 0)
+          .sort((a, b) => b.score - a.score);
+        const targets = candidates.slice(0, 5).map((entry) => entry.el);
+        if (!targets.length) return { found: false, moved: false, atBottom: false, latestButtonVisible };
+        let moved = false;
+        for (const target of targets) {
+          const before = target.scrollTop;
+          target.scrollTop = target.scrollHeight;
+          target.scrollBy?.({ top: target.scrollHeight, behavior: "auto" });
+          target.dispatchEvent(new Event("scroll", { bubbles: true }));
+          moved = moved || target.scrollTop !== before;
+        }
+        const primary = targets[0];
+        const distanceToBottom = primary.scrollHeight - primary.clientHeight - primary.scrollTop;
+        return {
+          found: true,
+          moved,
+          atBottom: distanceToBottom <= 12,
+          distanceToBottom,
+          latestButtonVisible
+        };
+      });
+      try {
+        await page.mouse.wheel(0, 7200);
+        await page.keyboard.press("End");
+        await page.keyboard.press("PageDown");
+      } catch {
+        // Direct scroll above is the primary fallback.
+      }
+      if (!result.found) return false;
+      stableBottomRounds = result.atBottom && !result.latestButtonVisible ? stableBottomRounds + 1 : 0;
+      if (stableBottomRounds >= 2) return true;
+      await page.waitForTimeout(result.moved ? 900 : 700);
+    }
+    return await page.evaluate(() => {
+      const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+      const labels = ["跳转到最新", "跳至最新", "回到最新", "Jump to latest", "Go to latest", "Latest"];
+      const isVisible = (node) => {
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+      };
+      const latestButtonVisible = [...document.querySelectorAll("button, [role='button'], [aria-label], [title]")]
+        .filter((node) => node instanceof HTMLElement && isVisible(node))
+        .some((node) => {
+          const text = clean([
+            node.innerText,
+            node.textContent,
+            node.getAttribute("aria-label"),
+            node.getAttribute("title")
+          ].filter(Boolean).join(" "));
+          return labels.some((label) => text.toLowerCase().includes(label.toLowerCase()));
+        });
+      const candidates = [...document.querySelectorAll("[data-tid='chat-pane-list'], [role='main'], main, [data-tid*='chat'], [data-tid*='message'], div")]
+        .filter((el) => el instanceof HTMLElement)
+        .map((el) => ({
+          el,
+          score: (el.scrollHeight - el.clientHeight) * Math.max(1, el.getBoundingClientRect().height)
+        }))
+        .filter((entry) => entry.score > 0)
+        .sort((a, b) => b.score - a.score);
+      const target = candidates[0]?.el;
+      if (!target || latestButtonVisible) return false;
+      return target.scrollHeight - target.clientHeight - target.scrollTop <= 12;
+    });
+  } catch {
+    return false;
+  }
+}
+
+function teamsMessageKeySet(messages) {
+  const keys = new Set();
+  for (const message of messages || []) {
+    for (const key of teamsMessageKeys(message)) {
+      keys.add(key);
+    }
+  }
+  return keys;
+}
+
+function hasTeamsMessageOverlap(messages, previousKeys) {
+  if (!previousKeys?.size) return false;
+  for (const message of messages || []) {
+    for (const key of teamsMessageKeys(message)) {
+      if (previousKeys.has(key)) return true;
+    }
+  }
+  return false;
+}
+
+function teamsMessageKeys(message) {
+  const body = cleanText(message?.body || "");
+  if (!body) return [];
+  const createdAt = cleanText(message?.createdAt || "");
+  const keys = [];
+  if (createdAt) keys.push(`time-body:${createdAt}\n${body}`);
+  keys.push(`body:${body.slice(0, 240)}`);
+  return keys;
 }
 
 async function extractTeamsFromPage(page, url, adapter, observedMessages = []) {
