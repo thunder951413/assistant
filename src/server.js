@@ -28,13 +28,19 @@ let indexesDir = path.join(kbDir, "indexes");
 const webdriverSessions = new Map();
 const refreshRuntime = {
   timer: null,
-  running: new Set()
+  running: new Set(),
+  queued: new Set(),
+  runs: new Map()
 };
+const FETCH_TIMEOUT_MS = 45 * 1000;
+const REFRESH_JOB_TIMEOUT_MS = 4 * 60 * 1000;
+const REFRESH_RUN_RETENTION_MS = 6 * 60 * 60 * 1000;
 
 const port = Number(process.env.PORT || 8020);
 
 await ensureKnowledgeBase();
 await syncContentRefreshJobsFromItems();
+await reconcileStaleRunningRefreshJobs();
 startRefreshScheduler();
 
 const server = http.createServer(async (req, res) => {
@@ -339,13 +345,39 @@ async function handleApi(req, res, url) {
 
   if (req.method === "GET" && url.pathname === "/api/refresh-jobs") {
     await syncContentRefreshJobsFromItems();
+    await reconcileStaleRunningRefreshJobs();
     sendJson(res, 200, { jobs: publicRefreshJobs() });
     return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/refresh-runs") {
+    sendJson(res, 200, { runs: publicRefreshRuns() });
+    return;
+  }
+
+  if (url.pathname.startsWith("/api/refresh-runs/")) {
+    const runId = decodeURIComponent(url.pathname.split("/")[3] || "");
+    if (req.method === "GET") {
+      const run = publicRefreshRun(runId);
+      if (!run) throw new Error("Refresh run not found.");
+      sendJson(res, 200, { run });
+      return;
+    }
+    if (req.method === "POST" && url.pathname.endsWith("/cancel")) {
+      const run = await cancelRefreshRun(runId);
+      sendJson(res, 200, { run, jobs: publicRefreshJobs() });
+      return;
+    }
   }
 
   if (req.method === "POST" && url.pathname.startsWith("/api/refresh-jobs/") && url.pathname.endsWith("/run")) {
     await syncContentRefreshJobsFromItems();
     const id = decodeURIComponent(url.pathname.split("/")[3] || "");
+    if (url.searchParams.get("background") === "1") {
+      const run = await startRefreshRunByIds([id], { force: true, sourceType: "all" });
+      sendJson(res, 202, { run, jobs: publicRefreshJobs() });
+      return;
+    }
     const result = await runRefreshJobById(id, { force: true });
     sendJson(res, 200, { result, jobs: publicRefreshJobs() });
     return;
@@ -354,10 +386,16 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && url.pathname === "/api/refresh-jobs/run-batch") {
     await syncContentRefreshJobsFromItems();
     const body = await readBody(req);
-    const result = await runRefreshJobsByIds(body.ids || [], {
+    const options = {
       force: true,
       sourceType: cleanText(body.sourceType || "all")
-    });
+    };
+    if (url.searchParams.get("background") === "1" || body.background) {
+      const run = await startRefreshRunByIds(body.ids || [], options);
+      sendJson(res, 202, { run, jobs: publicRefreshJobs() });
+      return;
+    }
+    const result = await runRefreshJobsByIds(body.ids || [], options);
     sendJson(res, 200, { result, jobs: publicRefreshJobs() });
     return;
   }
@@ -3117,7 +3155,7 @@ async function runDueRefreshJobs() {
   const now = new Date();
   const dueJobs = [];
   for (const job of settings.refreshJobs || []) {
-    if (!job.enabled || refreshRuntime.running.has(job.id)) continue;
+    if (!job.enabled || isRefreshJobActive(job.id)) continue;
     const dueAt = nextDueRefreshSlot(job, now, settings.refreshSchedule);
     if (dueAt) dueJobs.push(job);
   }
@@ -3176,6 +3214,147 @@ async function runRefreshJobById(id, options = {}) {
   };
 }
 
+async function startRefreshRunByIds(ids, options = {}) {
+  const requestedIds = Array.isArray(ids) ? ids.map((id) => String(id)) : [];
+  const requested = new Set(requestedIds);
+  const jobs = (settings.refreshJobs || []).filter((job) => requested.has(job.id));
+  if (requestedIds.length && jobs.length !== requested.size) {
+    throw new Error("Some refresh jobs were not found.");
+  }
+  if (!options.force) {
+    const disabled = jobs.find((job) => !job.enabled);
+    if (disabled) throw new Error(`Refresh job is disabled: ${disabled.name || disabled.id}`);
+  }
+  const runnableJobs = jobs
+    .filter((job) => options.force || job.enabled)
+    .filter((job) => !isInvalidTeamsRootRefreshJob(job));
+  const run = createRefreshRun(runnableJobs, options);
+  Promise.resolve()
+    .then(async () => {
+      updateRefreshRun(run, { status: "running" });
+      const result = await runRefreshJobsBatch(runnableJobs, { ...options, run });
+      updateRefreshRun(run, {
+        status: run.cancelRequested ? "canceled" : result.failureCount ? "failed" : "completed",
+        result,
+        jobs: publicRefreshJobs(),
+        finishedAt: new Date().toISOString(),
+        currentJobId: "",
+        currentJobName: "",
+        completedJobs: result.jobCount || run.totalJobs,
+        failedJobs: result.failureCount || 0
+      });
+    })
+    .catch((error) => {
+      updateRefreshRun(run, {
+        status: run.cancelRequested ? "canceled" : "failed",
+        error: error.message || String(error),
+        jobs: publicRefreshJobs(),
+        finishedAt: new Date().toISOString(),
+        currentJobId: "",
+        currentJobName: ""
+      });
+    });
+  return publicRefreshRun(run.id);
+}
+
+function createRefreshRun(jobs, options = {}) {
+  cleanupRefreshRuns();
+  const now = new Date().toISOString();
+  const sourceType = cleanText(options.sourceType || "all");
+  const run = {
+    id: `refresh-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    status: "queued",
+    sourceType,
+    jobIds: jobs.map((job) => job.id),
+    totalJobs: jobs.length,
+    completedJobs: 0,
+    failedJobs: 0,
+    currentJobId: "",
+    currentJobName: "",
+    cancelRequested: false,
+    refreshContext: null,
+    startedAt: now,
+    updatedAt: now,
+    finishedAt: "",
+    result: null,
+    error: "",
+    jobs: publicRefreshJobs()
+  };
+  refreshRuntime.runs.set(run.id, run);
+  return run;
+}
+
+function updateRefreshRun(run, patch = {}) {
+  if (!run) return null;
+  Object.assign(run, patch, { updatedAt: new Date().toISOString() });
+  refreshRuntime.runs.set(run.id, run);
+  return run;
+}
+
+function publicRefreshRuns() {
+  cleanupRefreshRuns();
+  return [...refreshRuntime.runs.values()].map(publicRefreshRunFromRecord);
+}
+
+function publicRefreshRun(id) {
+  cleanupRefreshRuns();
+  const run = refreshRuntime.runs.get(id);
+  return run ? publicRefreshRunFromRecord(run) : null;
+}
+
+function publicRefreshRunFromRecord(run) {
+  return {
+    id: run.id,
+    status: run.status,
+    sourceType: run.sourceType,
+    jobIds: run.jobIds,
+    totalJobs: run.totalJobs,
+    completedJobs: run.completedJobs,
+    failedJobs: run.failedJobs,
+    currentJobId: run.currentJobId,
+    currentJobName: run.currentJobName,
+    cancelRequested: Boolean(run.cancelRequested),
+    startedAt: run.startedAt,
+    updatedAt: run.updatedAt,
+    finishedAt: run.finishedAt,
+    result: run.result,
+    error: run.error,
+    jobs: run.jobs || publicRefreshJobs()
+  };
+}
+
+function cleanupRefreshRuns() {
+  const cutoff = Date.now() - REFRESH_RUN_RETENTION_MS;
+  for (const [id, run] of refreshRuntime.runs.entries()) {
+    if (!run.finishedAt) continue;
+    const finished = Date.parse(run.finishedAt);
+    if (!Number.isNaN(finished) && finished < cutoff) refreshRuntime.runs.delete(id);
+  }
+}
+
+async function cancelRefreshRun(id) {
+  const run = refreshRuntime.runs.get(id);
+  if (!run) throw new Error("Refresh run not found.");
+  if (["completed", "failed", "canceled"].includes(run.status)) return publicRefreshRunFromRecord(run);
+  updateRefreshRun(run, {
+    status: "canceling",
+    cancelRequested: true,
+    error: "用户已请求取消刷新。"
+  });
+  await closeRefreshRunContext(run);
+  return publicRefreshRunFromRecord(run);
+}
+
+async function closeRefreshRunContext(run) {
+  const context = run?.refreshContext;
+  if (!context?.webdriverSession) return;
+  try {
+    await closeWebdriverSession(context.webdriverSession);
+  } catch {
+    // Best-effort cancellation; the job loop checks cancelRequested between jobs.
+  }
+}
+
 async function runRefreshJobsByIds(ids, options = {}) {
   const requestedIds = Array.isArray(ids) ? ids.map((id) => String(id)) : [];
   const requested = new Set(requestedIds);
@@ -3194,50 +3373,94 @@ async function runRefreshJobsBatch(jobs, options = {}) {
   const runnableJobs = jobs
     .filter((job) => options.force || job.enabled)
     .filter((job) => !isInvalidTeamsRootRefreshJob(job));
-  const groups = await buildRefreshGroups(runnableJobs, options);
+  const queuedIds = [];
+  for (const job of runnableJobs) {
+    if (refreshRuntime.running.has(job.id) || refreshRuntime.queued.has(job.id)) continue;
+    refreshRuntime.queued.add(job.id);
+    queuedIds.push(job.id);
+  }
+  const jobsToRun = runnableJobs.filter((job) => queuedIds.includes(job.id));
+  const groups = await buildRefreshGroups(jobsToRun, options);
   const results = [];
   const contentResults = [];
   const startedAt = new Date().toISOString();
+  const run = options.run || null;
+  if (run) updateRefreshRun(run, { totalJobs: jobsToRun.length, queuedJobIds: jobsToRun.map((job) => job.id) });
 
-  for (const group of groups) {
-    let refreshContext = null;
-    const refreshedUrls = new Set(group.jobs.map((job) => normalizeUrlForMatch(job.url)).filter(Boolean));
-    try {
-      refreshContext = await createRefreshGroupContext(group);
-      await verifyRefreshGroupAuthentication(group, refreshContext);
-      for (const job of group.jobs) {
-        try {
-          const result = await runRefreshJob(job, { refreshContext });
-          results.push({ id: job.id, status: result.status || "ok", result });
-          rememberRefreshedContentUrls(refreshedUrls, result);
-        } catch (error) {
+  try {
+    for (const group of groups) {
+      if (run?.cancelRequested) break;
+      let refreshContext = null;
+      const refreshedUrls = new Set(group.jobs.map((job) => normalizeUrlForMatch(job.url)).filter(Boolean));
+      try {
+        refreshContext = await createRefreshGroupContext(group, run);
+        if (run) updateRefreshRun(run, { refreshContext });
+        await verifyRefreshGroupAuthentication(group, refreshContext);
+        for (const job of group.jobs) {
+          if (run?.cancelRequested) break;
+          try {
+            if (run) updateRefreshRun(run, { currentJobId: job.id, currentJobName: job.name || job.id });
+            const result = await runRefreshJob(job, { refreshContext, run });
+            results.push({ id: job.id, status: result.status || "ok", result });
+            rememberRefreshedContentUrls(refreshedUrls, result);
+          } catch (error) {
+            if (isAuthenticationRequiredError(error)) {
+              keepRefreshGroupOpenForLogin(refreshContext);
+              throw error;
+            }
+            results.push({
+              id: job.id,
+              status: "failed",
+              error: error.message || String(error),
+              result: failedRefreshJobResult(job, error)
+            });
+          } finally {
+            if (run) {
+              const completedJobs = results.filter((entry) => entry.status !== "running").length;
+              const failedJobs = results.filter((entry) => entry.status === "failed").length;
+              updateRefreshRun(run, { completedJobs, failedJobs });
+            }
+          }
+        }
+      } catch (error) {
+        if (isAuthenticationRequiredError(error)) {
+          keepRefreshGroupOpenForLogin(refreshContext);
+        }
+        for (const job of group.jobs) {
+          if (results.some((entry) => entry.id === job.id)) continue;
+          await markRefreshJobFailed(job, error);
           results.push({
             id: job.id,
             status: "failed",
-            error: error.message || String(error)
+            error: error.message || String(error),
+            result: failedRefreshJobResult(job, error)
           });
         }
-      }
-    } catch (error) {
-      for (const job of group.jobs) {
-        if (results.some((entry) => entry.id === job.id)) continue;
-        await markRefreshJobFailed(job, error);
-        results.push({
-          id: job.id,
-          status: "failed",
-          error: error.message || String(error)
-        });
-      }
     } finally {
+      updateRefreshRun(run, { refreshContext: null });
       await closeRefreshGroupContext(refreshContext);
     }
-  }
+    }
 
-  const aiProcessing = await processUpdatedItemsAfterRefresh(results);
-  await annotateRefreshResultsWithAiProcessing(results, aiProcessing);
-  const summary = summarizeRefreshBatch(results, startedAt, groups, contentResults, aiProcessing);
-  await notifyRefreshBatchResult(summary);
-  return summary;
+    const aiProcessing = await processUpdatedItemsAfterRefresh(results);
+    await annotateRefreshResultsWithAiProcessing(results, aiProcessing);
+    const summary = summarizeRefreshBatch(results, startedAt, groups, contentResults, aiProcessing);
+    if (run?.cancelRequested) {
+      summary.canceled = true;
+      summary.errorCount = Number(summary.errorCount || 0) + 1;
+    }
+    await notifyRefreshBatchResult(summary);
+    return summary;
+  } finally {
+    for (const id of queuedIds) refreshRuntime.queued.delete(id);
+  }
+}
+
+function keepRefreshGroupOpenForLogin(refreshContext) {
+  if (!refreshContext?.webdriverSession) return;
+  refreshContext.closeWhenDone = false;
+  refreshContext.webdriverSession.manual = true;
+  refreshContext.webdriverSession.autoClose = false;
 }
 
 async function markRefreshJobFailed(job, error) {
@@ -3246,8 +3469,52 @@ async function markRefreshJobFailed(job, error) {
   await updateRefreshJobState(job.id, {
     status: unreachable ? "unreachable" : "failed",
     lastRunAt: new Date().toISOString(),
-    lastError
+    lastError,
+    lastResult: failedRefreshJobResult(job, lastError)
   });
+}
+
+function failedRefreshJobResult(job, error) {
+  const message = typeof error === "string" ? error : error?.message || String(error || "unknown error");
+  return {
+    id: job?.id || "",
+    sourceType: detectSourceAdapter(job?.url || "").sourceType,
+    failedAt: new Date().toISOString(),
+    linkCount: job?.pageKind === "content" ? 1 : 0,
+    updatedItemCount: 0,
+    skippedItemCount: 0,
+    errorCount: 1,
+    updatedItems: [],
+    skippedItems: [],
+    errors: [{ url: job?.url || "", error: message }]
+  };
+}
+
+function isRefreshJobActive(id) {
+  return refreshRuntime.running.has(id) || refreshRuntime.queued.has(id);
+}
+
+async function reconcileStaleRunningRefreshJobs() {
+  const staleJobs = (settings.refreshJobs || []).filter((job) => job.status === "running" && !isRefreshJobActive(job.id));
+  if (!staleJobs.length) return 0;
+  const now = new Date().toISOString();
+  settings = {
+    ...settings,
+    refreshJobs: (settings.refreshJobs || []).map((job) => {
+      if (!staleJobs.some((stale) => stale.id === job.id)) return job;
+      const error = "刷新任务已中断：服务重启或浏览器会话结束，已自动恢复为失败状态。";
+      return {
+        ...job,
+        status: "failed",
+        lastRunAt: job.lastRunAt || now,
+        lastError: job.lastError || error,
+        lastResult: failedRefreshJobResult(job, job.lastError || error)
+      };
+    })
+  };
+  await fs.mkdir(configDir, { recursive: true });
+  await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  return staleJobs.length;
 }
 
 function groupRefreshJobsBySource(jobs) {
@@ -3291,7 +3558,7 @@ async function createRefreshGroupContext(group) {
   const sessionUrl = group.sourceType === "teams" ? `https://${adapter.hostname}` : targetUrl;
   const session = await ensureWebdriverSession(adapter.hostname, sessionUrl, {
     autoClose: false,
-    windowMode: group.sourceType === "teams" ? "normal" : undefined
+    windowMode: group.sourceType === "teams" || group.sourceType === "jira" ? "normal" : undefined
   });
   const page = await ensureSessionPage(session);
   session.page = page;
@@ -3327,6 +3594,7 @@ function shouldPrecheckAuthentication(adapter) {
 
 async function verifyWebdriverAuthentication(page, url, adapter) {
   await navigateWebdriverPage(page, url, adapter);
+  await ensureWebdriverPageAuthenticated(page, url, adapter);
   try {
     await page.waitForLoadState("networkidle", { timeout: 5000 });
   } catch {
@@ -3340,6 +3608,102 @@ async function verifyWebdriverAuthentication(page, url, adapter) {
     title: await page.title(),
     raw
   });
+}
+
+async function ensureWebdriverPageAuthenticated(page, url, adapter) {
+  if (adapter.sourceType !== "jira") return;
+  let raw = await page.content();
+  let login = detectAuthenticationPage({
+    adapter,
+    requestedUrl: url,
+    finalUrl: page.url(),
+    title: await page.title(),
+    raw
+  });
+  if (!login) return;
+
+  const loggedIn = await loginJiraWithWebdriver(page, url, adapter);
+  if (!loggedIn) return;
+
+  raw = await page.content();
+  login = detectAuthenticationPage({
+    adapter,
+    requestedUrl: url,
+    finalUrl: page.url(),
+    title: await page.title(),
+    raw
+  });
+  if (!login) return;
+
+  await navigateWebdriverPage(page, url, adapter);
+}
+
+async function loginJiraWithWebdriver(page, returnUrl, adapter) {
+  const profile = settings.sources?.[adapter.hostname] || {};
+  if (profile.authMode !== "basic" || !profile.username || !profile.password) return false;
+
+  await navigateWebdriverPage(page, jiraLoginUrl(returnUrl, adapter), adapter);
+  let username = page.locator("input[name='os_username']:visible, input#login-form-username:visible").first();
+  try {
+    await username.waitFor({ state: "visible", timeout: 6000 });
+  } catch {
+    await clickJiraLoginLink(page);
+    username = page.locator("input[name='os_username']:visible, input#login-form-username:visible").first();
+    try {
+      await username.waitFor({ state: "visible", timeout: 8000 });
+    } catch {
+      return false;
+    }
+  }
+
+  const password = page.locator("input[name='os_password']:visible, input#login-form-password:visible").first();
+  await username.fill(profile.username, { timeout: 5000 });
+  await password.fill(profile.password, { timeout: 5000 });
+  await page.locator("input[name='os_cookie']:visible, input#login-form-remember-me:visible").first().check({ timeout: 2000 }).catch(() => {});
+  const submit = page.locator("input#login-form-submit:visible, input[name='login']:visible, input[value='Log In']:visible, button[type='submit']:visible").first();
+  await Promise.all([
+    page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {}),
+    submit.click({ timeout: 3000 }).catch(() => password.press("Enter", { timeout: 5000 }))
+  ]);
+  try {
+    await page.waitForLoadState("networkidle", { timeout: 5000 });
+  } catch {
+    // Jira often keeps background requests open.
+  }
+  if (normalizeUrlForMatch(page.url()) !== normalizeUrlForMatch(returnUrl)) {
+    await navigateWebdriverPage(page, returnUrl, adapter);
+  }
+  return true;
+}
+
+async function clickJiraLoginLink(page) {
+  const candidates = [
+    ".login-link",
+    "a[href*='login.jsp']",
+    "text=Log In",
+    "text=Log in"
+  ];
+  for (const selector of candidates) {
+    try {
+      const target = page.locator(selector).first();
+      await target.click({ timeout: 3000 });
+      await page.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => {});
+      return true;
+    } catch {
+      // Try the next login affordance.
+    }
+  }
+  return false;
+}
+
+function jiraLoginUrl(returnUrl, adapter) {
+  try {
+    const target = new URL(returnUrl);
+    const destination = `${target.pathname}${target.search}${target.hash}`;
+    return `https://${adapter.hostname}/login.jsp?os_destination=${encodeURIComponent(destination)}`;
+  } catch {
+    return `https://${adapter.hostname}/login.jsp`;
+  }
 }
 
 async function prepareTeamsRefreshGroup(page, adapter) {
@@ -3526,6 +3890,7 @@ async function runRefreshJob(job, options = {}) {
     return { id: job.id, status: "running" };
   }
 
+  refreshRuntime.queued.delete(job.id);
   refreshRuntime.running.add(job.id);
   const startedAt = new Date().toISOString();
   await updateRefreshJobState(job.id, {
@@ -3535,9 +3900,11 @@ async function runRefreshJob(job, options = {}) {
   });
 
   try {
-    const result = job.pageKind === "content"
-      ? await refreshContentJob({ ...job, lastStartedAt: startedAt }, options.refreshContext)
-      : await refreshListJob({ ...job, lastStartedAt: startedAt }, options.refreshContext);
+    const result = await withRefreshJobTimeout(job, options.run, async () => (
+      job.pageKind === "content"
+        ? await refreshContentJob({ ...job, lastStartedAt: startedAt }, options.refreshContext)
+        : await refreshListJob({ ...job, lastStartedAt: startedAt }, options.refreshContext)
+    ));
     await updateRefreshJobState(job.id, {
       status: "idle",
       lastRunAt: new Date().toISOString(),
@@ -3551,7 +3918,8 @@ async function runRefreshJob(job, options = {}) {
     await updateRefreshJobState(job.id, {
       status: unreachable ? "unreachable" : "failed",
       lastRunAt: new Date().toISOString(),
-      lastError
+      lastError,
+      lastResult: failedRefreshJobResult(job, lastError)
     });
     if (unreachable) {
       const friendlyError = new Error(lastError);
@@ -3561,6 +3929,27 @@ async function runRefreshJob(job, options = {}) {
     throw error;
   } finally {
     refreshRuntime.running.delete(job.id);
+  }
+}
+
+async function withRefreshJobTimeout(job, run, task) {
+  let timer;
+  let timedOut = false;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(async () => {
+      timedOut = true;
+      const error = new Error(`刷新任务超时：${job.name || job.id} 超过 ${Math.round(REFRESH_JOB_TIMEOUT_MS / 60000)} 分钟未完成。`);
+      error.code = "REFRESH_JOB_TIMEOUT";
+      if (run) updateRefreshRun(run, { error: error.message });
+      await closeRefreshRunContext(run);
+      reject(error);
+    }, REFRESH_JOB_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([task(), timeout]);
+  } finally {
+    clearTimeout(timer);
+    if (timedOut && run) updateRefreshRun(run, { status: "failed" });
   }
 }
 
@@ -3849,15 +4238,73 @@ async function refreshJiraFilterJob(job) {
 
 async function fetchForRefreshJob(url, job, adapter = detectSourceAdapter(url), refreshContext = null) {
   if (resolvedRefreshFetchMode(job, adapter) === "webdriver") {
-    return fetchUrlWithWebdriver(url, {
-      pageKind: job.pageKind || "auto",
-      session: refreshContext?.webdriverSession,
-      page: refreshContext?.webdriverPage,
-      maxGithubExpansionPasses: resolvePageKind(url, job.pageKind || "auto") === "content" ? 3 : 0,
-      existingGithubComments: await readExistingGithubComments(url, adapter)
-    });
+    return fetchUrlWithWebdriverForRefresh(url, job, adapter, refreshContext);
   }
   return fetchUrl(url, { pageKind: job.pageKind || "auto" });
+}
+
+async function fetchUrlWithWebdriverForRefresh(url, job, adapter = detectSourceAdapter(url), refreshContext = null) {
+  const existingGithubComments = await readExistingGithubComments(url, adapter);
+  const options = {
+    pageKind: job.pageKind || "auto",
+    session: refreshContext?.webdriverSession,
+    page: refreshContext?.webdriverPage,
+    maxGithubExpansionPasses: resolvePageKind(url, job.pageKind || "auto") === "content" ? 3 : 0,
+    existingGithubComments
+  };
+  try {
+    const fetched = await fetchUrlWithWebdriver(url, options);
+    validateFetchedGithubNotRegressed(url, adapter, fetched, existingGithubComments);
+    return fetched;
+  } catch (error) {
+    if (!isRetryableWebdriverError(error) || adapter.sourceType !== "github") throw error;
+    await resetRefreshWebdriverContext(refreshContext);
+    const retryOptions = {
+      ...options,
+      session: refreshContext?.webdriverSession,
+      page: refreshContext?.webdriverPage
+    };
+    const fetched = await fetchUrlWithWebdriver(url, retryOptions);
+    validateFetchedGithubNotRegressed(url, adapter, fetched, existingGithubComments);
+    return fetched;
+  }
+}
+
+function validateFetchedGithubNotRegressed(url, adapter, fetched, existingComments = []) {
+  if (adapter.sourceType !== "github") return;
+  if (resolvePageKind(url, "auto") !== "content") return;
+  const previousCount = Array.isArray(existingComments) ? existingComments.length : 0;
+  const nextCount = Array.isArray(fetched?.comments) ? fetched.comments.length : 0;
+  if (previousCount < 5) return;
+  if (nextCount >= Math.max(3, Math.floor(previousCount * 0.4))) return;
+  throw new Error([
+    "GitHub 抓取到的评论数量明显少于已有内容，已跳过覆盖以避免资料变少。",
+    `已有 ${previousCount} 条，本次 ${nextCount} 条。`,
+    "请确认 GitHub 登录状态和页面加载完成后再刷新。"
+  ].join(" "));
+}
+
+function isRetryableWebdriverError(error) {
+  const message = String(error?.message || error || "");
+  return /Target page.*closed|Target context.*closed|browser has been closed|Failed to open a new tab|Target\.createTarget|Timeout|Execution context was destroyed|frame was detached|ERR_ABORTED/i.test(message);
+}
+
+async function resetRefreshWebdriverContext(refreshContext) {
+  if (!refreshContext?.webdriverSession) return;
+  const session = refreshContext.webdriverSession;
+  const hostname = session.hostname;
+  const url = session.page && !session.page.isClosed() ? session.page.url() : `https://${hostname}`;
+  try {
+    await closeWebdriverSession(session);
+  } catch {
+    // Best-effort reset before retrying the GitHub fetch.
+  }
+  const next = await ensureWebdriverSession(hostname, url, {
+    autoClose: false,
+    windowMode: session.windowMode
+  });
+  refreshContext.webdriverSession = next;
+  refreshContext.webdriverPage = await ensureSessionPage(next);
 }
 
 async function readExistingGithubComments(url, adapter = detectSourceAdapter(url)) {
@@ -4035,9 +4482,20 @@ async function fetchUrl(url, options = {}) {
     "User-Agent": "MaterialOrganizer/0.1",
     ...buildAuthHeaders(url)
   };
-  const response = await fetch(url, {
-    headers
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Number(options.timeoutMs || FETCH_TIMEOUT_MS));
+  let response;
+  try {
+    response = await fetch(url, {
+      headers,
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error(`Fetch timed out after ${Math.round((Number(options.timeoutMs || FETCH_TIMEOUT_MS)) / 1000)}s: ${url}`);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 
   if (!response.ok) {
     throw new Error(`Could not fetch URL: ${response.status} ${response.statusText}`);
@@ -4093,8 +4551,15 @@ async function fetchUrlWithWebdriver(url, options = {}) {
           // Best-effort reset; the target navigation below still loads fresh.
         }
       }
+    } else if (adapter.sourceType === "github" && resolvePageKind(url, options.pageKind || "auto") === "content") {
+      try {
+        await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: 10000 });
+      } catch {
+        // Best-effort reset to avoid stale GitHub SPA state before the next issue/PR.
+      }
     }
     await navigateWebdriverPage(page, navigationUrl, adapter);
+    await ensureWebdriverPageAuthenticated(page, navigationUrl, adapter);
     await waitForJiraIssueNavigator(page, adapter, options.pageKind || "auto");
     await expandGithubDynamicContent(page, adapter, options.pageKind || "auto", {
       maxPasses: options.maxGithubExpansionPasses,
@@ -4157,7 +4622,8 @@ function detectAuthenticationPage({ adapter, finalUrl, title, raw }) {
   if (adapter.sourceType === "jira") {
     const jiraLogin = /\/login\.jsp$/i.test(pathname)
       || /^Log in\b.*\bJIRA$/i.test(pageTitle)
-      || /name=["']os_username["']|id=["']login-form["']|class=["'][^"']*\blogin-link\b/i.test(html);
+      || /name=["']os_username["']|id=["']login-form["']|class=["'][^"']*\blogin-link\b/i.test(html)
+      || isJiraAnonymousPage(html);
     if (jiraLogin) return { sourceName: "Jira", finalUrl };
   }
   if (adapter.sourceType === "confluence") {
@@ -4173,6 +4639,24 @@ function detectAuthenticationPage({ adapter, finalUrl, title, raw }) {
     if (githubLogin) return { sourceName: "GitHub", finalUrl };
   }
   return null;
+}
+
+function isJiraAnonymousPage(html) {
+  if (extractJiraIssues(html, "").length > 0) return false;
+  const remoteUser = extractMetaContent(html, "ajs-remote-user") || extractMetaContentLoose(html, "ajs-remote-user");
+  if (remoteUser) return false;
+  return /class=["'][^"']*\blogin-link\b|href=["'][^"']*login\.jsp|>\s*Log In\s*<|data-username=["']anonymous["']|ajaxUnauthorised|not authorized/i.test(String(html || ""));
+}
+
+function extractMetaContentLoose(html, name) {
+  const source = String(html || "");
+  const tags = source.match(/<meta\b[^>]*>/gi) || [];
+  for (const tag of tags) {
+    if (!new RegExp(`\\b(?:name|id)=["']${escapeRegExp(name)}["']`, "i").test(tag)) continue;
+    const content = tag.match(/\bcontent=["']([^"']*)["']/i)?.[1] || "";
+    if (content) return decodeHtml(content);
+  }
+  return "";
 }
 
 async function navigateWebdriverPage(page, navigationUrl, adapter) {
@@ -5397,6 +5881,15 @@ function extractJiraFilterPage(html, url, adapter) {
   const filterId = extractFilterId(url);
   const issues = extractJiraIssues(html, url);
   const isAnonymous = issues.length === 0 && (!remoteUser || /login-link|Log In|ajaxUnauthorised|not authorized/i.test(html));
+  if (isAnonymous) {
+    assertFetchedPageIsAuthenticated({
+      adapter,
+      requestedUrl: url,
+      finalUrl: url,
+      title,
+      raw: html
+    });
+  }
   const lines = [
     `# ${title}`,
     "",

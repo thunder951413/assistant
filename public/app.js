@@ -29,9 +29,20 @@ const state = {
   homeSourceRefresh: {
     confirmSource: "",
     runningSource: "",
+    runId: "",
+    requestToken: "",
     startedAt: "",
     total: 0,
     completed: 0,
+    failed: 0,
+    message: "",
+    pollErrorCount: 0,
+    pollTimer: null,
+    timeoutAt: 0
+  },
+  activeRefreshRun: {
+    id: "",
+    scope: "",
     pollTimer: null
   },
   seenRefreshRunKey: localStorage.getItem("materialOrganizer.seenRefreshRunKey") || "",
@@ -559,11 +570,13 @@ function renderHomeRefreshTasks(jobs) {
       ? Math.round((runningCompleted / runningTotal) * 100)
       : summary.progress;
     const progressText = isRunning
-      ? `${runningCompleted}/${runningTotal}`
+      ? `${runningCompleted}/${runningTotal}${state.homeSourceRefresh.failed ? ` · 失败 ${state.homeSourceRefresh.failed}` : ""}`
       : summaryRunning ? "运行中" : `${summary.progress}%`;
     const trackClass = isRunning ? "is-running" : summaryRunning ? "is-indeterminate" : "";
     const barStyle = (isRunning || summaryRunning) ? "" : `width: ${escapeHtml(String(progress))}%`;
-    const status = isRunning ? { kind: "running", label: "运行中" } : summary.status;
+    const status = isRunning
+      ? { kind: state.homeSourceRefresh.failed ? "warning" : "running", label: state.homeSourceRefresh.message || "运行中" }
+      : summary.status;
     return `
       <tr>
         <td>
@@ -705,15 +718,20 @@ function sourceSummaryStatus(group) {
 async function refreshHomeSource(source, options = {}) {
   const jobsToRun = (state.refreshJobs || []).filter((job) => sourceTypeForSubscription(job) === source);
   const startedAt = new Date().toISOString();
+  const token = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   state.homeSourceRefresh.confirmSource = "";
   state.homeSourceRefresh.runningSource = source;
+  state.homeSourceRefresh.requestToken = token;
   state.homeSourceRefresh.startedAt = startedAt;
   state.homeSourceRefresh.total = jobsToRun.length;
   state.homeSourceRefresh.completed = 0;
-  startHomeSourceRefreshPolling(source, startedAt, jobsToRun.length);
+  state.homeSourceRefresh.failed = 0;
+  state.homeSourceRefresh.message = "启动刷新中";
+  state.homeSourceRefresh.pollErrorCount = 0;
+  state.homeSourceRefresh.timeoutAt = Date.now() + 10 * 60 * 1000;
   renderHomeOverview();
   if (!jobsToRun.length) {
-    resetHomeSourceRefreshState();
+    resetHomeSourceRefreshState(token);
     renderHomeOverview();
     return;
   }
@@ -721,41 +739,75 @@ async function refreshHomeSource(source, options = {}) {
   try {
     if (options.clearFirst) {
       const { jobs } = await api(`/api/refresh-jobs/source/${encodeURIComponent(source)}/items`, { method: "DELETE" });
+      if (state.homeSourceRefresh.requestToken !== token) return;
       state.refreshJobs = jobs || state.refreshJobs;
       renderHomeOverview();
     }
-    const { jobs } = await api("/api/refresh-jobs/run-batch", {
+    const { run, jobs } = await api("/api/refresh-jobs/run-batch?background=1", {
       method: "POST",
       body: JSON.stringify({
         ids: jobsToRun.map((job) => job.id),
-        sourceType: source
+        sourceType: source,
+        background: true
       })
     });
-    state.refreshJobs = jobs || [];
-    renderRefreshJobs(state.refreshJobs);
-    await loadMaterialUpdateCount();
+    if (state.homeSourceRefresh.requestToken !== token) return;
+    state.homeSourceRefresh.runId = run?.id || "";
+    state.homeSourceRefresh.message = "运行中";
+    state.refreshJobs = jobs || state.refreshJobs;
+    startHomeSourceRefreshPolling(source, startedAt, jobsToRun.length, token, run?.id || "");
+    renderHomeOverview();
   } catch (error) {
+    if (state.homeSourceRefresh.requestToken !== token) return;
     console.warn(`Failed to refresh ${source}:`, error);
+    state.homeSourceRefresh.message = error.message || "刷新启动失败";
+    state.homeSourceRefresh.failed = jobsToRun.length;
     await loadSettings();
-  } finally {
-    resetHomeSourceRefreshState();
+    resetHomeSourceRefreshState(token);
     renderHomeOverview();
   }
 }
 
-function startHomeSourceRefreshPolling(source, startedAt, total) {
+function startHomeSourceRefreshPolling(source, startedAt, total, token = state.homeSourceRefresh.requestToken, runId = state.homeSourceRefresh.runId) {
   stopHomeSourceRefreshPolling();
   state.homeSourceRefresh.pollTimer = setInterval(async () => {
+    if (state.homeSourceRefresh.requestToken !== token) return stopHomeSourceRefreshPolling();
     try {
-      const { jobs } = await api("/api/refresh-jobs");
+      const payload = runId ? await api(`/api/refresh-runs/${encodeURIComponent(runId)}`) : await api("/api/refresh-jobs");
+      const run = payload.run || null;
+      const jobs = run?.jobs || payload.jobs || state.refreshJobs;
       state.refreshJobs = jobs || state.refreshJobs;
       const sourceJobs = (state.refreshJobs || []).filter((job) => sourceTypeForSubscription(job) === source);
-      const completed = sourceJobs.filter((job) => job.lastRunAt && job.lastRunAt >= startedAt).length;
-      state.homeSourceRefresh.total = total || sourceJobs.length;
+      const completed = run ? Number(run.completedJobs || 0) : sourceJobs.filter((job) => job.lastRunAt && job.lastRunAt >= startedAt).length;
+      const failed = run ? Number(run.failedJobs || 0) : sourceJobs.filter((job) => ["failed", "unreachable"].includes(job.status) && job.lastRunAt && job.lastRunAt >= startedAt).length;
+      const active = sourceJobs.some((job) => job.running);
+      state.homeSourceRefresh.total = run?.totalJobs || total || sourceJobs.length;
       state.homeSourceRefresh.completed = completed;
+      state.homeSourceRefresh.failed = failed;
+      state.homeSourceRefresh.pollErrorCount = 0;
+      state.homeSourceRefresh.message = runStatusText(run) || (active ? "运行中" : failed ? "有失败" : "刷新完成");
+      renderRefreshJobs(state.refreshJobs);
       renderHomeOverview();
+      const terminal = run && ["completed", "failed", "canceled"].includes(run.status);
+      if (terminal || (!active && completed + failed >= Math.max(1, Number(state.homeSourceRefresh.total || 0)))) {
+        await loadMaterialUpdateCount();
+        resetHomeSourceRefreshState(token);
+        renderHomeOverview();
+      } else if (Date.now() > state.homeSourceRefresh.timeoutAt) {
+        state.homeSourceRefresh.message = "已切换后台监控";
+        resetHomeSourceRefreshState(token, { keepJobs: true });
+        renderHomeOverview();
+      }
     } catch (error) {
+      state.homeSourceRefresh.pollErrorCount += 1;
+      state.homeSourceRefresh.message = "进度同步失败";
       console.warn(`Failed to poll ${source} refresh progress:`, error);
+      if (state.homeSourceRefresh.pollErrorCount >= 5) {
+        resetHomeSourceRefreshState(token, { keepJobs: true });
+        renderHomeOverview();
+      } else {
+        renderHomeOverview();
+      }
     }
   }, 1000);
 }
@@ -766,16 +818,36 @@ function stopHomeSourceRefreshPolling() {
   state.homeSourceRefresh.pollTimer = null;
 }
 
-function resetHomeSourceRefreshState() {
+function resetHomeSourceRefreshState(token = state.homeSourceRefresh.requestToken, options = {}) {
+  if (token && state.homeSourceRefresh.requestToken && token !== state.homeSourceRefresh.requestToken) return;
   stopHomeSourceRefreshPolling();
   state.homeSourceRefresh.runningSource = "";
+  state.homeSourceRefresh.runId = "";
+  state.homeSourceRefresh.requestToken = "";
   state.homeSourceRefresh.startedAt = "";
   state.homeSourceRefresh.total = 0;
   state.homeSourceRefresh.completed = 0;
+  state.homeSourceRefresh.failed = 0;
+  state.homeSourceRefresh.pollErrorCount = 0;
+  state.homeSourceRefresh.timeoutAt = 0;
+  if (!options.keepJobs) state.homeSourceRefresh.message = "";
+}
+
+function runStatusText(run) {
+  if (!run) return "";
+  if (run.status === "queued") return "排队中";
+  if (run.status === "running") return run.currentJobName ? `运行中：${run.currentJobName}` : "运行中";
+  if (run.status === "canceling") return "正在取消";
+  if (run.status === "canceled") return "已取消";
+  if (run.status === "failed") return run.error || "刷新失败";
+  if (run.status === "completed") return "刷新完成";
+  return run.status || "";
 }
 
 function homeRefreshJobProgress(job) {
+  if (job.running) return { percent: 0 };
   if (job.status === "failed" || job.status === "unreachable") return { percent: 0 };
+  if (job.status === "running" && !job.running) return { percent: 0 };
   if (job.lastResult) {
     const total = Number(job.lastResult.linkCount ?? job.lastResult.issueCount ?? 0);
     const skipped = Number(job.lastResult.skippedItemCount || 0);
@@ -789,6 +861,7 @@ function homeRefreshJobProgress(job) {
 
 function homeRefreshJobStatus(job) {
   if (job.running) return { kind: "running", label: "运行中" };
+  if (job.status === "running") return { kind: "warning", label: "可能中断" };
   if (job.status === "failed" || job.status === "unreachable") return { kind: "failed", label: "失败" };
   if (!job.enabled) return { kind: "skipped", label: "跳过" };
   if (job.lastError) return { kind: "warning", label: "警告" };
@@ -797,6 +870,9 @@ function homeRefreshJobStatus(job) {
 }
 
 function homeRefreshJobDelta(job) {
+  if (job.status === "failed" || job.status === "unreachable" || job.status === "running") {
+    return { changed: false, text: "- / -", updated: 0, total: 0 };
+  }
   const updated = Number(job.lastResult?.updatedItemCount ?? job.lastResult?.updatedIssueCount ?? 0);
   const total = Number(job.lastResult?.linkCount ?? job.lastResult?.issueCount ?? 0);
   if (!job.lastResult) return { changed: false, text: "- / -", updated: 0, total: 0 };
@@ -2924,7 +3000,7 @@ function renderRefreshJobs(jobs) {
           <strong>${escapeHtml(job.name)}</strong>
         </label>
         <div class="refresh-job-actions">
-          <button type="button" data-run-job="${escapeHtml(job.id)}">${job.running ? "运行中" : "立即刷新"}</button>
+          <button type="button" data-run-job="${escapeHtml(job.id)}" ${job.running ? "disabled" : ""}>${job.running ? "运行中" : "立即刷新"}</button>
           ${isManagedContentPageJob(job) ? "" : `
             <button type="button" class="danger-button" data-clear-job-items="${escapeHtml(job.id)}">清空内容</button>
             <button type="button" class="danger-button" data-delete-job="${escapeHtml(job.id)}">删除</button>
@@ -2953,7 +3029,7 @@ function renderRefreshJobs(jobs) {
         状态：${escapeHtml(formatRefreshStatus(job.running ? "running" : job.status || "idle"))} · 上次刷新：${escapeHtml(job.lastRunAt ? formatDate(job.lastRunAt) : "未刷新")}
       </div>
       ${job.lastError ? `<div class="item-meta">错误：${escapeHtml(job.lastError)}</div>` : ""}
-      ${job.lastResult ? `<div class="item-meta">结果：更新 ${escapeHtml(job.lastResult.updatedItemCount ?? job.lastResult.updatedIssueCount ?? 0)} / ${escapeHtml(job.lastResult.linkCount ?? job.lastResult.issueCount ?? 0)} 个内容页，跳过 ${escapeHtml(job.lastResult.skippedItemCount || 0)} 个</div>` : ""}
+      ${job.lastResult && !["failed", "unreachable", "running"].includes(job.status) ? `<div class="item-meta">结果：更新 ${escapeHtml(job.lastResult.updatedItemCount ?? job.lastResult.updatedIssueCount ?? 0)} / ${escapeHtml(job.lastResult.linkCount ?? job.lastResult.issueCount ?? 0)} 个内容页，跳过 ${escapeHtml(job.lastResult.skippedItemCount || 0)}</div>` : ""}
       <input data-field="fetchMode" type="hidden" value="${escapeHtml(job.fetchMode || "auto")}" />
       <input data-field="pageKind" type="hidden" value="${escapeHtml(job.pageKind || "list")}" />
     </section>
@@ -2996,7 +3072,7 @@ function renderContentPageRefreshGroup(contentJobs) {
           <strong>普通页面整体刷新</strong>
         </label>
         <div class="refresh-job-actions">
-          <button type="button" data-run-content-pages>${running ? "运行中" : "立即刷新"}</button>
+          <button type="button" data-run-content-pages ${running ? "disabled" : ""}>${running ? "运行中" : "立即刷新"}</button>
         </div>
       </div>
       <div class="settings-grid">
@@ -3105,7 +3181,8 @@ function formatRefreshStatus(status) {
     idle: "空闲",
     running: "运行中",
     failed: "失败",
-    unreachable: "网络不可达"
+    unreachable: "网络不可达",
+    canceled: "已取消"
   }[status] || status;
 }
 
@@ -3178,18 +3255,12 @@ async function saveSubscriptions() {
 
 async function runRefreshJob(id) {
   syncRefreshJobsFromDom();
-  refreshJobStatus.textContent = "正在刷新过滤页和列表中的内容页...";
+  const job = state.refreshJobs.find((candidate) => candidate.id === id);
+  refreshJobStatus.textContent = "正在启动刷新任务...";
   try {
-    const { result, jobs } = await api(`/api/refresh-jobs/${encodeURIComponent(id)}/run`, { method: "POST" });
-    renderRefreshJobs(jobs || []);
-    const updated = Number(result.updatedItemCount ?? result.updatedIssueCount ?? 0);
-    const newCount = Number(result.newItemCount || 0);
-    const aiFailed = Number(result.aiProcessErrorCount || 0);
-    refreshJobStatus.textContent = `刷新完成：更新 ${updated} / ${result.linkCount ?? result.issueCount ?? 0} 个内容页，AI 已整理 ${newCount} 个，AI 失败 ${aiFailed} 个，跳过 ${result.skippedItemCount || 0} 个，失败 ${result.errorCount} 个。`;
-    if (state.view === "materials") {
-      await loadAll();
-    }
-    scheduleReloadAfterRefreshUpdates(newCount);
+    const { run, jobs } = await api(`/api/refresh-jobs/${encodeURIComponent(id)}/run?background=1`, { method: "POST" });
+    renderRefreshJobs(jobs || state.refreshJobs);
+    await monitorSubscriptionRefreshRun(run, `正在刷新 ${job?.name || id}`);
   } catch (error) {
     refreshJobStatus.textContent = error.message;
     await loadSettings();
@@ -3202,35 +3273,22 @@ async function runAllRefreshJobs() {
 
   runAllSubscriptionsButton.disabled = true;
   saveSubscriptionsButton.disabled = true;
-  let updated = 0;
-  let total = 0;
-  let skipped = 0;
-  let failed = 0;
   try {
     const sourceLabel = subscriptionSourceLabel(state.subscriptionSource);
     refreshJobStatus.textContent = jobsToRun.length
-      ? `正在刷新 ${sourceLabel} ${jobsToRun.length} 个任务...`
+      ? `正在启动 ${sourceLabel} ${jobsToRun.length} 个任务...`
       : `当前分类下没有可刷新的任务。`;
     if (!jobsToRun.length) return;
-    const { result, jobs } = await api("/api/refresh-jobs/run-batch", {
+    const { run, jobs } = await api("/api/refresh-jobs/run-batch?background=1", {
       method: "POST",
       body: JSON.stringify({
         ids: jobsToRun.map((job) => job.id),
-        sourceType: state.subscriptionSource
+        sourceType: state.subscriptionSource,
+        background: true
       })
     });
-    renderRefreshJobs(jobs || []);
-    updated = Number(result.updatedItemCount ?? result.updatedIssueCount ?? 0);
-    const newCount = Number(result.newItemCount || 0);
-    const aiFailed = Number(result.aiProcessErrorCount || 0);
-    total = Number(result.linkCount ?? result.issueCount ?? 0);
-    skipped = Number(result.skippedItemCount || 0);
-    failed = Number(result.errorCount || 0);
-    refreshJobStatus.textContent = `全部刷新完成：更新 ${updated} / ${total} 个内容页，AI 已整理 ${newCount} 个，AI 失败 ${aiFailed} 个，跳过 ${skipped} 个，失败 ${failed} 个。`;
-    if (state.view === "materials") {
-      await loadAll();
-    }
-    scheduleReloadAfterRefreshUpdates(newCount);
+    renderRefreshJobs(jobs || state.refreshJobs);
+    await monitorSubscriptionRefreshRun(run, `正在刷新 ${sourceLabel}`);
   } catch (error) {
     refreshJobStatus.textContent = error.message;
     await loadSettings();
@@ -3238,6 +3296,66 @@ async function runAllRefreshJobs() {
     runAllSubscriptionsButton.disabled = false;
     saveSubscriptionsButton.disabled = false;
   }
+}
+
+async function monitorSubscriptionRefreshRun(run, initialMessage = "刷新中") {
+  if (!run?.id) throw new Error("刷新任务启动失败：没有返回 runId。");
+  stopActiveRefreshRunPolling();
+  state.activeRefreshRun.id = run.id;
+  state.activeRefreshRun.scope = "subscriptions";
+  refreshJobStatus.textContent = `${initialMessage}：0 / ${run.totalJobs || 0}`;
+  const timeoutAt = Date.now() + 10 * 60 * 1000;
+  let pollErrors = 0;
+  return new Promise((resolve) => {
+    state.activeRefreshRun.pollTimer = setInterval(async () => {
+      try {
+        const { run: latest } = await api(`/api/refresh-runs/${encodeURIComponent(run.id)}`);
+        if (!latest) return;
+        pollErrors = 0;
+        state.refreshJobs = latest.jobs || state.refreshJobs;
+        renderRefreshJobs(state.refreshJobs);
+        const completed = Number(latest.completedJobs || 0);
+        const total = Number(latest.totalJobs || 0);
+        const failed = Number(latest.failedJobs || 0);
+        refreshJobStatus.textContent = `${runStatusText(latest)}：${completed} / ${total}${failed ? `，失败 ${failed}` : ""}`;
+        if (["completed", "failed", "canceled"].includes(latest.status)) {
+          stopActiveRefreshRunPolling();
+          const result = latest.result || {};
+          const updated = Number(result.updatedItemCount ?? result.updatedIssueCount ?? 0);
+          const newCount = Number(result.newItemCount || 0);
+          const aiFailed = Number(result.aiProcessErrorCount || 0);
+          const totalItems = Number(result.linkCount ?? result.issueCount ?? 0);
+          const skipped = Number(result.skippedItemCount || 0);
+          const errorCount = Number(result.errorCount || failed || 0);
+          refreshJobStatus.textContent = `${latest.status === "completed" ? "刷新完成" : latest.status === "canceled" ? "刷新已取消" : "刷新结束，有失败"}：更新 ${updated} / ${totalItems} 个内容页，AI 已整理 ${newCount} 个，AI 失败 ${aiFailed} 个，跳过 ${skipped} 个，失败 ${errorCount} 个。`;
+          if (state.view === "materials") await loadAll();
+          await loadMaterialUpdateCount();
+          scheduleReloadAfterRefreshUpdates(newCount);
+          resolve(latest);
+        } else if (Date.now() > timeoutAt) {
+          stopActiveRefreshRunPolling();
+          refreshJobStatus.textContent = "刷新仍在后台运行，已停止前台等待；稍后会自动同步状态。";
+          resolve(latest);
+        }
+      } catch (error) {
+        pollErrors += 1;
+        refreshJobStatus.textContent = `刷新进度同步失败：${error.message}`;
+        console.warn("Failed to poll refresh run:", error);
+        if (pollErrors >= 5) {
+          stopActiveRefreshRunPolling();
+          refreshJobStatus.textContent = "刷新进度同步连续失败，已恢复按钮；后台任务可能仍在运行。";
+          resolve(null);
+        }
+      }
+    }, 1000);
+  });
+}
+
+function stopActiveRefreshRunPolling() {
+  if (state.activeRefreshRun.pollTimer) clearInterval(state.activeRefreshRun.pollTimer);
+  state.activeRefreshRun.pollTimer = null;
+  state.activeRefreshRun.id = "";
+  state.activeRefreshRun.scope = "";
 }
 
 function scheduleReloadAfterRefreshUpdates(updatedCount) {
@@ -3257,6 +3375,9 @@ function startRefreshJobMonitor() {
 async function checkRefreshJobsForUpdates() {
   try {
     const { jobs } = await api("/api/refresh-jobs");
+    state.refreshJobs = jobs || state.refreshJobs;
+    renderHomeOverview();
+    if (state.view === "subscriptions") renderRefreshJobs(state.refreshJobs);
     const latest = latestUpdatedRefreshRun(jobs || []);
     if (!latest || latest.key <= state.seenRefreshRunKey) return;
     const updated = refreshResultUpdatedCount(latest.job.lastResult);
