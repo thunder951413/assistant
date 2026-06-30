@@ -838,7 +838,7 @@ async function refreshItemWithContext(id, refreshContext = null) {
   const metadata = {
     ...previousMetadata,
     title: item.metadata.title || fetched.title,
-    updatedAt: now,
+    updatedAt: hasUpdate ? now : item.metadata.updatedAt,
     lastFetchedAt: now,
     sourceUpdatedAt: nextSourceUpdatedAt,
     contentUpdatedAt: item.metadata.contentUpdatedAt || "",
@@ -924,7 +924,7 @@ async function upsertFetchedItem(input) {
     sourceType: input.sourceType || item.metadata.sourceType,
     url: itemUrl,
     tags: item.metadata.tags || [],
-    updatedAt: input.fetchedAt,
+    updatedAt: hasUpdate ? input.fetchedAt : item.metadata.updatedAt,
     lastFetchedAt: input.fetchedAt,
     sourceUpdatedAt: nextSourceUpdatedAt,
     contentUpdatedAt: item.metadata.contentUpdatedAt || "",
