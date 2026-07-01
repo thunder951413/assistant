@@ -90,6 +90,7 @@ button {
 }
 
 .brand > div:not(.brand-mark) {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   transition: opacity 160ms ease, max-width 180ms ease;
@@ -111,7 +112,7 @@ button {
 
 .sidebar:hover .brand > div:not(.brand-mark),
 .sidebar:focus-within .brand > div:not(.brand-mark) {
-  max-width: 160px;
+  max-width: 176px;
   opacity: 1;
 }
 
@@ -142,8 +143,10 @@ button {
 .brand-title-row {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
   min-width: 0;
+  width: 100%;
 }
 
 .new-badge {
@@ -380,10 +383,67 @@ button {
 }
 
 .workspace {
+  position: relative;
   overflow: auto;
   padding: clamp(14px, 2vw, 24px);
   min-width: 0;
   min-height: 0;
+}
+
+.dnd-toggle {
+  display: grid;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border-color: #cfd8e3;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.92);
+  padding: 0;
+  box-shadow: 0 5px 12px rgba(20, 32, 46, 0.1);
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    box-shadow 160ms ease,
+    transform 160ms ease;
+}
+
+.dnd-toggle:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 16px rgba(20, 32, 46, 0.15);
+}
+
+.dnd-toggle-icon {
+  position: relative;
+  width: 13px;
+  height: 13px;
+  border-radius: 999px;
+  background: #667085;
+}
+
+.dnd-toggle-icon::after {
+  position: absolute;
+  top: -3px;
+  right: -4px;
+  width: 13px;
+  height: 13px;
+  border-radius: inherit;
+  background: rgba(255, 255, 255, 0.92);
+  content: "";
+}
+
+.dnd-toggle.is-active {
+  border-color: #4a5568;
+  background: #555b64;
+  box-shadow: 0 8px 18px rgba(17, 24, 39, 0.22);
+}
+
+.dnd-toggle.is-active .dnd-toggle-icon {
+  background: #fff;
+}
+
+.dnd-toggle.is-active .dnd-toggle-icon::after {
+  background: #555b64;
 }
 
 .home-view,
@@ -1302,9 +1362,12 @@ textarea {
 }
 
 .toolbar-actions button {
+  flex: 0 0 auto;
+  min-width: max-content;
   min-height: 38px;
   border-radius: 8px;
   padding: 0 14px;
+  white-space: nowrap;
 }
 
 .primary-button {

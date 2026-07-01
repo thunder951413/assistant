@@ -53,6 +53,7 @@ const state = {
   },
   subscriptionSource: "all",
   settingsTab: "ai",
+  doNotDisturb: false,
   detailMode: localStorage.getItem("materialOrganizer.detailMode") || "processed",
   selectedId: null,
   sourceType: "",
@@ -93,6 +94,7 @@ const homeSourceNewCounts = {
 const filterTabs = [...document.querySelectorAll("[data-filter-tab]")];
 const filterPanels = [...document.querySelectorAll("[data-filter-panel]")];
 const homeView = document.querySelector("#homeView");
+const doNotDisturbToggle = document.querySelector("#doNotDisturbToggle");
 const chatView = document.querySelector("#chatView");
 const materialsView = document.querySelector("#materialsView");
 const importView = document.querySelector("#importView");
@@ -230,6 +232,7 @@ clearImportButton.addEventListener("click", resetImport);
 copyPreviewButton.addEventListener("click", copyPreview);
 summarizeButton.addEventListener("click", summarizePreview);
 settingsForm.addEventListener("submit", saveSettings);
+doNotDisturbToggle?.addEventListener("click", toggleDoNotDisturb);
 exportSettingsButton.addEventListener("click", () => downloadExport("/api/export/settings"));
 exportDataButton.addEventListener("click", () => downloadExport("/api/export/data"));
 importSettingsButton.addEventListener("click", () => settingsImportFile.click());
@@ -1976,6 +1979,7 @@ async function loadSettings() {
   settingModel.value = settings.ai.model || "";
   settingShowThinking.checked = settings.chat?.showThinking !== false;
   settingShowToolCalls.checked = settings.chat?.showToolCalls !== false;
+  setDoNotDisturbState(Boolean(settings.doNotDisturb?.enabled), { renderOnly: true });
   settingNotificationsEnabled.checked = settings.notifications?.enabled !== false;
   for (const input of notificationSourceInputs) {
     input.checked = settings.notifications?.sources?.[input.dataset.notificationSource] !== false;
@@ -2620,6 +2624,9 @@ async function saveSettings(event) {
           showThinking: settingShowThinking.checked,
           showToolCalls: settingShowToolCalls.checked
         },
+        doNotDisturb: {
+          enabled: state.doNotDisturb
+        },
         notifications: collectNotificationSettings(),
         refreshSchedule: {
           startTime: settingRefreshStartTime.value,
@@ -2642,6 +2649,7 @@ async function saveSettings(event) {
     settingApiKey.value = settings.ai.apiKey;
     settingShowThinking.checked = settings.chat?.showThinking !== false;
     settingShowToolCalls.checked = settings.chat?.showToolCalls !== false;
+    setDoNotDisturbState(Boolean(settings.doNotDisturb?.enabled), { renderOnly: true });
     settingNotificationsEnabled.checked = settings.notifications?.enabled !== false;
     for (const input of notificationSourceInputs) {
       input.checked = settings.notifications?.sources?.[input.dataset.notificationSource] !== false;
@@ -2662,6 +2670,40 @@ async function saveSettings(event) {
     await loadSettingsTags();
   } catch (error) {
     settingsStatus.textContent = error.message;
+  }
+}
+
+function setDoNotDisturbState(enabled, options = {}) {
+  state.doNotDisturb = Boolean(enabled);
+  if (!doNotDisturbToggle) return;
+  const active = state.doNotDisturb;
+  doNotDisturbToggle.classList.toggle("is-active", active);
+  doNotDisturbToggle.setAttribute("aria-pressed", String(active));
+  doNotDisturbToggle.setAttribute("aria-label", active ? "关闭勿扰模式" : "开启勿扰模式");
+  doNotDisturbToggle.title = active ? "勿扰模式已开启：自动更新暂停" : "开启勿扰模式";
+  if (!options.renderOnly) {
+    doNotDisturbToggle.disabled = false;
+  }
+}
+
+async function toggleDoNotDisturb() {
+  if (!doNotDisturbToggle) return;
+  const next = !state.doNotDisturb;
+  doNotDisturbToggle.disabled = true;
+  setDoNotDisturbState(next, { renderOnly: true });
+  try {
+    const { settings } = await api("/api/settings", {
+      method: "PATCH",
+      body: JSON.stringify({
+        doNotDisturb: {
+          enabled: next
+        }
+      })
+    });
+    setDoNotDisturbState(Boolean(settings.doNotDisturb?.enabled));
+  } catch (error) {
+    setDoNotDisturbState(!next);
+    console.warn("Failed to update do not disturb mode:", error);
   }
 }
 

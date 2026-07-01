@@ -3152,6 +3152,7 @@ function startRefreshScheduler() {
 }
 
 async function runDueRefreshJobs() {
+  if (settings.doNotDisturb?.enabled) return;
   const now = new Date();
   const dueJobs = [];
   for (const job of settings.refreshJobs || []) {
@@ -7362,6 +7363,7 @@ async function saveSettings(input) {
       showThinking: Boolean(input.chat?.showThinking ?? settings.chat?.showThinking ?? true),
       showToolCalls: Boolean(input.chat?.showToolCalls ?? settings.chat?.showToolCalls ?? true)
     },
+    doNotDisturb: normalizeDoNotDisturbSettings(input.doNotDisturb || settings.doNotDisturb || {}),
     notifications: normalizeNotificationSettings(input.notifications || settings.notifications || {}),
     refreshSchedule: normalizeRefreshSchedule(input.refreshSchedule || settings.refreshSchedule || {}),
     processingPrompts: normalizeProcessingPrompts(input.processingPrompts || settings.processingPrompts || {}),
@@ -7394,6 +7396,7 @@ function defaultSettings() {
       showThinking: true,
       showToolCalls: true
     },
+    doNotDisturb: defaultDoNotDisturbSettings(),
     notifications: defaultNotificationSettings(),
     refreshSchedule: defaultRefreshSchedule(),
     processingPrompts: defaultProcessingPrompts(),
@@ -7426,6 +7429,10 @@ function mergeSettings(base, patch) {
       ...base.chat,
       ...(patch.chat || {})
     },
+    doNotDisturb: normalizeDoNotDisturbSettings({
+      ...(base.doNotDisturb || {}),
+      ...(patch.doNotDisturb || {})
+    }),
     notifications: normalizeNotificationSettings({
       ...(base.notifications || {}),
       ...(patch.notifications || {})
@@ -7463,11 +7470,24 @@ function publicSettings() {
       showThinking: settings.chat?.showThinking !== false,
       showToolCalls: settings.chat?.showToolCalls !== false
     },
+    doNotDisturb: normalizeDoNotDisturbSettings(settings.doNotDisturb || {}),
     notifications: normalizeNotificationSettings(settings.notifications || {}),
     refreshSchedule: normalizeRefreshSchedule(settings.refreshSchedule || {}),
     processingPrompts: normalizeProcessingPrompts(settings.processingPrompts || {}),
     sources: publicSourceProfiles(),
     refreshJobs: publicRefreshJobs()
+  };
+}
+
+function defaultDoNotDisturbSettings() {
+  return {
+    enabled: false
+  };
+}
+
+function normalizeDoNotDisturbSettings(input = {}) {
+  return {
+    enabled: Boolean(input.enabled)
   };
 }
 
