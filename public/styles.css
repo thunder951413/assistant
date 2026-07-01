@@ -403,7 +403,7 @@ button {
 }
 
 .home-view {
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(320px, 1fr);
 }
 
 .view-heading {
@@ -426,6 +426,8 @@ button {
   display: grid;
   grid-template-columns: minmax(0, 1.05fr) minmax(340px, 1.95fr);
   gap: 10px;
+  align-content: start;
+  align-items: start;
   min-width: 0;
   margin-bottom: 12px;
 }
@@ -511,16 +513,52 @@ button {
 .overview-metrics {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-auto-rows: 1fr;
   gap: 10px;
+  align-content: start;
+  align-self: stretch;
   min-width: 0;
 }
 
 .metric-card {
+  position: relative;
   display: grid;
   gap: 5px;
   align-content: start;
-  min-height: 124px;
-  padding: 12px;
+  min-height: 92px;
+  height: 100%;
+  overflow: hidden;
+  padding: 10px 12px 12px;
+}
+
+.metric-card::before {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 3px;
+  background: var(--metric-accent, var(--accent));
+  content: "";
+}
+
+.metric-card:nth-child(1) {
+  --metric-accent: #2563eb;
+  background: linear-gradient(180deg, #f1f6ff 0%, rgba(255, 255, 255, 0.94) 100%);
+}
+
+.metric-card:nth-child(2) {
+  --metric-accent: #dc6803;
+  background: linear-gradient(180deg, #fff6e7 0%, rgba(255, 255, 255, 0.94) 100%);
+}
+
+.metric-card:nth-child(3) {
+  --metric-accent: #7c3aed;
+  background: linear-gradient(180deg, #f5f0ff 0%, rgba(255, 255, 255, 0.94) 100%);
+}
+
+.metric-card:nth-child(4) {
+  --metric-accent: #059669;
+  background: linear-gradient(180deg, #ecfdf3 0%, rgba(255, 255, 255, 0.94) 100%);
 }
 
 .metric-card span,

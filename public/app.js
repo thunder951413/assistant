@@ -530,7 +530,7 @@ function renderHomeOverview() {
   }
   for (const [source, element] of Object.entries(homeSourceNewCounts)) {
     if (!element) continue;
-    const newCount = sourceNewCounts.get(source) || 0;
+    const newCount = isHomeSourceNewBadgeVisible(source) ? sourceNewCounts.get(source) || 0 : 0;
     element.textContent = `新 ${newCount}`;
     element.hidden = newCount <= 0;
     element.closest("button")?.classList.toggle("has-new-content", newCount > 0);
@@ -547,9 +547,10 @@ function renderHomeOverview() {
 
 function renderHomeRefreshTasks(jobs) {
   if (!homeRefreshTaskRows) return;
-  const summaries = summarizeRefreshSources(jobs || []);
+  const visibleJobs = (jobs || []).filter((job) => isHomeRefreshSourceVisible(sourceTypeForSubscription(job)));
+  const summaries = summarizeRefreshSources(visibleJobs);
   if (homeRefreshTaskCount) {
-    homeRefreshTaskCount.textContent = `共 ${summaries.length} 个数据源 · ${(jobs || []).length} 个任务`;
+    homeRefreshTaskCount.textContent = `共 ${summaries.length} 个数据源 · ${visibleJobs.length} 个任务`;
   }
   if (!summaries.length) {
     homeRefreshTaskRows.innerHTML = `
@@ -634,6 +635,14 @@ function renderHomeRefreshTasks(jobs) {
       renderHomeOverview();
     });
   });
+}
+
+function isHomeRefreshSourceVisible(source) {
+  return source !== "web" && source !== "text";
+}
+
+function isHomeSourceNewBadgeVisible(source) {
+  return source !== "web" && source !== "text";
 }
 
 function countNewSources(items) {
@@ -929,7 +938,7 @@ function sourceLabel(source) {
     jira: "Jira",
     teams: "Teams",
     text: "文本",
-    web: "网页"
+    web: "文本"
   };
   return labels[source] || source;
 }
@@ -3172,7 +3181,7 @@ function subscriptionSourceLabel(source) {
     jira: "Jira",
     github: "GitHub",
     teams: "Teams",
-    web: "网页"
+    web: "文本"
   }[source] || source;
 }
 

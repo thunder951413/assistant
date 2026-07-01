@@ -1865,7 +1865,7 @@ function classifyItemsLocally(items, categories = []) {
 function sourceTypeLabel(sourceType) {
   const labels = {
     text: "文本",
-    web: "网页",
+    web: "文本",
     confluence: "Confluence",
     jira: "Jira",
     github: "GitHub",
@@ -4002,7 +4002,7 @@ function sourceLabel(sourceType) {
     jira: "Jira",
     github: "GitHub",
     teams: "Teams",
-    web: "网页",
+    web: "文本",
     text: "文本"
   }[sourceType] || sourceType || "资料";
 }
