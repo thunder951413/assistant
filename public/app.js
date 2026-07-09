@@ -5,6 +5,7 @@ const state = {
   chatSessions: [],
   activeChatId: "",
   importPreview: null,
+  importPreviewRequest: 0,
   refreshJobs: [],
   tagEditor: {
     item: null,
@@ -46,6 +47,9 @@ const state = {
     pollTimer: null
   },
   seenRefreshRunKey: localStorage.getItem("materialOrganizer.seenRefreshRunKey") || "",
+  seenRefreshFailureKey: localStorage.getItem("materialOrganizer.seenRefreshFailureKey") || "",
+  toastTimers: new Map(),
+  authFailurePrompt: null,
   listClassification: null,
   listClassifying: false,
   listClassifier: {
@@ -58,7 +62,11 @@ const state = {
   selectedId: null,
   sourceType: "",
   tag: "",
-  query: ""
+  query: "",
+  page: 1,
+  pageSize: 50,
+  totalItems: 0,
+  settings: null
 };
 
 const itemList = document.querySelector("#itemList");
@@ -75,6 +83,7 @@ const homeTagCount = document.querySelector("#homeTagCount");
 const homeRunningJobs = document.querySelector("#homeRunningJobs");
 const homeFailedJobs = document.querySelector("#homeFailedJobs");
 const homeEnabledJobs = document.querySelector("#homeEnabledJobs");
+const homeAiMode = document.querySelector("#homeAiMode");
 const homeRefreshTaskRows = document.querySelector("#homeRefreshTaskRows");
 const homeRefreshTaskCount = document.querySelector("#homeRefreshTaskCount");
 const homeSourceCounts = {
@@ -139,6 +148,7 @@ const settingsPanels = [...document.querySelectorAll("[data-settings-panel]")];
 const settingBaseUrl = document.querySelector("#settingBaseUrl");
 const settingApiKey = document.querySelector("#settingApiKey");
 const settingModel = document.querySelector("#settingModel");
+const aiPrivacyNotice = document.querySelector("#aiPrivacyNotice");
 const settingShowThinking = document.querySelector("#settingShowThinking");
 const settingShowToolCalls = document.querySelector("#settingShowToolCalls");
 const settingNotificationsEnabled = document.querySelector("#settingNotificationsEnabled");
@@ -153,6 +163,9 @@ const settingEmbeddingDimensions = document.querySelector("#settingEmbeddingDime
 const processingPromptFields = [...document.querySelectorAll("[data-processing-prompt]")];
 const settingDocumentRoot = document.querySelector("#settingDocumentRoot");
 const activeDocumentRoot = document.querySelector("#activeDocumentRoot");
+const storageStatsElement = document.querySelector("#storageStats");
+const cleanupSnapshotsButton = document.querySelector("#cleanupSnapshotsButton");
+const storageCleanupStatus = document.querySelector("#storageCleanupStatus");
 const settingsStatus = document.querySelector("#settingsStatus");
 const exportSettingsButton = document.querySelector("#exportSettingsButton");
 const importSettingsButton = document.querySelector("#importSettingsButton");
@@ -160,6 +173,7 @@ const exportDataButton = document.querySelector("#exportDataButton");
 const importDataButton = document.querySelector("#importDataButton");
 const settingsImportFile = document.querySelector("#settingsImportFile");
 const dataImportFile = document.querySelector("#dataImportFile");
+const toastRegion = document.querySelector("#toastRegion");
 const replaceDataOnImport = document.querySelector("#replaceDataOnImport");
 const importExportStatus = document.querySelector("#importExportStatus");
 const sourceProfiles = document.querySelector("#sourceProfiles");
@@ -222,6 +236,11 @@ const classificationStatus = document.querySelector("#classificationStatus");
 const classificationCount = document.querySelector("#classificationCount");
 const classificationProgress = document.querySelector("#classificationProgress");
 const classifyListSubtitle = document.querySelector("#classifyListSubtitle");
+const authFailureDialog = document.querySelector("#authFailureDialog");
+const authFailureMessage = document.querySelector("#authFailureMessage");
+const closeAuthFailureButton = document.querySelector("#closeAuthFailureButton");
+const dismissAuthFailureButton = document.querySelector("#dismissAuthFailureButton");
+const openAuthWebdriverButton = document.querySelector("#openAuthWebdriverButton");
 
 chatForm.addEventListener("submit", sendChatMessage);
 newChatButton.addEventListener("click", () => createChatSession({ activate: true }));
@@ -237,6 +256,7 @@ exportSettingsButton.addEventListener("click", () => downloadExport("/api/export
 exportDataButton.addEventListener("click", () => downloadExport("/api/export/data"));
 importSettingsButton.addEventListener("click", () => settingsImportFile.click());
 importDataButton.addEventListener("click", () => dataImportFile.click());
+cleanupSnapshotsButton?.addEventListener("click", cleanupSnapshots);
 settingsImportFile.addEventListener("change", importSettingsFile);
 dataImportFile.addEventListener("change", importDataFile);
 saveSubscriptionsButton.addEventListener("click", saveSubscriptions);
@@ -273,6 +293,9 @@ batchProcessTagsToggle.addEventListener("change", updateBatchProcessCandidates);
 batchProcessTagMode.addEventListener("change", updateBatchProcessCandidates);
 batchProcessForceToggle.addEventListener("change", updateBatchProcessCandidates);
 batchProcessForm.addEventListener("submit", (event) => event.preventDefault());
+closeAuthFailureButton?.addEventListener("click", closeAuthFailureDialog);
+dismissAuthFailureButton?.addEventListener("click", closeAuthFailureDialog);
+openAuthWebdriverButton?.addEventListener("click", openAuthFailureWebdriver);
 addTagButton.addEventListener("click", addSettingsTags);
 selectAllTagsButton.addEventListener("click", () => {
   state.selectedSettingsTags = new Set(state.settingsTags.map((tag) => tag.name));
@@ -299,8 +322,8 @@ document.querySelectorAll("[data-webdriver-url]").forEach((button) => {
 document.querySelectorAll("[data-save-cookie-url]").forEach((button) => {
   button.addEventListener("click", () => saveWebdriverCookies(button.dataset.saveCookieUrl));
 });
-importContent.addEventListener("paste", () => setTimeout(() => autoPreviewImport(), 50));
-importUrl.addEventListener("paste", () => setTimeout(() => autoPreviewImport(), 50));
+importContent.addEventListener("paste", () => setTimeout(() => scheduleAutoPreviewImport(), 0));
+importUrl.addEventListener("paste", () => setTimeout(() => scheduleAutoPreviewImport(), 0));
 dropZone.addEventListener("dragover", handleDragOver);
 dropZone.addEventListener("dragleave", handleDragLeave);
 dropZone.addEventListener("drop", handleDrop);
@@ -448,13 +471,32 @@ async function loadItems() {
   if (state.sourceType) params.set("sourceType", state.sourceType);
   if (state.tag) params.set("tag", state.tag);
   if (state.query) params.set("q", state.query);
+  params.set("page", "1");
+  params.set("pageSize", String(state.pageSize));
 
-  const { items } = await api(`/api/items?${params}`);
+  const { items, total } = await api(`/api/items?${params}`);
   state.items = items;
+  state.page = 1;
+  state.totalItems = Number(total ?? items.length);
   syncMaterialUpdateCountFromItems(items);
   state.listClassification = null;
   renderItems();
   renderMaterialsNewBadge();
+}
+
+async function loadMoreItems() {
+  if (state.items.length >= state.totalItems) return;
+  const params = new URLSearchParams();
+  if (state.sourceType) params.set("sourceType", state.sourceType);
+  if (state.tag) params.set("tag", state.tag);
+  if (state.query) params.set("q", state.query);
+  params.set("page", String(state.page + 1));
+  params.set("pageSize", String(state.pageSize));
+  const { items, total } = await api(`/api/items?${params}`);
+  state.items = [...state.items, ...(items || [])];
+  state.page += 1;
+  state.totalItems = Number(total ?? state.items.length);
+  renderItems();
 }
 
 async function loadTags() {
@@ -522,6 +564,20 @@ function renderHomeOverview() {
   homeRunningJobs.textContent = String(runningJobs);
   homeFailedJobs.textContent = String(failedJobs);
   homeEnabledJobs.textContent = String(enabledJobs);
+  if (homeAiMode) {
+    const baseUrl = state.settings?.ai?.baseUrl || "";
+    let remote = false;
+    try {
+      const host = new URL(baseUrl).hostname;
+      remote = Boolean(host && !["localhost", "127.0.0.1", "::1"].includes(host));
+    } catch {
+      remote = false;
+    }
+    homeAiMode.textContent = !baseUrl ? "未配置 AI" : remote ? "远程 AI" : "本地 AI";
+    homeAiMode.classList.toggle("is-online", remote);
+    homeAiMode.classList.toggle("is-local", !remote);
+    homeAiMode.title = remote ? "问答、总结和整理会把相关资料片段发送到已配置的远程模型。" : "AI 请求发送到本机地址。";
+  }
   homeSubscriptionStatus.textContent = failedJobs
     ? `${failedJobs} 个任务需要检查`
     : enabledJobs
@@ -691,7 +747,7 @@ function summarizeRefreshSources(jobs) {
     group.failed += status.kind === "failed" ? 1 : 0;
     group.warning += status.kind === "warning" ? 1 : 0;
     group.succeeded += status.kind === "success" ? 1 : 0;
-    group.progressSum += progress.percent;
+    if (job.enabled) group.progressSum += progress.percent;
     group.updated += delta.updated;
     group.totalResult += delta.total;
     if (job.lastRunAt && (!group.latestRunAt || job.lastRunAt > group.latestRunAt)) {
@@ -708,7 +764,7 @@ function summarizeRefreshSources(jobs) {
         ...group,
         status,
         successRate,
-        progress: group.total ? Math.round(group.progressSum / group.total) : 0
+        progress: group.enabled ? Math.round(group.progressSum / group.enabled) : 0
       };
     })
     .sort((a, b) => {
@@ -774,6 +830,12 @@ async function refreshHomeSource(source, options = {}) {
     console.warn(`Failed to refresh ${source}:`, error);
     state.homeSourceRefresh.message = error.message || "刷新启动失败";
     state.homeSourceRefresh.failed = jobsToRun.length;
+    showRefreshFailureToast([{
+      sourceType: source,
+      name: subscriptionSourceLabel(source),
+      url: jobsToRun[0]?.url || "",
+      error: error.message || "刷新启动失败"
+    }]);
     await loadSettings();
     resetHomeSourceRefreshState(token);
     renderHomeOverview();
@@ -802,6 +864,20 @@ function startHomeSourceRefreshPolling(source, startedAt, total, token = state.h
       renderHomeOverview();
       const terminal = run && ["completed", "failed", "canceled"].includes(run.status);
       if (terminal || (!active && completed + failed >= Math.max(1, Number(state.homeSourceRefresh.total || 0)))) {
+        if (failed) {
+          if (run) {
+            showRefreshFailureToastFromRun(run);
+          } else {
+            showRefreshFailureToast(sourceJobs
+              .filter((job) => ["failed", "unreachable"].includes(job.status) && job.lastRunAt && job.lastRunAt >= startedAt)
+              .map((job) => ({
+                sourceType: sourceTypeForSubscription(job),
+                name: job.name || job.id,
+                url: job.url || job.lastResult?.errors?.find((entry) => entry?.url)?.url || "",
+                error: refreshJobErrorText(job) || "刷新失败"
+              })));
+          }
+        }
         await loadMaterialUpdateCount();
         resetHomeSourceRefreshState(token);
         renderHomeOverview();
@@ -948,7 +1024,7 @@ function sourceLabel(source) {
 
 function renderItems() {
   const classified = state.listClassification?.groups?.length;
-  resultCount.textContent = `${state.items.length} 条资料${classified ? ` · ${state.listClassification.groups.length} 个分类` : ""}`;
+  resultCount.textContent = `${state.items.length} / ${state.totalItems || state.items.length} 条资料${classified ? ` · ${state.listClassification.groups.length} 个分类` : ""}`;
   classifyListButton.textContent = state.listClassifying
     ? "分类中..."
     : classified
@@ -966,9 +1042,13 @@ function renderItems() {
     return;
   }
 
-  itemList.innerHTML = state.items.map(renderItemCard).join("");
+  itemList.innerHTML = [
+    state.items.map(renderItemCard).join(""),
+    state.items.length < state.totalItems ? `<button class="load-more-button" type="button" data-load-more>加载更多（剩余 ${state.totalItems - state.items.length} 条）</button>` : ""
+  ].join("");
 
   bindItemCards();
+  itemList.querySelector("[data-load-more]")?.addEventListener("click", loadMoreItems);
 }
 
 function renderItemCard(item) {
@@ -976,6 +1056,7 @@ function renderItemCard(item) {
     <button class="item-card ${state.selectedId === item.id ? "is-selected" : ""}" data-id="${escapeHtml(item.id)}">
       <div class="item-card-title">
         <h3>${escapeHtml(item.title)}</h3>
+        ${item.integrityStatus === "quarantined" ? `<span class="integrity-badge">已隔离</span>` : ""}
         ${item.contentUpdatedAt ? `<span class="new-badge item-new-badge">NEW!</span>` : ""}
       </div>
     </button>
@@ -1228,9 +1309,9 @@ function updateBatchProcessCandidates() {
   const force = batchProcessForceToggle.checked;
   const includeTags = batchProcessTagsToggle.checked;
   const tagMode = batchProcessTagMode.value;
-  const contentCandidates = state.items.filter((item) => item.pageKind !== "list" && (force || !item.hasProcessed));
+  const contentCandidates = state.items.filter((item) => item.pageKind !== "list" && item.integrityStatus !== "quarantined" && (force || !item.hasProcessed));
   const tagOnlyCandidates = includeTags && tagMode === "batch"
-    ? state.items.filter((item) => item.pageKind !== "list")
+    ? state.items.filter((item) => item.pageKind !== "list" && item.integrityStatus !== "quarantined")
     : [];
   const candidates = uniqueItemsById([...contentCandidates, ...tagOnlyCandidates]);
   state.batchProcess.items = candidates;
@@ -1593,6 +1674,9 @@ function renderDetail(item) {
     : showProcessed && metadata.processedStale
       ? `<div class="detail-note">原文刷新后发生过变化，当前 AI 整理版可能不是最新。点击“更新整理”可重新生成。</div>`
     : "";
+  const integrityNote = metadata.integrityStatus === "quarantined"
+    ? `<div class="detail-note integrity-warning"><strong>资料已隔离：</strong>${escapeHtml(metadata.integrityReason || "来源完整性校验未通过")}。在刷新验证通过前不会进入 AI 检索或批处理。</div>`
+    : "";
   detailPanel.innerHTML = `
     <div class="detail-title">
       <div class="title-editor">
@@ -1604,7 +1688,7 @@ function renderDetail(item) {
       <div class="detail-actions">
         <div class="title-editor-actions">
           <button id="saveTitleButton" type="button">保存标题</button>
-          <button id="generateTitleButton" type="button">AI 生成标题</button>
+          <button id="generateTitleButton" type="button" ${metadata.integrityStatus === "quarantined" ? "disabled" : ""}>AI 生成标题</button>
         </div>
         <div class="detail-display-control ${hasProcessed ? "" : "is-unavailable"}">
           <span>显示模式</span>
@@ -1615,19 +1699,21 @@ function renderDetail(item) {
             <span class="mode-choice ${state.detailMode === "processed" ? "is-selected" : ""}">${state.detailMode === "processed" ? "🟢 " : ""}已整理</span>
           </label>
         </div>
-        <button id="processItemButton">${hasProcessed ? "重新生成整理" : "生成 AI 整理"}</button>
+        <button id="processItemButton" ${metadata.integrityStatus === "quarantined" ? "disabled" : ""}>${hasProcessed ? "重新生成整理" : "生成 AI 整理"}</button>
         <button id="editTagsButton">标签</button>
         <button id="refreshButton">刷新</button>
         <button id="deleteItemButton" class="danger-button">删除</button>
       </div>
       <div class="detail-meta-block">
         <div class="item-meta">${escapeHtml(metadata.sourceType)} · ${escapeHtml(metadata.url || "local input")}</div>
+        ${metadata.captureMethod ? `<div class="item-meta">抓取方式：${escapeHtml(metadata.captureMethod)}</div>` : ""}
         ${metadata.processedAt ? `<div class="item-meta">AI 整理：${escapeHtml(formatDate(metadata.processedAt))}</div>` : ""}
       </div>
     </div>
     <div class="item-meta">标签：${escapeHtml((metadata.tags || []).join(", ") || "no tags")}</div>
     ${metadata.contentUpdatedAt ? `<div class="item-meta">内容更新：${escapeHtml(formatDate(metadata.contentUpdatedAt))}</div>` : ""}
     <hr />
+    ${integrityNote}
     ${modeNote}
     <div id="detailContentLayout" class="detail-content-layout">
       <div id="detailTocWrap" class="detail-toc-wrap" hidden>
@@ -1957,7 +2043,7 @@ function slugTagClient(value) {
     .trim()
     .toLowerCase()
     .replace(/[\s_]+/g, "-")
-    .replace(/[^a-z0-9\u4e00-\u9fa5-]/g, "")
+    .replace(/[^a-z0-9+\u4e00-\u9fa5-]/g, "")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "")
     .slice(0, 40);
@@ -1974,9 +2060,19 @@ async function loadAgentConfig() {
 
 async function loadSettings() {
   const { settings } = await api("/api/settings");
+  state.settings = settings;
   settingBaseUrl.value = settings.ai.baseUrl || "";
   settingApiKey.value = settings.ai.apiKey || "";
   settingModel.value = settings.ai.model || "";
+  if (aiPrivacyNotice) {
+    let host = "";
+    try { host = new URL(settings.ai.baseUrl || "").hostname; } catch { host = ""; }
+    const remote = host && !["localhost", "127.0.0.1", "::1"].includes(host);
+    aiPrivacyNotice.textContent = remote
+      ? `当前使用远程 AI：${host}。问答、总结、标题、标签和资料整理会发送相关资料片段。`
+      : host ? "当前 AI 运行在本机地址。" : "尚未配置 AI；资料不会发送到模型服务。";
+    aiPrivacyNotice.classList.toggle("is-remote", Boolean(remote));
+  }
   settingShowThinking.checked = settings.chat?.showThinking !== false;
   settingShowToolCalls.checked = settings.chat?.showToolCalls !== false;
   setDoNotDisturbState(Boolean(settings.doNotDisturb?.enabled), { renderOnly: true });
@@ -2000,6 +2096,47 @@ async function loadSettings() {
   renderRefreshJobs(settings.refreshJobs || []);
   rememberLatestRefreshRun(settings.refreshJobs || []);
   await loadSettingsTags();
+  await loadStorageStats();
+}
+
+async function loadStorageStats() {
+  if (!storageStatsElement) return;
+  try {
+    const { stats } = await api("/api/storage-stats");
+    storageStatsElement.textContent = `知识库 ${formatBytes(stats.knowledgeBytes)} · 历史快照 ${formatBytes(stats.snapshotBytes)} · WebDriver 登录数据 ${formatBytes(stats.webdriverBytes)}`;
+  } catch (error) {
+    storageStatsElement.textContent = `无法读取存储占用：${error.message}`;
+  }
+}
+
+async function cleanupSnapshots() {
+  if (!cleanupSnapshotsButton) return;
+  const confirmed = window.confirm("将删除每条资料超过最近 20 个版本的旧快照。当前资料和最近 20 个版本不会删除。是否继续？");
+  if (!confirmed) return;
+  cleanupSnapshotsButton.disabled = true;
+  storageCleanupStatus.textContent = "正在清理旧快照...";
+  try {
+    const { result, stats } = await api("/api/storage-cleanup", { method: "POST" });
+    storageCleanupStatus.textContent = `已删除 ${result.removedSnapshots} 个旧快照，释放 ${formatBytes(result.reclaimedBytes)}。`;
+    storageStatsElement.textContent = `知识库 ${formatBytes(stats.knowledgeBytes)} · 历史快照 ${formatBytes(stats.snapshotBytes)} · WebDriver 登录数据 ${formatBytes(stats.webdriverBytes)}`;
+  } catch (error) {
+    storageCleanupStatus.textContent = error.message;
+  } finally {
+    cleanupSnapshotsButton.disabled = false;
+  }
+}
+
+function formatBytes(value) {
+  const bytes = Math.max(0, Number(value || 0));
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let amount = bytes;
+  let index = -1;
+  do {
+    amount /= 1024;
+    index += 1;
+  } while (amount >= 1024 && index < units.length - 1);
+  return `${amount.toFixed(amount >= 10 ? 1 : 2)} ${units[index]}`;
 }
 
 async function loadSupplementalContext() {
@@ -2477,6 +2614,8 @@ async function autoPreviewImport() {
   await previewImport();
 }
 
+const scheduleAutoPreviewImport = debounce(() => autoPreviewImport(), 350);
+
 async function previewImport(event) {
   event?.preventDefault();
   const content = importContent.value.trim();
@@ -2490,6 +2629,7 @@ async function previewImport(event) {
   previewStatus.textContent = "正在解析内容...";
   previewBadge.textContent = "解析中";
   confirmImportButton.disabled = true;
+  const requestId = ++state.importPreviewRequest;
 
   try {
     const { preview } = await api("/api/preview-source", {
@@ -2502,6 +2642,7 @@ async function previewImport(event) {
         pageKind: importPageKind.value
       })
     });
+    if (requestId !== state.importPreviewRequest) return;
 
     state.importPreview = preview;
     confirmTitle.value = preview.title;
@@ -2514,7 +2655,9 @@ async function previewImport(event) {
       ? ` 检测到 ${preview.linkedItems.length} 个内容链接，确认导入后会同步导入这些内容页。`
       : "";
     const refreshJobNote = preview.refreshJob
-      ? ` 已加入订阅管理：${preview.refreshJob.name}（默认${preview.refreshJob.enabled ? "开启" : "关闭"}，可在订阅管理页点击立即刷新）。`
+      ? preview.refreshJob.proposed
+        ? ` 确认后将加入订阅管理：${preview.refreshJob.name}（默认关闭）。`
+        : ` 已存在订阅任务：${preview.refreshJob.name}（当前${preview.refreshJob.enabled ? "开启" : "关闭"}）。`
       : "";
     previewStatus.textContent = `${preview.parseNote} 内容长度 ${preview.contentLength} 字符。${linkedNote}${refreshJobNote}${duplicateNote}`;
     const isSubscription = preview.importMode === "subscription" || (preview.pageKind === "list" && preview.refreshJob);
@@ -2524,6 +2667,7 @@ async function previewImport(event) {
     confirmImportButton.disabled = isSubscription ? !preview.refreshJob : (!preview.extractedContent.trim() && !preview.existingItem);
     summarizeButton.disabled = isSubscription || !preview.extractedContent.trim();
   } catch (error) {
+    if (requestId !== state.importPreviewRequest) return;
     previewStatus.textContent = error.message;
     previewBadge.textContent = "失败";
     confirmImportButton.disabled = true;
@@ -2544,6 +2688,19 @@ async function confirmImport() {
   }
 
   if (preview.importMode === "subscription" || (preview.pageKind === "list" && preview.refreshJob)) {
+    if (preview.refreshJob?.proposed) {
+      await api("/api/refresh-jobs", {
+        method: "POST",
+        body: JSON.stringify({
+          url: preview.url,
+          title: confirmTitle.value.trim() || preview.title,
+          sourceType: preview.sourceType,
+          fetchMode: preview.fetchMode,
+          pageKind: preview.pageKind,
+          managedBy: preview.refreshJob.managedBy || ""
+        })
+      });
+    }
     resetImport();
     await switchView("subscriptions");
     return;
@@ -2574,6 +2731,7 @@ async function confirmImport() {
 }
 
 function resetImport() {
+  state.importPreviewRequest += 1;
   state.importPreview = null;
   importForm.reset();
   confirmTitle.value = "";
@@ -3049,6 +3207,7 @@ function renderRefreshJobs(jobs) {
         <label class="inline-toggle">
           <input data-field="enabled" type="checkbox" ${job.enabled ? "checked" : ""} />
           <strong>${escapeHtml(job.name)}</strong>
+          ${job.quarantined ? `<span class="integrity-badge">待验证</span>` : ""}
         </label>
         <div class="refresh-job-actions">
           <button type="button" data-run-job="${escapeHtml(job.id)}" ${job.running ? "disabled" : ""}>${job.running ? "运行中" : "立即刷新"}</button>
@@ -3079,6 +3238,7 @@ function renderRefreshJobs(jobs) {
       <div class="item-meta">
         状态：${escapeHtml(formatRefreshStatus(job.running ? "running" : job.status || "idle"))} · 上次刷新：${escapeHtml(job.lastRunAt ? formatDate(job.lastRunAt) : "未刷新")}
       </div>
+      ${job.quarantined ? `<div class="detail-note integrity-warning">${escapeHtml(job.quarantineReason || "该 Teams 任务因历史会话串线已暂停。点击立即刷新进行验证，成功后再启用自动刷新。")}</div>` : ""}
       ${job.lastError ? `<div class="item-meta">错误：${escapeHtml(job.lastError)}</div>` : ""}
       ${job.lastResult && !["failed", "unreachable", "running"].includes(job.status) ? `<div class="item-meta">结果：更新 ${escapeHtml(job.lastResult.updatedItemCount ?? job.lastResult.updatedIssueCount ?? 0)} / ${escapeHtml(job.lastResult.linkCount ?? job.lastResult.issueCount ?? 0)} 个内容页，跳过 ${escapeHtml(job.lastResult.skippedItemCount || 0)}</div>` : ""}
       <input data-field="fetchMode" type="hidden" value="${escapeHtml(job.fetchMode || "auto")}" />
@@ -3379,6 +3539,7 @@ async function monitorSubscriptionRefreshRun(run, initialMessage = "刷新中") 
           const skipped = Number(result.skippedItemCount || 0);
           const errorCount = Number(result.errorCount || failed || 0);
           refreshJobStatus.textContent = `${latest.status === "completed" ? "刷新完成" : latest.status === "canceled" ? "刷新已取消" : "刷新结束，有失败"}：更新 ${updated} / ${totalItems} 个内容页，AI 已整理 ${newCount} 个，AI 失败 ${aiFailed} 个，跳过 ${skipped} 个，失败 ${errorCount} 个。`;
+          if (errorCount) showRefreshFailureToastFromRun(latest);
           if (state.view === "materials") await loadAll();
           await loadMaterialUpdateCount();
           scheduleReloadAfterRefreshUpdates(newCount);
@@ -3429,6 +3590,7 @@ async function checkRefreshJobsForUpdates() {
     state.refreshJobs = jobs || state.refreshJobs;
     renderHomeOverview();
     if (state.view === "subscriptions") renderRefreshJobs(state.refreshJobs);
+    showNewRefreshFailureToast(jobs || []);
     const latest = latestUpdatedRefreshRun(jobs || []);
     if (!latest || latest.key <= state.seenRefreshRunKey) return;
     const updated = refreshResultUpdatedCount(latest.job.lastResult);
@@ -3451,6 +3613,11 @@ function rememberRefreshRunKey(key) {
   localStorage.setItem("materialOrganizer.seenRefreshRunKey", key);
 }
 
+function rememberRefreshFailureKey(key) {
+  state.seenRefreshFailureKey = key;
+  localStorage.setItem("materialOrganizer.seenRefreshFailureKey", key);
+}
+
 function latestUpdatedRefreshRun(jobs) {
   return (jobs || [])
     .filter((job) => job.lastRunAt && refreshResultUpdatedCount(job.lastResult) > 0)
@@ -3466,6 +3633,140 @@ function refreshResultUpdatedCount(result) {
     return Number(result?.newItemCount || 0);
   }
   return Number(result?.updatedItemCount ?? result?.updatedIssueCount ?? 0);
+}
+
+function showRefreshFailureToastFromRun(run) {
+  const entries = [
+    ...(run?.result?.results || []),
+    ...(run?.result?.contentResults || [])
+  ].filter((entry) => entry?.status === "failed" || Number(entry?.result?.errorCount || 0) > 0);
+  const failures = entries.map((entry) => ({
+    sourceType: entry.result?.sourceType || run?.sourceType || "refresh",
+    name: entry.name || entry.id || "刷新任务",
+    url: entry.result?.errors?.find((item) => item?.url)?.url || "",
+    error: refreshResultErrorText(entry.result) || entry.error || run?.error || "刷新失败"
+  })).filter((entry) => entry.error);
+  if (!failures.length && run?.error) {
+    failures.push({
+      sourceType: run.sourceType || "refresh",
+      name: "刷新任务",
+      url: "",
+      error: run.error
+    });
+  }
+  if (!failures.length) return;
+  showRefreshFailureToast(failures);
+}
+
+function showNewRefreshFailureToast(jobs) {
+  const latest = latestFailedRefreshJob(jobs);
+  if (!latest || latest.key <= state.seenRefreshFailureKey) return;
+  rememberRefreshFailureKey(latest.key);
+  showRefreshFailureToast([{
+    sourceType: sourceTypeForSubscription(latest.job),
+    name: latest.job.name || latest.job.id,
+    url: latest.job.url || latest.job.lastResult?.errors?.find((entry) => entry?.url)?.url || "",
+    error: refreshJobErrorText(latest.job)
+  }]);
+}
+
+function latestFailedRefreshJob(jobs) {
+  return (jobs || [])
+    .filter((job) => job.lastRunAt && ["failed", "unreachable"].includes(job.status) && refreshJobErrorText(job))
+    .map((job) => ({
+      job,
+      key: `${job.lastRunAt}|${job.id}|${refreshJobErrorText(job)}`
+    }))
+    .sort((a, b) => b.key.localeCompare(a.key))[0] || null;
+}
+
+function refreshJobErrorText(job) {
+  return job?.lastError || refreshResultErrorText(job?.lastResult);
+}
+
+function refreshResultErrorText(result) {
+  return result?.errors?.find((entry) => entry?.error)?.error || "";
+}
+
+function showRefreshFailureToast(failures) {
+  const authFailure = failures.find(isAuthenticationFailure);
+  if (authFailure) {
+    showAuthFailureDialog(authFailure);
+  }
+  const nonAuthFailures = authFailure ? failures.filter((failure) => !isAuthenticationFailure(failure)) : failures;
+  if (!nonAuthFailures.length) return;
+  failures = nonAuthFailures;
+  const visible = failures.slice(0, 3);
+  const title = failures.length > 1 ? `${failures.length} 个刷新任务失败` : `${subscriptionSourceLabel(visible[0].sourceType)} 刷新失败`;
+  const lines = visible.map((failure) => {
+    const name = failure.name ? `${failure.name}：` : "";
+    return `${subscriptionSourceLabel(failure.sourceType)} · ${name}${failure.error}`;
+  });
+  if (failures.length > visible.length) lines.push(`还有 ${failures.length - visible.length} 个失败任务，请到订阅管理查看。`);
+  showToast({
+    title,
+    message: lines.join("\n")
+  });
+}
+
+function isAuthenticationFailure(failure) {
+  const text = `${failure?.sourceType || ""} ${failure?.name || ""} ${failure?.url || ""} ${failure?.error || ""}`;
+  return /未登录|401|Unauthorized|Unauthori[sz]ed|authentication|required|登录态|login/i.test(text);
+}
+
+function showAuthFailureDialog(failure) {
+  if (!authFailureDialog || !authFailureMessage) return;
+  const source = subscriptionSourceLabel(failure.sourceType);
+  const loginUrl = authFailureLoginUrl(failure);
+  state.authFailurePrompt = { ...failure, loginUrl };
+  authFailureMessage.textContent = `${source} 的登录态已失效，刷新任务“${failure.name || "未命名"}”无法继续。`;
+  if (openAuthWebdriverButton) {
+    openAuthWebdriverButton.textContent = `打开 ${source} 登录`;
+  }
+  if (!authFailureDialog.open) authFailureDialog.showModal();
+}
+
+function closeAuthFailureDialog() {
+  authFailureDialog?.close();
+}
+
+async function openAuthFailureWebdriver() {
+  const url = state.authFailurePrompt?.loginUrl;
+  closeAuthFailureDialog();
+  if (!url) return;
+  await openWebdriver(url);
+  showToast({
+    title: "已打开 WebDriver 登录",
+    message: "请在新打开的浏览器窗口完成登录，然后回到订阅管理重新刷新。"
+  });
+}
+
+function authFailureLoginUrl(failure) {
+  const text = `${failure?.sourceType || ""} ${failure?.url || ""} ${failure?.error || ""}`;
+  if (/confluence/i.test(text)) return "https://confluence.amlogic.com";
+  if (/jira/i.test(text)) return failure?.url || "https://jira.amlogic.com/issues/?filter=50724";
+  return failure?.url || "";
+}
+
+function showToast({ title, message, duration = 9000 }) {
+  if (!toastRegion) return;
+  const toast = document.createElement("div");
+  toast.className = "toast";
+  toast.innerHTML = `
+    <div><strong>${escapeHtml(title || "提示")}</strong></div>
+    <button type="button" aria-label="关闭提示">×</button>
+    <p>${escapeHtml(message || "").replace(/\n/g, "<br>")}</p>
+  `;
+  const close = () => {
+    const timer = state.toastTimers.get(toast);
+    if (timer) clearTimeout(timer);
+    state.toastTimers.delete(toast);
+    toast.remove();
+  };
+  toast.querySelector("button")?.addEventListener("click", close);
+  toastRegion.append(toast);
+  const timer = setTimeout(close, duration);
+  state.toastTimers.set(toast, timer);
 }
 
 function schedulePageReloadForBackgroundRefresh(updatedCount) {
@@ -3630,18 +3931,19 @@ function escapeHtml(value) {
 }
 
 function renderMarkdown(markdown) {
+  const normalizedMarkdown = String(markdown || "").replace(/(https?:\/\/[^\s<>()\[\]]+)([（【])/g, "$1 $2");
   if (window.marked && window.DOMPurify) {
     window.marked.setOptions({
       breaks: false,
       gfm: true
     });
-    const rawHtml = window.marked.parse(String(markdown || ""));
+    const rawHtml = window.marked.parse(normalizedMarkdown);
     return addSafeLinkAttributes(window.DOMPurify.sanitize(rawHtml, {
       USE_PROFILES: { html: true },
       ADD_ATTR: ["target", "rel"]
     }));
   }
-  return renderMarkdownFallback(markdown);
+  return renderMarkdownFallback(normalizedMarkdown);
 }
 
 function renderMarkdownFallback(markdown) {

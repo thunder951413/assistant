@@ -31,7 +31,7 @@ export function safeSearch(url) {
 }
 
 export function slugTag(value) {
-  return cleanText(value).toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9._/-]/g, "");
+  return cleanText(value).toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9+._/-]/g, "");
 }
 
 export function normalizeTags(tags) {

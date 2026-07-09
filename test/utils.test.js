@@ -24,7 +24,7 @@ describe("utils", () => {
   });
 
   it("normalizes tags and slugs", () => {
-    assert.deepEqual(normalizeTags(" Jira, jira, CI+ , blocked "), ["jira", "ci", "blocked"]);
+    assert.deepEqual(normalizeTags(" Jira, jira, CI+ , blocked "), ["jira", "ci+", "blocked"]);
     assert.equal(slugify("TV-221322 [CI+]"), "tv-221322-ci");
   });
 });

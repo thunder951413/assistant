@@ -93,7 +93,7 @@
                 <p>查看资料更新、订阅刷新和 AI 检索状态，然后直接在下方继续提问。</p>
               </div>
               <div class="overview-status-row">
-                <span class="status-pill is-local">本地模型</span>
+                <span id="homeAiMode" class="status-pill is-local">AI 状态载入中</span>
                 <span class="status-pill is-search">混合检索</span>
                 <span class="status-pill is-online">联网资料</span>
               </div>
@@ -178,7 +178,7 @@
                     <th>任务</th>
                     <th>状态</th>
                     <th>最近刷新</th>
-                    <th>成功率</th>
+                    <th>最近成功</th>
                     <th>进度</th>
                     <th>新增/变更</th>
                     <th>操作</th>
@@ -419,6 +419,7 @@
             <section class="settings-section" data-settings-panel="ai">
               <h3>AI 接口</h3>
               <p>支持 OpenAI 兼容格式，会调用 <code>/chat/completions</code>。</p>
+              <p id="aiPrivacyNotice" class="privacy-notice">配置远程地址后，问答、总结、标题、标签和资料整理会把相关资料片段发送到该服务。</p>
               <label>
                 Base URL
                 <input id="settingBaseUrl" placeholder="例如 https://api.openai.com/v1" />
@@ -552,7 +553,7 @@
 
             <section class="settings-section" data-settings-panel="capture" hidden>
               <h3>页面来源认证</h3>
-              <p>列表页和内容页抓取会优先使用这里配置的 Cookie、Token 或 Basic 认证。</p>
+              <p>抓取会优先调用 Jira、Confluence、GitHub 或 Microsoft Graph API，API 不可用时再回退到 HTML/WebDriver。Token、Cookie 或 Basic 认证仅保存在本机。</p>
               <div id="sourceProfiles" class="source-profiles"></div>
             </section>
 
@@ -605,6 +606,11 @@
                 <span>当前生效路径</span>
                 <code id="activeDocumentRoot">载入中</code>
               </div>
+              <div class="storage-stats" id="storageStats">正在计算存储占用...</div>
+              <div class="settings-grid">
+                <button id="cleanupSnapshotsButton" type="button">清理旧快照</button>
+              </div>
+              <p id="storageCleanupStatus" class="status-message">每条资料最多保留最近 20 个历史版本。</p>
             </section>
 
             <section class="settings-section" data-settings-panel="storage" hidden>
@@ -767,8 +773,29 @@
       </form>
     </dialog>
 
-    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js"></script>
+    <dialog id="authFailureDialog" class="auth-failure-dialog">
+      <form method="dialog">
+        <div class="dialog-header">
+          <div>
+            <h3>登录态已失效</h3>
+            <p id="authFailureMessage">需要重新启动 WebDriver 登录后再刷新。</p>
+          </div>
+          <button type="button" id="closeAuthFailureButton" class="icon-button" aria-label="关闭">×</button>
+        </div>
+        <div class="auth-failure-note">
+          刷新任务检测到认证失败。打开 WebDriver 后，请在浏览器窗口完成登录，再回到订阅管理重新刷新。
+        </div>
+        <div class="dialog-actions">
+          <button type="button" id="dismissAuthFailureButton">稍后处理</button>
+          <button type="button" id="openAuthWebdriverButton" class="primary-button">打开 WebDriver 登录</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+    <script src="/vendor/purify.min.js"></script>
+    <script src="/vendor/marked.umd.js"></script>
     <script type="module" src="/app.js"></script>
   </body>
 </html>

@@ -11,6 +11,7 @@
 - 资料导入：支持粘贴文本、拖入文本文件、输入 URL、粘贴网页内容。
 - 网页抓取：支持普通网页、Jira、Confluence、GitHub、Teams 等来源类型。
 - Webdriver 抓取：可用 Playwright Chromium 登录需要认证的页面，并复用登录态抓取。
+- API-first 抓取：Jira、Confluence、GitHub Enterprise 和 Teams 在凭据允许时优先使用官方 API，HTML/WebDriver 作为回退。
 - 资料预览：导入前可确认标题、正文、标签和 AI 总结。
 - 资料管理：按来源、标签、关键词浏览，支持详情查看、标题编辑、标签编辑、删除。
 - AI 整理：支持生成标题、正文整理、标签推荐、列表分类和批量处理。
@@ -18,6 +19,8 @@
 - 补充资料：维护额外上下文，并可让 AI 分析候选补充项。
 - 导入导出：支持设置导入导出、知识库数据导入导出。
 - Embedding 配置：可启用 OpenAI 兼容 embedding 接口作为检索增强配置。
+- 数据完整性保护：Teams 会话标题校验、评论/消息数量防退化、异常资料隔离。
+- 存储治理：内容真正变化后才保存快照，每条资料最多保留最近 20 个版本。
 
 ## 技术栈
 
@@ -134,6 +137,8 @@ AI 接口会调用：
 
 如果没有配置 AI 接口，应用仍可导入资料，并在问答或总结场景返回本地检索结果或本地提取式摘要。
 
+如果 Base URL 指向远程服务，问答、总结、标题、标签、Embedding 和资料整理会把相关资料片段发送到该服务。首页与设置页会明确显示“远程 AI”；资料文件本身仍保存在本机。
+
 ## 知识库存储
 
 默认资料库路径：
@@ -201,6 +206,21 @@ knowledge-base/
 - `roku.atlassian.net`
 - `github.ecodesamsung.com`
 - `teams.microsoft.com`
+
+抓取优先级：
+
+1. Jira REST、Confluence REST、GitHub Enterprise REST 或 Microsoft Graph。
+2. 带认证头的普通 HTTP 抓取。
+3. 需要动态渲染、SSO 或页面展开时使用 WebDriver。
+
+Teams 使用 Bearer Token 时会尝试 Microsoft Graph；否则使用 WebDriver。Teams 刷新会校验实际会话标题，不匹配时阻止覆盖。可运行以下命令检查或隔离旧的串线资料：
+
+```bash
+node scripts/report-teams-title-mismatches.js
+node scripts/report-teams-title-mismatches.js --quarantine
+```
+
+设置页“存储”中会显示知识库、历史快照和 WebDriver 登录数据的占用，并可清理超过最近 20 个版本的旧快照。
 
 ## 订阅刷新
 

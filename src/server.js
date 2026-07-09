@@ -4,6 +4,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { chromium } from "playwright";
+import { JSDOM } from "jsdom";
+import { Readability } from "@mozilla/readability";
 import {
   cleanText,
   normalizeTags,
@@ -13,6 +15,9 @@ import {
   slugify,
   uniqueValues
 } from "./utils.js";
+import { createRouter } from "./router.js";
+import { createAiClient } from "./ai-client.js";
+import { areCaptureTitlesConsistent, isSupportedCaptureContentType, paginate } from "./capture-utils.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -21,6 +26,7 @@ const configDir = path.join(rootDir, ".config");
 const settingsPath = path.join(configDir, "settings.json");
 const webdriverRoot = path.join(configDir, "webdriver");
 let settings = await loadSettings();
+const ai = createAiClient(() => settings);
 let kbDir = resolveDocumentRoot(settings.documentRoot);
 let itemsDir = path.join(kbDir, "items");
 let tagsDir = path.join(kbDir, "tags");
@@ -35,6 +41,8 @@ const refreshRuntime = {
 const FETCH_TIMEOUT_MS = 45 * 1000;
 const REFRESH_JOB_TIMEOUT_MS = 4 * 60 * 1000;
 const REFRESH_RUN_RETENTION_MS = 6 * 60 * 60 * 1000;
+const SNAPSHOT_RETENTION_COUNT = 20;
+const MAX_FETCH_BYTES = 12 * 1024 * 1024;
 
 const port = Number(process.env.PORT || 8020);
 
@@ -62,392 +70,370 @@ server.listen(port, "127.0.0.1", () => {
   console.log(`Material Organizer running at http://localhost:${port}`);
 });
 
+// ---- Route table (replaces the 386-line if/else chain) ----
+
+const api = createRouter();
+
+// Items -------------------------------------------------------
+api.get("/api/items", async ({ url, res }) => {
+  const allItems = await listItems({
+    tag: url.searchParams.get("tag"),
+    sourceType: url.searchParams.get("sourceType"),
+    query: url.searchParams.get("q"),
+    updates: url.searchParams.get("updates"),
+    includeLists: url.searchParams.get("includeLists")
+  });
+  const pageData = paginate(allItems, url.searchParams.get("page") || 1, url.searchParams.get("pageSize") || allItems.length || 1);
+  const items = url.searchParams.has("page") || url.searchParams.has("pageSize") ? pageData.items : allItems;
+  sendJson(res, 200, { ...pageData, items });
+});
+
+api.post("/api/items", async ({ req, res }) => {
+  const body = await readBody(req);
+  const item = await createItem(body);
+  sendJson(res, 201, { item });
+});
+
+api.get("/api/items/:id", async ({ params, res }) => {
+  const item = await readItem(params.id);
+  sendJson(res, 200, { item });
+});
+
+api.delete("/api/items/:id", async ({ params, res }) => {
+  await deleteItem(params.id);
+  sendJson(res, 200, { ok: true });
+});
+
+api.patch("/api/items/:id/tags", async ({ params, req, res }) => {
+  const body = await readBody(req);
+  const item = await updateTags(params.id, body.tags || []);
+  sendJson(res, 200, { item });
+});
+
+api.patch("/api/items/:id/title", async ({ params, req, res }) => {
+  const body = await readBody(req);
+  const item = await updateTitle(params.id, body.title || "");
+  sendJson(res, 200, { item });
+});
+
+api.post("/api/items/:id/recommend-title", async ({ params, res }) => {
+  const item = await updateTitleWithAi(params.id);
+  sendJson(res, 200, { item });
+});
+
+api.post("/api/items/:id/recommend-tags", async ({ params, res }) => {
+  const recommendations = await recommendTagsForItem(params.id);
+  sendJson(res, 200, recommendations);
+});
+
+api.post("/api/items/:id/process", async ({ params, res }) => {
+  const item = await processItemWithAi(params.id);
+  sendJson(res, 200, { item });
+});
+
+api.post("/api/items/:id/ack-update", async ({ params, res }) => {
+  const item = await acknowledgeItemUpdate(params.id);
+  sendJson(res, 200, { item });
+});
+
+api.post("/api/items/:id/refresh", async ({ params, res }) => {
+  const item = await refreshItem(params.id);
+  sendJson(res, 200, { item });
+});
+
+// Preview & summarize ------------------------------------------
+api.post("/api/preview-source", async ({ req, res }) => {
+  const body = await readBody(req);
+  const preview = await previewSource(body);
+  sendJson(res, 200, { preview });
+});
+
+api.post("/api/summarize", async ({ req, res }) => {
+  const body = await readBody(req);
+  const summary = await summarizeContent(body);
+  sendJson(res, 200, { summary });
+});
+
+// WebDriver ----------------------------------------------------
+api.get("/api/webdriver/status", async ({ res }) => {
+  sendJson(res, 200, { sessions: await webdriverStatus() });
+});
+
+api.post("/api/webdriver/open", async ({ req, res }) => {
+  const body = await readBody(req);
+  const session = await openWebdriverSession(body.url || "", body.hostname || "");
+  sendJson(res, 200, { session });
+});
+
+api.post("/api/webdriver/fetch", async ({ req, res }) => {
+  const body = await readBody(req);
+  const fetched = await fetchUrlWithWebdriver(body.url, { pageKind: body.pageKind || "auto" });
+  sendJson(res, 200, { fetched });
+});
+
+api.post("/api/webdriver/save-cookies", async ({ req, res }) => {
+  const body = await readBody(req);
+  const saved = await saveWebdriverCookies(body.url || "", body.hostname || "");
+  sendJson(res, 200, { saved, settings: publicSettings() });
+});
+
+// Batch AI operations ------------------------------------------
+api.post("/api/batch-recommend-tags", async ({ req, res }) => {
+  const body = await readBody(req);
+  const recommendations = await recommendTagsForItems(body.ids || []);
+  sendJson(res, 200, recommendations);
+});
+
+api.post("/api/classify-items", async ({ req, res }) => {
+  const body = await readBody(req);
+  const classification = await classifyItems(body.ids || [], body.categories || []);
+  sendJson(res, 200, classification);
+});
+
+api.post("/api/classify-item", async ({ req, res }) => {
+  const body = await readBody(req);
+  const classification = await classifyItem(body.id || "", body.categories || []);
+  sendJson(res, 200, classification);
+});
+
+// Tags ---------------------------------------------------------
+api.get("/api/tags", async ({ res }) => {
+  sendJson(res, 200, { tags: await listTags() });
+});
+
+api.post("/api/tags", async ({ req, res }) => {
+  const body = await readBody(req);
+  const tags = await addManualTags(body.tags || body.tag || []);
+  sendJson(res, 200, { tags });
+});
+
+api.patch("/api/tags", async ({ req, res }) => {
+  const body = await readBody(req);
+  const result = await renameTag(body.from || body.oldTag || "", body.to || body.newTag || "");
+  sendJson(res, 200, result);
+});
+
+api.delete("/api/tags", async ({ req, res }) => {
+  const body = await readBody(req);
+  const result = await deleteTags(body.tags || []);
+  sendJson(res, 200, result);
+});
+
+// Search & knowledge -------------------------------------------
+api.post("/api/search", async ({ req, res }) => {
+  const body = await readBody(req);
+  const results = await searchItems(body.query || "");
+  sendJson(res, 200, { results });
+});
+
+api.post("/api/knowledge-search", async ({ req, res }) => {
+  const body = await readBody(req);
+  const results = await searchKnowledgeBase(body.query || "", body.limit || 8);
+  sendJson(res, 200, { rootDir: kbDir, results });
+});
+
+api.post("/api/ask-context", async ({ req, res }) => {
+  const body = await readBody(req);
+  const context = await buildAskContext(body.question || "");
+  sendJson(res, 200, context);
+});
+
+api.get("/api/agent-config", async ({ res }) => {
+  sendJson(res, 200, {
+    rootDir: kbDir,
+    guidePath: path.join(kbDir, "AGENTS.md")
+  });
+});
+
+// Supplemental context -----------------------------------------
+api.get("/api/supplemental-context", async ({ res }) => {
+  const entries = await readSupplementalEntries();
+  sendJson(res, 200, {
+    entries,
+    content: renderSupplementalMarkdown(entries),
+    path: supplementalContextPath(),
+    entriesPath: supplementalEntriesPath()
+  });
+});
+
+api.patch("/api/supplemental-context", async ({ req, res }) => {
+  const body = await readBody(req);
+  const entries = Array.isArray(body.entries)
+    ? await saveSupplementalEntries(body.entries)
+    : await saveSupplementalContext(body.content || "");
+  sendJson(res, 200, {
+    entries,
+    content: renderSupplementalMarkdown(entries),
+    path: supplementalContextPath(),
+    entriesPath: supplementalEntriesPath()
+  });
+});
+
+api.post("/api/supplemental-context/suggest", async ({ req, res }) => {
+  const body = await readBody(req);
+  const entries = await suggestSupplementalContext(body.existingEntries || []);
+  sendJson(res, 200, {
+    entries,
+    suggestion: renderSupplementalMarkdown(entries)
+  });
+});
+
+// Settings -----------------------------------------------------
+api.get("/api/settings", async ({ res }) => {
+  await syncContentRefreshJobsFromItems();
+  sendJson(res, 200, { settings: publicSettings() });
+});
+
+api.patch("/api/settings", async ({ req, res }) => {
+  const body = await readBody(req);
+  settings = await saveSettings(body);
+  configureKnowledgeBase();
+  await ensureKnowledgeBase();
+  await syncContentRefreshJobsFromItems();
+  startRefreshScheduler();
+  sendJson(res, 200, { settings: publicSettings() });
+});
+
+// Export / import ----------------------------------------------
+api.get("/api/export/settings", async ({ res }) => {
+  sendJsonDownload(res, exportFilename("assistant-settings"), {
+    type: "material-organizer-settings",
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    settings
+  });
+});
+
+api.post("/api/import/settings", async ({ req, res }) => {
+  const body = await readBody(req);
+  settings = await importSettingsBundle(body);
+  configureKnowledgeBase();
+  await ensureKnowledgeBase();
+  await syncContentRefreshJobsFromItems();
+  startRefreshScheduler();
+  sendJson(res, 200, { settings: publicSettings() });
+});
+
+api.get("/api/export/data", async ({ res }) => {
+  sendJsonDownload(res, exportFilename("assistant-data"), await exportDataBundle());
+});
+
+api.post("/api/import/data", async ({ req, res }) => {
+  const body = await readBody(req);
+  const result = await importDataBundle(body.bundle || body, { mode: body.mode || "merge" });
+  await syncContentRefreshJobsFromItems();
+  sendJson(res, 200, result);
+});
+
+// Source profiles ----------------------------------------------
+api.get("/api/source-profiles", async ({ res }) => {
+  sendJson(res, 200, { profiles: publicSourceProfiles() });
+});
+
+api.get("/api/storage-stats", async ({ res }) => {
+  sendJson(res, 200, { stats: await storageStats() });
+});
+
+api.post("/api/storage-cleanup", async ({ res }) => {
+  const result = await cleanupOldSnapshots();
+  sendJson(res, 200, { result, stats: await storageStats() });
+});
+
+// Refresh jobs -------------------------------------------------
+api.get("/api/refresh-jobs", async ({ res }) => {
+  await syncContentRefreshJobsFromItems();
+  await reconcileStaleRunningRefreshJobs();
+  sendJson(res, 200, { jobs: publicRefreshJobs() });
+});
+
+api.post("/api/refresh-jobs", async ({ req, res }) => {
+  const body = await readBody(req);
+  const url = canonicalizeMaterialUrl(body.url || "");
+  if (!url) throw new Error("Refresh job URL is required.");
+  const pageKind = resolvePageKind(url, body.pageKind || "auto");
+  const job = pageKind === "list"
+    ? await ensureRefreshJobForListUrl(url, body)
+    : await ensureRefreshJobForContentUrl(url, body);
+  startRefreshScheduler();
+  sendJson(res, 201, { job, jobs: publicRefreshJobs() });
+});
+
+api.post("/api/refresh-jobs/run-batch", async ({ url, req, res }) => {
+  await syncContentRefreshJobsFromItems();
+  const body = await readBody(req);
+  const options = { force: true, sourceType: cleanText(body.sourceType || "all") };
+  if (url.searchParams.get("background") === "1" || body.background) {
+    const run = await startRefreshRunByIds(body.ids || [], options);
+    sendJson(res, 202, { run, jobs: publicRefreshJobs() });
+    return;
+  }
+  const result = await runRefreshJobsByIds(body.ids || [], options);
+  sendJson(res, 200, { result, jobs: publicRefreshJobs() });
+});
+
+api.post("/api/refresh-jobs/:id/run", async ({ params, url, res }) => {
+  await syncContentRefreshJobsFromItems();
+  if (url.searchParams.get("background") === "1") {
+    const run = await startRefreshRunByIds([params.id], { force: true, sourceType: "all" });
+    sendJson(res, 202, { run, jobs: publicRefreshJobs() });
+    return;
+  }
+  const result = await runRefreshJobById(params.id, { force: true });
+  sendJson(res, 200, { result, jobs: publicRefreshJobs() });
+});
+
+api.delete("/api/refresh-jobs/:id", async ({ params, res }) => {
+  const jobs = await deleteRefreshJob(params.id);
+  startRefreshScheduler();
+  sendJson(res, 200, { jobs });
+});
+
+api.delete("/api/refresh-jobs/:id/items", async ({ params, res }) => {
+  const result = await deleteRefreshJobItems(params.id);
+  sendJson(res, 200, { result, jobs: publicRefreshJobs() });
+});
+
+api.delete("/api/refresh-jobs/source/:sourceType/items", async ({ params, res }) => {
+  await syncContentRefreshJobsFromItems();
+  const result = await deleteRefreshSourceItems(params.sourceType);
+  sendJson(res, 200, { result, jobs: publicRefreshJobs() });
+});
+
+// Refresh runs -------------------------------------------------
+api.get("/api/refresh-runs", async ({ res }) => {
+  sendJson(res, 200, { runs: publicRefreshRuns() });
+});
+
+api.get("/api/refresh-runs/:runId", async ({ params, res }) => {
+  const run = publicRefreshRun(params.runId);
+  if (!run) throw new Error("Refresh run not found.");
+  sendJson(res, 200, { run });
+});
+
+api.post("/api/refresh-runs/:runId/cancel", async ({ params, res }) => {
+  const run = await cancelRefreshRun(params.runId);
+  sendJson(res, 200, { run, jobs: publicRefreshJobs() });
+});
+
+// Chat ---------------------------------------------------------
+api.post("/api/chat", async ({ req, res }) => {
+  const body = await readBody(req);
+  const answer = await answerFromKnowledgeBase(body.message || "");
+  sendJson(res, 200, answer);
+});
+
+api.post("/api/chat-stream", async ({ req, res }) => {
+  const body = await readBody(req);
+  await streamAnswerFromKnowledgeBase(body.message || "", res);
+});
+
+// ---- Dispatch -------------------------------------------------
+
 async function handleApi(req, res, url) {
-  if (req.method === "GET" && url.pathname === "/api/items") {
-    const items = await listItems({
-      tag: url.searchParams.get("tag"),
-      sourceType: url.searchParams.get("sourceType"),
-      query: url.searchParams.get("q"),
-      updates: url.searchParams.get("updates"),
-      includeLists: url.searchParams.get("includeLists")
-    });
-    sendJson(res, 200, { items });
-    return;
+  const matched = await api.handle(req, res, url);
+  if (!matched) {
+    sendJson(res, 404, { error: "Not found" });
   }
-
-  if (req.method === "POST" && url.pathname === "/api/items") {
-    const body = await readBody(req);
-    const item = await createItem(body);
-    sendJson(res, 201, { item });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/preview-source") {
-    const body = await readBody(req);
-    const preview = await previewSource(body);
-    sendJson(res, 200, { preview });
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/api/webdriver/status") {
-    sendJson(res, 200, { sessions: await webdriverStatus() });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/webdriver/open") {
-    const body = await readBody(req);
-    const session = await openWebdriverSession(body.url || "", body.hostname || "");
-    sendJson(res, 200, { session });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/webdriver/fetch") {
-    const body = await readBody(req);
-    const fetched = await fetchUrlWithWebdriver(body.url, { pageKind: body.pageKind || "auto" });
-    sendJson(res, 200, { fetched });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/webdriver/save-cookies") {
-    const body = await readBody(req);
-    const saved = await saveWebdriverCookies(body.url || "", body.hostname || "");
-    sendJson(res, 200, { saved, settings: publicSettings() });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/summarize") {
-    const body = await readBody(req);
-    const summary = await summarizeContent(body);
-    sendJson(res, 200, { summary });
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname.startsWith("/api/items/")) {
-    const id = decodeURIComponent(url.pathname.split("/")[3] || "");
-    const item = await readItem(id);
-    sendJson(res, 200, { item });
-    return;
-  }
-
-  if (req.method === "DELETE" && url.pathname.startsWith("/api/items/")) {
-    const id = decodeURIComponent(url.pathname.split("/")[3] || "");
-    await deleteItem(id);
-    sendJson(res, 200, { ok: true });
-    return;
-  }
-
-  if (req.method === "PATCH" && url.pathname.startsWith("/api/items/") && url.pathname.endsWith("/tags")) {
-    const id = decodeURIComponent(url.pathname.split("/")[3] || "");
-    const body = await readBody(req);
-    const item = await updateTags(id, body.tags || []);
-    sendJson(res, 200, { item });
-    return;
-  }
-
-  if (req.method === "PATCH" && url.pathname.endsWith("/title")) {
-    const id = decodeURIComponent(url.pathname.split("/")[3] || "");
-    const body = await readBody(req);
-    const item = await updateTitle(id, body.title || "");
-    sendJson(res, 200, { item });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname.endsWith("/recommend-title")) {
-    const id = decodeURIComponent(url.pathname.split("/")[3] || "");
-    const item = await updateTitleWithAi(id);
-    sendJson(res, 200, { item });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname.endsWith("/recommend-tags")) {
-    const id = decodeURIComponent(url.pathname.split("/")[3] || "");
-    const recommendations = await recommendTagsForItem(id);
-    sendJson(res, 200, recommendations);
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/batch-recommend-tags") {
-    const body = await readBody(req);
-    const recommendations = await recommendTagsForItems(body.ids || []);
-    sendJson(res, 200, recommendations);
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/classify-items") {
-    const body = await readBody(req);
-    const classification = await classifyItems(body.ids || [], body.categories || []);
-    sendJson(res, 200, classification);
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/classify-item") {
-    const body = await readBody(req);
-    const classification = await classifyItem(body.id || "", body.categories || []);
-    sendJson(res, 200, classification);
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname.endsWith("/process")) {
-    const id = decodeURIComponent(url.pathname.split("/")[3] || "");
-    const item = await processItemWithAi(id);
-    sendJson(res, 200, { item });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname.endsWith("/ack-update")) {
-    const id = decodeURIComponent(url.pathname.split("/")[3] || "");
-    const item = await acknowledgeItemUpdate(id);
-    sendJson(res, 200, { item });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname.endsWith("/refresh")) {
-    const id = decodeURIComponent(url.pathname.split("/")[3] || "");
-    const item = await refreshItem(id);
-    sendJson(res, 200, { item });
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/api/tags") {
-    sendJson(res, 200, { tags: await listTags() });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/tags") {
-    const body = await readBody(req);
-    const tags = await addManualTags(body.tags || body.tag || []);
-    sendJson(res, 200, { tags });
-    return;
-  }
-
-  if (req.method === "PATCH" && url.pathname === "/api/tags") {
-    const body = await readBody(req);
-    const result = await renameTag(body.from || body.oldTag || "", body.to || body.newTag || "");
-    sendJson(res, 200, result);
-    return;
-  }
-
-  if (req.method === "DELETE" && url.pathname === "/api/tags") {
-    const body = await readBody(req);
-    const result = await deleteTags(body.tags || []);
-    sendJson(res, 200, result);
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/search") {
-    const body = await readBody(req);
-    const results = await searchItems(body.query || "");
-    sendJson(res, 200, { results });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/knowledge-search") {
-    const body = await readBody(req);
-    const results = await searchKnowledgeBase(body.query || "", body.limit || 8);
-    sendJson(res, 200, { rootDir: kbDir, results });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/ask-context") {
-    const body = await readBody(req);
-    const context = await buildAskContext(body.question || "");
-    sendJson(res, 200, context);
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/api/agent-config") {
-    sendJson(res, 200, {
-      rootDir: kbDir,
-      guidePath: path.join(kbDir, "AGENTS.md")
-    });
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/api/supplemental-context") {
-    const entries = await readSupplementalEntries();
-    sendJson(res, 200, {
-      entries,
-      content: renderSupplementalMarkdown(entries),
-      path: supplementalContextPath(),
-      entriesPath: supplementalEntriesPath()
-    });
-    return;
-  }
-
-  if (req.method === "PATCH" && url.pathname === "/api/supplemental-context") {
-    const body = await readBody(req);
-    const entries = Array.isArray(body.entries)
-      ? await saveSupplementalEntries(body.entries)
-      : await saveSupplementalContext(body.content || "");
-    sendJson(res, 200, {
-      entries,
-      content: renderSupplementalMarkdown(entries),
-      path: supplementalContextPath(),
-      entriesPath: supplementalEntriesPath()
-    });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/supplemental-context/suggest") {
-    const body = await readBody(req);
-    const entries = await suggestSupplementalContext(body.existingEntries || []);
-    sendJson(res, 200, {
-      entries,
-      suggestion: renderSupplementalMarkdown(entries)
-    });
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/api/settings") {
-    await syncContentRefreshJobsFromItems();
-    sendJson(res, 200, { settings: publicSettings() });
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/api/export/settings") {
-    sendJsonDownload(res, exportFilename("assistant-settings"), {
-      type: "material-organizer-settings",
-      version: 1,
-      exportedAt: new Date().toISOString(),
-      settings
-    });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/import/settings") {
-    const body = await readBody(req);
-    settings = await importSettingsBundle(body);
-    configureKnowledgeBase();
-    await ensureKnowledgeBase();
-    await syncContentRefreshJobsFromItems();
-    startRefreshScheduler();
-    sendJson(res, 200, { settings: publicSettings() });
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/api/export/data") {
-    sendJsonDownload(res, exportFilename("assistant-data"), await exportDataBundle());
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/import/data") {
-    const body = await readBody(req);
-    const result = await importDataBundle(body.bundle || body, { mode: body.mode || "merge" });
-    await syncContentRefreshJobsFromItems();
-    sendJson(res, 200, result);
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/api/source-profiles") {
-    sendJson(res, 200, { profiles: publicSourceProfiles() });
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/api/refresh-jobs") {
-    await syncContentRefreshJobsFromItems();
-    await reconcileStaleRunningRefreshJobs();
-    sendJson(res, 200, { jobs: publicRefreshJobs() });
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/api/refresh-runs") {
-    sendJson(res, 200, { runs: publicRefreshRuns() });
-    return;
-  }
-
-  if (url.pathname.startsWith("/api/refresh-runs/")) {
-    const runId = decodeURIComponent(url.pathname.split("/")[3] || "");
-    if (req.method === "GET") {
-      const run = publicRefreshRun(runId);
-      if (!run) throw new Error("Refresh run not found.");
-      sendJson(res, 200, { run });
-      return;
-    }
-    if (req.method === "POST" && url.pathname.endsWith("/cancel")) {
-      const run = await cancelRefreshRun(runId);
-      sendJson(res, 200, { run, jobs: publicRefreshJobs() });
-      return;
-    }
-  }
-
-  if (req.method === "POST" && url.pathname.startsWith("/api/refresh-jobs/") && url.pathname.endsWith("/run")) {
-    await syncContentRefreshJobsFromItems();
-    const id = decodeURIComponent(url.pathname.split("/")[3] || "");
-    if (url.searchParams.get("background") === "1") {
-      const run = await startRefreshRunByIds([id], { force: true, sourceType: "all" });
-      sendJson(res, 202, { run, jobs: publicRefreshJobs() });
-      return;
-    }
-    const result = await runRefreshJobById(id, { force: true });
-    sendJson(res, 200, { result, jobs: publicRefreshJobs() });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/refresh-jobs/run-batch") {
-    await syncContentRefreshJobsFromItems();
-    const body = await readBody(req);
-    const options = {
-      force: true,
-      sourceType: cleanText(body.sourceType || "all")
-    };
-    if (url.searchParams.get("background") === "1" || body.background) {
-      const run = await startRefreshRunByIds(body.ids || [], options);
-      sendJson(res, 202, { run, jobs: publicRefreshJobs() });
-      return;
-    }
-    const result = await runRefreshJobsByIds(body.ids || [], options);
-    sendJson(res, 200, { result, jobs: publicRefreshJobs() });
-    return;
-  }
-
-  if (req.method === "DELETE" && url.pathname.startsWith("/api/refresh-jobs/source/") && url.pathname.endsWith("/items")) {
-    await syncContentRefreshJobsFromItems();
-    const sourceType = cleanText(decodeURIComponent(url.pathname.split("/")[4] || ""));
-    const result = await deleteRefreshSourceItems(sourceType);
-    sendJson(res, 200, { result, jobs: publicRefreshJobs() });
-    return;
-  }
-
-  if (req.method === "DELETE" && url.pathname.startsWith("/api/refresh-jobs/") && url.pathname.endsWith("/items")) {
-    const id = decodeURIComponent(url.pathname.split("/")[3] || "");
-    const result = await deleteRefreshJobItems(id);
-    sendJson(res, 200, { result, jobs: publicRefreshJobs() });
-    return;
-  }
-
-  if (req.method === "DELETE" && url.pathname.startsWith("/api/refresh-jobs/")) {
-    const id = decodeURIComponent(url.pathname.split("/")[3] || "");
-    const jobs = await deleteRefreshJob(id);
-    startRefreshScheduler();
-    sendJson(res, 200, { jobs });
-    return;
-  }
-
-  if (req.method === "PATCH" && url.pathname === "/api/settings") {
-    const body = await readBody(req);
-    settings = await saveSettings(body);
-    configureKnowledgeBase();
-    await ensureKnowledgeBase();
-    await syncContentRefreshJobsFromItems();
-    startRefreshScheduler();
-    sendJson(res, 200, { settings: publicSettings() });
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/chat") {
-    const body = await readBody(req);
-    const answer = await answerFromKnowledgeBase(body.message || "");
-    sendJson(res, 200, answer);
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/chat-stream") {
-    const body = await readBody(req);
-    await streamAnswerFromKnowledgeBase(body.message || "", res);
-    return;
-  }
-
-  sendJson(res, 404, { error: "Not found" });
 }
 
 async function createItem(input) {
@@ -495,6 +481,10 @@ async function createItem(input) {
     fetchMode: input.fetchMode || null,
     parentUrl: input.parentUrl || null,
     managedBy: input.managedBy || null,
+    captureMethod: cleanText(input.captureMethod || "manual"),
+    httpValidators: input.httpValidators || {},
+    integrityStatus: cleanText(input.integrityStatus || ""),
+    integrityReason: cleanText(input.integrityReason || ""),
     pendingContentUpdatedAt: cleanText(input.pendingContentUpdatedAt || "")
   };
 
@@ -567,10 +557,11 @@ async function previewSource(input) {
       "该链接已识别为订阅/过滤页。确认后只会加入订阅管理，不会作为资料内容导入。",
       "可以在订阅管理里点击立即刷新，抓取该列表中的内容页。"
     ].join("\n");
-    refreshJob = await ensureRefreshJobForListUrl(canonicalDetectedUrl, {
+    refreshJob = previewRefreshJob(canonicalDetectedUrl, {
       title,
       sourceType: adapter.sourceType,
-      fetchMode: input.fetchMode || "auto"
+      fetchMode: input.fetchMode || "auto",
+      pageKind: "list"
     });
     return {
       title,
@@ -666,17 +657,19 @@ async function previewSource(input) {
   title = title || inferTitle(extractedContent) || "Untitled material";
   const resolvedPageKind = requestedPageKind;
   if (!skipRefreshJob && canonicalDetectedUrl && resolvedPageKind === "list") {
-    refreshJob = await ensureRefreshJobForListUrl(canonicalDetectedUrl, {
+    refreshJob = previewRefreshJob(canonicalDetectedUrl, {
       title,
       sourceType,
       fetchMode: input.fetchMode || "auto",
+      pageKind: "list",
       managedBy: "content-page"
     });
   } else if (!skipRefreshJob && canonicalDetectedUrl && resolvedPageKind === "content") {
-    refreshJob = await ensureRefreshJobForContentUrl(canonicalDetectedUrl, {
+    refreshJob = previewRefreshJob(canonicalDetectedUrl, {
       title,
       sourceType,
-      fetchMode: input.fetchMode || "auto"
+      fetchMode: input.fetchMode || "auto",
+      pageKind: "content"
     });
   }
 
@@ -705,6 +698,41 @@ async function previewSource(input) {
     contentLength: extractedContent.length,
     pageKind: resolvedPageKind,
     fetchMode: input.fetchMode || "auto"
+  };
+}
+
+function previewRefreshJob(url, options = {}) {
+  const canonicalUrl = canonicalizeMaterialUrl(url);
+  const adapter = detectSourceAdapter(canonicalUrl);
+  const normalizedUrl = normalizeUrlForMatch(canonicalUrl);
+  const existing = (settings.refreshJobs || []).find((job) => normalizeUrlForMatch(job.url) === normalizedUrl);
+  if (existing) {
+    return {
+      id: existing.id,
+      name: existing.name,
+      url: existing.url,
+      enabled: Boolean(existing.enabled),
+      intervalMinutes: existing.intervalMinutes,
+      maxItems: existing.maxItems,
+      managedBy: existing.managedBy || "",
+      created: false,
+      proposed: false
+    };
+  }
+  const pageKind = options.pageKind || resolvePageKind(canonicalUrl, "auto");
+  const isList = pageKind === "list";
+  return {
+    id: isList ? defaultRefreshJobIdForListUrl(canonicalUrl, adapter) : defaultRefreshJobIdForContentUrl(canonicalUrl, adapter),
+    name: isList ? defaultRefreshJobNameForListUrl(canonicalUrl, options.title) : defaultRefreshJobNameForContentUrl(canonicalUrl, options.title),
+    url: canonicalUrl,
+    enabled: false,
+    intervalMinutes: 60,
+    maxItems: isList ? 50 : 1,
+    managedBy: options.managedBy || (isList ? "" : "content-page"),
+    fetchMode: defaultRefreshFetchModeForAdapter(adapter, options.fetchMode),
+    pageKind,
+    created: false,
+    proposed: true
   };
 }
 
@@ -748,40 +776,16 @@ async function summarizeContent(input) {
 }
 
 async function summarizeWithOpenAICompatible(content) {
-  const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
-  const endpoint = `${baseUrl}/chat/completions`;
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${settings.ai.apiKey}`,
-      "Content-Type": "application/json"
+  const text = await ai.chat([
+    {
+      role: "system",
+      content: "你是资料整理助手。请用中文总结资料，突出主题、关键进展、评论/讨论结论、未解决问题和下一步。"
     },
-    body: JSON.stringify({
-      model: settings.ai.model,
-      temperature: 0.2,
-      messages: [
-        {
-          role: "system",
-          content: "你是资料整理助手。请用中文总结资料，突出主题、关键进展、评论/讨论结论、未解决问题和下一步。"
-        },
-        {
-          role: "user",
-          content: content.slice(0, 24000)
-        }
-      ]
-    })
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`AI 总结失败：${response.status} ${text.slice(0, 300)}`);
-  }
-
-  const payload = await response.json();
-  const text = payload.choices?.[0]?.message?.content?.trim();
-  if (!text) {
-    throw new Error("AI 接口没有返回可用总结。");
-  }
+    {
+      role: "user",
+      content: content.slice(0, 24000)
+    }
+  ]);
 
   return {
     mode: "ai",
@@ -804,17 +808,18 @@ async function refreshItemWithContext(id, refreshContext = null) {
 
   const itemDir = path.join(itemsDir, id);
   const now = new Date().toISOString();
-  const snapshotDir = path.join(itemDir, "snapshots", now.replace(/[:.]/g, "-"));
-  await fs.mkdir(snapshotDir, { recursive: true });
-
-  for (const file of ["document.md", "metadata.json", "comments.jsonl", item.metadata.rawFileName || "raw.html"]) {
-    const sourcePath = path.join(itemDir, file);
-    if (await exists(sourcePath)) {
-      await fs.copyFile(sourcePath, path.join(snapshotDir, file));
-    }
-  }
-
   let fetched = await fetchForMetadata(item.metadata, refreshContext);
+  if (fetched.notModified) {
+    const metadata = {
+      ...item.metadata,
+      lastFetchedAt: now,
+      captureMethod: fetched.fetchMethod || item.metadata.captureMethod || "http-304",
+      httpValidators: fetched.httpValidators || item.metadata.httpValidators || {}
+    };
+    await fs.writeFile(path.join(itemDir, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+    return readItem(id);
+  }
+  validateTeamsConversationIdentity({ url: item.metadata.url, name: item.metadata.title }, fetched, detectSourceAdapter(item.metadata.url || ""));
   fetched = mergeFetchedTeamsInputWithExisting(item, {
     ...fetched,
     sourceType: item.metadata.sourceType,
@@ -834,6 +839,9 @@ async function refreshItemWithContext(id, refreshContext = null) {
     && normalizeSourceUpdatedAt(nextSourceUpdatedAt) !== normalizeSourceUpdatedAt(item.metadata.sourceUpdatedAt || "");
   const contentChanged = previousBody !== currentBody;
   const hasUpdate = Boolean((fetchedSourceUpdatedAt && sourceChanged) || contentChanged);
+  if (hasUpdate) {
+    await saveItemSnapshot(itemDir, item.metadata, now);
+  }
   const { updateSummary: _ignoredUpdateSummary, ...previousMetadata } = item.metadata;
   const metadata = {
     ...previousMetadata,
@@ -841,6 +849,10 @@ async function refreshItemWithContext(id, refreshContext = null) {
     updatedAt: hasUpdate ? now : item.metadata.updatedAt,
     lastFetchedAt: now,
     sourceUpdatedAt: nextSourceUpdatedAt,
+    captureMethod: fetched.fetchMethod || item.metadata.captureMethod || "html",
+    httpValidators: fetched.httpValidators || item.metadata.httpValidators || {},
+    integrityStatus: item.metadata.sourceType === "teams" ? "verified" : item.metadata.integrityStatus || "",
+    integrityReason: item.metadata.sourceType === "teams" ? "" : item.metadata.integrityReason || "",
     contentUpdatedAt: item.metadata.contentUpdatedAt || "",
     pendingContentUpdatedAt: hasUpdate ? now : item.metadata.pendingContentUpdatedAt || "",
     processedStale: hasUpdate && item.metadata.processedAt ? true : false,
@@ -864,10 +876,15 @@ async function fetchForMetadata(metadata, refreshContext = null) {
     return fetchUrlWithWebdriver(metadata.url, {
       pageKind: metadata.pageKind || "auto",
       session: refreshContext?.webdriverSession,
-      page: refreshContext?.webdriverPage
+      page: refreshContext?.webdriverPage,
+      validators: metadata.httpValidators || {}
     });
   }
-  return fetchUrl(metadata.url, { pageKind: metadata.pageKind || "auto" });
+  return fetchUrl(metadata.url, {
+    pageKind: metadata.pageKind || "auto",
+    validators: metadata.httpValidators || {},
+    signal: refreshContext?.abortSignal
+  });
 }
 
 async function upsertFetchedItem(input) {
@@ -889,6 +906,10 @@ async function upsertFetchedItem(input) {
       parentUrl: input.parentUrl,
       managedBy: input.managedBy,
       sourceUpdatedAt: input.sourceUpdatedAt,
+      captureMethod: input.captureMethod,
+      httpValidators: input.httpValidators,
+      integrityStatus: input.integrityStatus,
+      integrityReason: input.integrityReason,
       pendingContentUpdatedAt: input.fetchedAt
     });
     created.refreshChanged = true;
@@ -899,16 +920,6 @@ async function upsertFetchedItem(input) {
   input = mergeFetchedTeamsInputWithExisting(item, input);
   validateFetchedItemNotRegressed(item, input);
   const itemDir = path.join(itemsDir, existing.id);
-  const snapshotDir = path.join(itemDir, "snapshots", input.fetchedAt.replace(/[:.]/g, "-"));
-  await fs.mkdir(snapshotDir, { recursive: true });
-
-  for (const file of ["document.md", "metadata.json", "comments.jsonl", item.metadata.rawFileName || "raw.html"]) {
-    const sourcePath = path.join(itemDir, file);
-    if (await exists(sourcePath)) {
-      await fs.copyFile(sourcePath, path.join(snapshotDir, file));
-    }
-  }
-
   const previousBody = extractBodyFromDocument(item.document).trim();
   const currentBody = cleanText(input.text).trim();
   const fetchedSourceUpdatedAt = cleanText(input.sourceUpdatedAt || "");
@@ -917,6 +928,9 @@ async function upsertFetchedItem(input) {
     && normalizeSourceUpdatedAt(nextSourceUpdatedAt) !== normalizeSourceUpdatedAt(item.metadata.sourceUpdatedAt || "");
   const contentChanged = previousBody !== currentBody;
   const hasUpdate = Boolean((fetchedSourceUpdatedAt && sourceChanged) || contentChanged);
+  if (hasUpdate) {
+    await saveItemSnapshot(itemDir, item.metadata, input.fetchedAt);
+  }
   const { updateSummary: _ignoredUpdateSummary, ...previousMetadata } = item.metadata;
   const metadata = {
     ...previousMetadata,
@@ -935,6 +949,10 @@ async function upsertFetchedItem(input) {
     fetchMode: input.fetchMode || item.metadata.fetchMode || null,
     parentUrl: input.parentUrl || item.metadata.parentUrl || null,
     managedBy: input.managedBy || item.metadata.managedBy || null,
+    captureMethod: cleanText(input.captureMethod || item.metadata.captureMethod || "html"),
+    httpValidators: input.httpValidators || item.metadata.httpValidators || {},
+    integrityStatus: input.integrityStatus !== undefined ? cleanText(input.integrityStatus) : cleanText(item.metadata.integrityStatus || ""),
+    integrityReason: input.integrityReason !== undefined ? cleanText(input.integrityReason) : cleanText(item.metadata.integrityReason || ""),
     refreshNote: {
       previousDocumentLength: item.document.length,
       currentDocumentLength: input.text.length,
@@ -950,6 +968,22 @@ async function upsertFetchedItem(input) {
   const refreshed = await readItem(existing.id);
   refreshed.refreshChanged = hasUpdate;
   return refreshed;
+}
+
+async function saveItemSnapshot(itemDir, metadata, timestamp) {
+  const snapshotsRoot = path.join(itemDir, "snapshots");
+  const snapshotDir = path.join(snapshotsRoot, timestamp.replace(/[:.]/g, "-"));
+  await fs.mkdir(snapshotDir, { recursive: true });
+  for (const file of ["document.md", "metadata.json", "comments.jsonl", metadata.rawFileName || "raw.html"]) {
+    const sourcePath = path.join(itemDir, file);
+    if (await exists(sourcePath)) {
+      await fs.copyFile(sourcePath, path.join(snapshotDir, file));
+    }
+  }
+  const snapshots = (await safeReaddir(snapshotsRoot)).sort().reverse();
+  for (const stale of snapshots.slice(SNAPSHOT_RETENTION_COUNT)) {
+    await fs.rm(path.join(snapshotsRoot, stale), { recursive: true, force: true });
+  }
 }
 
 function validateFetchedItemNotRegressed(item, input) {
@@ -1446,46 +1480,31 @@ async function updateTitleWithAi(id) {
 }
 
 async function recommendTitleWithOpenAICompatible(item) {
-  const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
-  const endpoint = `${baseUrl}/chat/completions`;
   const body = extractBodyFromDocument(item.document).trim().slice(0, 12000);
   const supplemental = await supplementalPromptBlock();
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${settings.ai.apiKey}`,
-      "Content-Type": "application/json"
+  const text = await ai.chat([
+    {
+      role: "system",
+      content: [
+        "你是知识库资料标题生成助手。",
+        "根据资料正文生成一个便于检索的中文标题，主要描述内容涉及的核心对象、问题或主题。",
+        "要求：不要复述冗长原始标题；不要使用 Markdown；不要加引号；长度控制在 12 到 40 个中文字符左右。",
+        supplemental
+      ].join("\n")
     },
-    body: JSON.stringify({
-      model: settings.ai.model,
-      temperature: 0.2,
-      messages: [
-        {
-          role: "system",
-          content: [
-            "你是知识库资料标题生成助手。",
-            "根据资料正文生成一个便于检索的中文标题，主要描述内容涉及的核心对象、问题或主题。",
-            "要求：不要复述冗长原始标题；不要使用 Markdown；不要加引号；长度控制在 12 到 40 个中文字符左右。",
-            supplemental
-          ].join("\n")
-        },
-        {
-          role: "user",
-          content: [
-            `来源类型：${item.metadata.sourceType || "unknown"}`,
-            `原标题：${item.metadata.title || ""}`,
-            "",
-            "正文：",
-            body
-          ].join("\n")
-        }
-      ]
-    })
-  });
-  const text = await response.text();
-  if (!response.ok) throw new Error(`AI 标题生成失败：${response.status} ${text.slice(0, 300)}`);
-  const data = JSON.parse(text);
-  return cleanGeneratedTitle(data.choices?.[0]?.message?.content || "");
+    {
+      role: "user",
+      content: [
+        `来源类型：${item.metadata.sourceType || "unknown"}`,
+        `原标题：${item.metadata.title || ""}`,
+        "",
+        "正文：",
+        body
+      ].join("\n")
+    }
+  ]);
+
+  return cleanGeneratedTitle(text);
 }
 
 function recommendTitleLocally(item) {
@@ -1559,7 +1578,8 @@ async function recommendTagsForItems(ids) {
   const items = [];
   for (const id of uniqueIds) {
     try {
-      items.push(await readItem(id));
+      const item = await readItem(id);
+      if (item.metadata.integrityStatus !== "quarantined") items.push(item);
     } catch {
       // Ignore deleted or invalid items in a long-running batch.
     }
@@ -1572,7 +1592,6 @@ async function recommendTagsForItems(ids) {
 }
 
 async function recommendBatchTagsWithOpenAICompatible(items, allTags) {
-  const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
   const supplemental = await supplementalPromptBlock();
   const documents = items.map((item) => {
     const processed = item.processedDocument
@@ -1589,43 +1608,30 @@ async function recommendBatchTagsWithOpenAICompatible(items, allTags) {
     ].join("\n");
   }).join("\n\n---\n\n");
 
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${settings.ai.apiKey}`,
-      "Content-Type": "application/json"
+  const payload = await ai.chatPayload([
+    {
+      role: "system",
+      content: [
+        "你是资料库批量标签分类助手。",
+        "请根据一批文档的整体主题、来源、状态、问题类型和行动项，设计统一的标签池，并给每篇文档分配适合的标签。",
+        "优先复用已有标签；同义标签必须合并，只保留一种写法。",
+        "标签使用小写短词、数字或连字符，不要包含空格。",
+        "不要给每篇文档都创造独有标签；优先生成能横向分类多篇文档的标签。",
+        "只返回 JSON，格式为 {\"tags\":[\"tag-a\"],\"assignments\":[{\"id\":\"item-id\",\"tags\":[\"tag-a\"]}]}。",
+        supplemental
+      ].filter(Boolean).join("\n")
     },
-    body: JSON.stringify({
-      model: settings.ai.model,
-      temperature: 0.1,
-      messages: [
-        {
-          role: "system",
-          content: [
-            "你是资料库批量标签分类助手。",
-            "请根据一批文档的整体主题、来源、状态、问题类型和行动项，设计统一的标签池，并给每篇文档分配适合的标签。",
-            "优先复用已有标签；同义标签必须合并，只保留一种写法。",
-            "标签使用小写短词、数字或连字符，不要包含空格。",
-            "不要给每篇文档都创造独有标签；优先生成能横向分类多篇文档的标签。",
-            "只返回 JSON，格式为 {\"tags\":[\"tag-a\"],\"assignments\":[{\"id\":\"item-id\",\"tags\":[\"tag-a\"]}]}。",
-            supplemental
-          ].filter(Boolean).join("\n")
-        },
-        {
-          role: "user",
-          content: [
-            `资料库已有标签：${allTags.join(", ") || "none"}`,
-            "",
-            "待分类文档：",
-            documents
-          ].join("\n")
-        }
-      ]
-    })
-  });
-  const text = await response.text();
-  if (!response.ok) throw new Error(`AI 批量标签推荐失败：${response.status} ${text.slice(0, 300)}`);
-  const payload = JSON.parse(text);
+    {
+      role: "user",
+      content: [
+        `资料库已有标签：${allTags.join(", ") || "none"}`,
+        "",
+        "待分类文档：",
+        documents
+      ].join("\n")
+    }
+  ], { temperature: 0.1 });
+
   return parseJsonObjectFromText(payload.choices?.[0]?.message?.content || "");
 }
 
@@ -1675,7 +1681,8 @@ async function classifyItems(ids, categories = []) {
   const items = [];
   for (const id of uniqueIds) {
     try {
-      items.push(await readItem(id));
+      const item = await readItem(id);
+      if (item.metadata.integrityStatus !== "quarantined") items.push(item);
     } catch {
       // Ignore items deleted while a list classification request is running.
     }
@@ -1693,6 +1700,9 @@ async function classifyItem(id, categories = []) {
     throw new Error("请先提供分类类别。");
   }
   const item = await readItem(cleanText(id));
+  if (item.metadata.integrityStatus === "quarantined") {
+    throw new Error("该资料因来源完整性校验失败已被隔离，不能参与 AI 分类。");
+  }
   if (!settings.ai?.baseUrl || !settings.ai?.apiKey || !settings.ai?.model) {
     return classifyItemLocally(item, normalizedCategories);
   }
@@ -1700,7 +1710,6 @@ async function classifyItem(id, categories = []) {
 }
 
 async function classifyItemsWithOpenAICompatible(items, categories = []) {
-  const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
   const supplemental = await supplementalPromptBlock();
   const documents = items.map((item) => {
     const processed = item.processedDocument
@@ -1717,101 +1726,68 @@ async function classifyItemsWithOpenAICompatible(items, categories = []) {
     ].join("\n");
   }).join("\n\n---\n\n");
 
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${settings.ai.apiKey}`,
-      "Content-Type": "application/json"
+  const payload = await ai.chatPayload([
+    {
+      role: "system",
+      content: [
+        "你是资料库列表分类助手。",
+        categories.length
+          ? "用户已经给出固定类别。你必须逐条阅读资料，并且只把资料分配到这些类别中；不能新增类别。确实不适合任何类别时才放到\u201c未分类\u201d。"
+          : "请把当前资料列表按主题、项目、问题类型或工作流分成适合浏览的分类。",
+        categories.length ? "" : "分类数量通常为 3 到 10 个；避免每篇文档单独一个分类。",
+        "每个资料 ID 最多出现一次，尽量覆盖所有资料。",
+        "分类名要短且清晰，适合显示在左侧列表。",
+        "只返回 JSON，格式为 {\"groups\":[{\"name\":\"分类名\",\"itemIds\":[\"item-id\"],\"reason\":\"分类依据\"}]}。",
+        supplemental
+      ].filter(Boolean).join("\n")
     },
-    body: JSON.stringify({
-      model: settings.ai.model,
-      temperature: 0.1,
-      messages: [
-        {
-          role: "system",
-          content: [
-            "你是资料库列表分类助手。",
-            categories.length
-              ? "用户已经给出固定类别。你必须逐条阅读资料，并且只把资料分配到这些类别中；不能新增类别。确实不适合任何类别时才放到“未分类”。"
-              : "请把当前资料列表按主题、项目、问题类型或工作流分成适合浏览的分类。",
-            categories.length ? "" : "分类数量通常为 3 到 10 个；避免每篇文档单独一个分类。",
-            "每个资料 ID 最多出现一次，尽量覆盖所有资料。",
-            "分类名要短且清晰，适合显示在左侧列表。",
-            "只返回 JSON，格式为 {\"groups\":[{\"name\":\"分类名\",\"itemIds\":[\"item-id\"],\"reason\":\"分类依据\"}]}。",
-            supplemental
-          ].filter(Boolean).join("\n")
-        },
-        {
-          role: "user",
-          content: [
-            `当前列表共有 ${items.length} 条资料。`,
-            categories.length ? `可用类别：${categories.join("、")}、未分类` : "",
-            "",
-            documents
-          ].filter(Boolean).join("\n")
-        }
-      ]
-    })
-  });
-  const text = await response.text();
-  if (!response.ok) throw new Error(`AI 列表分类失败：${response.status} ${text.slice(0, 300)}`);
-  const payload = JSON.parse(text);
+    {
+      role: "user",
+      content: [
+        `当前列表共有 ${items.length} 条资料。`,
+        categories.length ? `可用类别：${categories.join("、")}、未分类` : "",
+        "",
+        documents
+      ].filter(Boolean).join("\n")
+    }
+  ], { temperature: 0.1 });
+
   return parseJsonObjectFromText(payload.choices?.[0]?.message?.content || "");
 }
 
 async function classifyItemWithOpenAICompatible(item, categories) {
-  const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
   const supplemental = await supplementalPromptBlock();
   const processed = item.processedDocument
     ? extractProcessedBodyFromDocument(item.processedDocument)
     : "";
   const source = processed || extractBodyFromDocument(item.document);
 
-  let response;
-  try {
-    response = await fetch(`${baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${settings.ai.apiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: settings.ai.model,
-        temperature: 0.1,
-        messages: [
-          {
-            role: "system",
-            content: [
-              "你是资料库单条资料分类助手。",
-              "请阅读资料内容，并且只从用户提供的类别中选择一个最合适的类别。",
-              "如果资料确实不适合任何类别，返回“未分类”。不能新增类别，不能改写类别名。",
-              "只返回 JSON，格式为 {\"category\":\"类别名\",\"reason\":\"一句话分类依据\"}。",
-              supplemental
-            ].filter(Boolean).join("\n")
-          },
-          {
-            role: "user",
-            content: [
-              `可用类别：${categories.join("、")}、未分类`,
-              `ID: ${item.metadata.id}`,
-              `标题: ${item.metadata.title}`,
-              `来源: ${item.metadata.sourceType || "unknown"}`,
-              `标签: ${(item.metadata.tags || []).join(", ") || "none"}`,
-              "",
-              "内容：",
-              source.slice(0, 5000)
-            ].join("\n")
-          }
-        ]
-      })
-    });
-  } catch (error) {
-    throw new Error(`AI 单条分类请求失败：${error.message}`);
-  }
+  const payload = await ai.chatPayload([
+    {
+      role: "system",
+      content: [
+        "你是资料库单条资料分类助手。",
+        "请阅读资料内容，并且只从用户提供的类别中选择一个最合适的类别。",
+        "如果资料确实不适合任何类别，返回\u201c未分类\u201d。不能新增类别，不能改写类别名。",
+        "只返回 JSON，格式为 {\"category\":\"类别名\",\"reason\":\"一句话分类依据\"}。",
+        supplemental
+      ].filter(Boolean).join("\n")
+    },
+    {
+      role: "user",
+      content: [
+        `可用类别：${categories.join("、")}、未分类`,
+        `ID: ${item.metadata.id}`,
+        `标题: ${item.metadata.title}`,
+        `来源: ${item.metadata.sourceType || "unknown"}`,
+        `标签: ${(item.metadata.tags || []).join(", ") || "none"}`,
+        "",
+        "内容：",
+        source.slice(0, 5000)
+      ].join("\n")
+    }
+  ], { temperature: 0.1 });
 
-  const text = await response.text();
-  if (!response.ok) throw new Error(`AI 单条分类失败：${response.status} ${text.slice(0, 300)}`);
-  const payload = JSON.parse(text);
   const parsed = parseJsonObjectFromText(payload.choices?.[0]?.message?.content || "");
   return normalizeSingleClassification(parsed, item, categories);
 }
@@ -1931,50 +1907,32 @@ function normalizeItemClassification(result, items, categories = []) {
 }
 
 async function recommendTagsWithOpenAICompatible({ content, allTags, currentTags }) {
-  const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
   const supplemental = await supplementalPromptBlock();
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${settings.ai.apiKey}`,
-      "Content-Type": "application/json"
+  const payload = await ai.chatPayload([
+    {
+      role: "system",
+      content: [
+        "你是资料库标签整理助手。",
+        "请根据文档内容推荐 3 到 8 个短标签。",
+        "优先复用已有标签，只有已有标签明显不合适时才创建新标签。",
+        "避免同义但写法不同的标签，例如已有 github 就不要新建 github-issue，已有 jira 就不要新建 jira-ticket。",
+        "标签使用小写短词、数字或连字符，不要包含空格。",
+        "只返回 JSON，格式为 {\"tags\":[\"tag-a\",\"tag-b\"]}。",
+        supplemental
+      ].join("\n")
     },
-    body: JSON.stringify({
-      model: settings.ai.model,
-      temperature: 0.1,
-      messages: [
-        {
-          role: "system",
-          content: [
-            "你是资料库标签整理助手。",
-            "请根据文档内容推荐 3 到 8 个短标签。",
-            "优先复用已有标签，只有已有标签明显不合适时才创建新标签。",
-            "避免同义但写法不同的标签，例如已有 github 就不要新建 github-issue，已有 jira 就不要新建 jira-ticket。",
-            "标签使用小写短词、数字或连字符，不要包含空格。",
-            "只返回 JSON，格式为 {\"tags\":[\"tag-a\",\"tag-b\"]}。",
-            supplemental
-          ].join("\n")
-        },
-        {
-          role: "user",
-          content: [
-            `当前文档标签：${currentTags.join(", ") || "none"}`,
-            `资料库已有标签：${allTags.join(", ") || "none"}`,
-            "",
-            "文档内容：",
-            content
-          ].join("\n")
-        }
-      ]
-    })
-  });
+    {
+      role: "user",
+      content: [
+        `当前文档标签：${currentTags.join(", ") || "none"}`,
+        `资料库已有标签：${allTags.join(", ") || "none"}`,
+        "",
+        "文档内容：",
+        content
+      ].join("\n")
+    }
+  ], { temperature: 0.1 });
 
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`AI 标签推荐失败：${response.status} ${text.slice(0, 300)}`);
-  }
-
-  const payload = await response.json();
   const text = payload.choices?.[0]?.message?.content?.trim() || "";
   const parsed = parseTagsFromAiText(text);
   return normalizeRecommendedTags(parsed, allTags, currentTags);
@@ -2032,6 +1990,9 @@ function normalizeRecommendedTags(tags, allTags, currentTags = []) {
 
 async function processItemWithAi(id) {
   const item = await readItem(id);
+  if (item.metadata.integrityStatus === "quarantined") {
+    throw new Error("该资料因来源完整性校验失败已被隔离，验证刷新成功前不能进行 AI 整理。");
+  }
   if (!settings.ai?.baseUrl || !settings.ai?.apiKey || !settings.ai?.model) {
     throw new Error("请先在设置页配置 AI 接口后再生成整理版。");
   }
@@ -2057,8 +2018,6 @@ async function processItemWithAi(id) {
 }
 
 async function processDocumentWithOpenAICompatible(item, prompt) {
-  const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
-  const endpoint = `${baseUrl}/chat/completions`;
   const supplemental = await supplementalPromptBlock();
   const sourceBody = extractBodyFromDocument(item.document).trim();
   const summary = extractSummaryFromDocument(item.document).trim();
@@ -2070,61 +2029,38 @@ async function processDocumentWithOpenAICompatible(item, prompt) {
     ].filter(Boolean).join("\n"))
     .join("\n\n---\n\n");
 
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${settings.ai.apiKey}`,
-      "Content-Type": "application/json"
+  return ai.chat([
+    {
+      role: "system",
+      content: [
+        prompt,
+        "",
+        "输出要求：",
+        "- 使用中文。",
+        "- 输出 Markdown。",
+        "- 只整理资料内容，不编造原文没有的信息。",
+        "- 如果信息不足或状态不明确，要明确写出\u201c不明确\u201d。",
+        "- 保留关键原始标识，例如 Jira key、GitHub issue/PR 编号、URL、时间、人名。",
+        supplemental
+      ].join("\n")
     },
-    body: JSON.stringify({
-      model: settings.ai.model,
-      temperature: 0.2,
-      messages: [
-        {
-          role: "system",
-          content: [
-            prompt,
-            "",
-            "输出要求：",
-            "- 使用中文。",
-            "- 输出 Markdown。",
-            "- 只整理资料内容，不编造原文没有的信息。",
-            "- 如果信息不足或状态不明确，要明确写出“不明确”。",
-            "- 保留关键原始标识，例如 Jira key、GitHub issue/PR 编号、URL、时间、人名。",
-            supplemental
-          ].join("\n")
-        },
-        {
-          role: "user",
-          content: [
-            `标题：${item.metadata.title}`,
-            `来源类型：${item.metadata.sourceType}`,
-            `URL：${item.metadata.url || "local input"}`,
-            `标签：${(item.metadata.tags || []).join(", ") || "none"}`,
-            `最后抓取：${item.metadata.lastFetchedAt || "not fetched"}`,
-            `来源更新时间：${item.metadata.sourceUpdatedAt || "unknown"}`,
-            "",
-            summary ? `已有摘要：\n${summary}\n` : "",
-            "原始提取内容：",
-            sourceBody.slice(0, 28000),
-            comments ? `\n\n评论/对话结构化内容：\n${comments.slice(0, 12000)}` : ""
-          ].join("\n")
-        }
-      ]
-    })
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`AI 整理失败：${response.status} ${text.slice(0, 300)}`);
-  }
-
-  const payload = await response.json();
-  const text = payload.choices?.[0]?.message?.content?.trim();
-  if (!text) {
-    throw new Error("AI 接口没有返回可用整理结果。");
-  }
-  return text;
+    {
+      role: "user",
+      content: [
+        `标题：${item.metadata.title}`,
+        `来源类型：${item.metadata.sourceType}`,
+        `URL：${item.metadata.url || "local input"}`,
+        `标签：${(item.metadata.tags || []).join(", ") || "none"}`,
+        `最后抓取：${item.metadata.lastFetchedAt || "not fetched"}`,
+        `来源更新时间：${item.metadata.sourceUpdatedAt || "unknown"}`,
+        "",
+        summary ? `已有摘要：\n${summary}\n` : "",
+        "原始提取内容：",
+        sourceBody.slice(0, 28000),
+        comments ? `\n\n评论/对话结构化内容：\n${comments.slice(0, 12000)}` : ""
+      ].join("\n")
+    }
+  ]);
 }
 
 async function readItem(id) {
@@ -2286,8 +2222,6 @@ async function answerFromKnowledgeBase(message) {
 }
 
 async function answerWithOpenAICompatible(question, results, trace = []) {
-  const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
-  const endpoint = `${baseUrl}/chat/completions`;
   const context = results.map((result, index) => {
     const source = result.item;
     return `资料 ${index + 1}
@@ -2304,51 +2238,28 @@ URL: ${source.url || "local input"}
 ${result.context}`;
   }).join("\n\n---\n\n");
   const supplemental = await supplementalPromptBlock();
-  const endpointHost = safeHostname(endpoint) || baseUrl;
   const requestTrace = [
     ...trace,
     {
       type: "tool",
       title: "调用 AI 接口",
-      detail: `模型：${settings.ai.model}\n接口：${endpointHost}\n上下文资料：${results.length} 条`
+      detail: `模型：${settings.ai.model}\n接口：${ai.endpointHost}\n上下文资料：${results.length} 条`
     }
   ];
 
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${settings.ai.apiKey}`,
-      "Content-Type": "application/json"
+  const content = await ai.chat([
+    {
+      role: "system",
+      content: [
+        "你是本地知识库问答助手。只能基于提供的资料回答；如果资料不足，要明确说不知道。回答使用中文。结论在前，并在关键依据处引用资料 ID、URL 或文件路径。",
+        supplemental
+      ].filter(Boolean).join("\n\n")
     },
-    body: JSON.stringify({
-      model: settings.ai.model,
-      temperature: 0.2,
-      messages: [
-        {
-          role: "system",
-          content: [
-            "你是本地知识库问答助手。只能基于提供的资料回答；如果资料不足，要明确说不知道。回答使用中文。结论在前，并在关键依据处引用资料 ID、URL 或文件路径。",
-            supplemental
-          ].filter(Boolean).join("\n\n")
-        },
-        {
-          role: "user",
-          content: `问题：${question}\n\n本地知识库根目录：${kbDir}\n\n检索到的资料：\n${context || "没有检索到相关资料。"}`
-        }
-      ]
-    })
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`AI 问答失败：${response.status} ${text.slice(0, 300)}`);
-  }
-
-  const payload = await response.json();
-  const content = payload.choices?.[0]?.message?.content?.trim();
-  if (!content) {
-    throw new Error("AI 接口没有返回可用回答。");
-  }
+    {
+      role: "user",
+      content: `问题：${question}\n\n本地知识库根目录：${kbDir}\n\n检索到的资料：\n${context || "没有检索到相关资料。"}`
+    }
+  ]);
 
   return {
     role: "assistant",
@@ -2424,52 +2335,29 @@ async function streamAnswerFromKnowledgeBase(message, res) {
 }
 
 async function streamWithOpenAICompatible(question, results, sources, res) {
-  const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
-  const endpoint = `${baseUrl}/chat/completions`;
   const context = buildOpenAIContext(results);
   const supplemental = await supplementalPromptBlock();
   sendSse(res, "trace", {
     type: "tool",
     title: "调用 AI 接口",
-    detail: `模型：${settings.ai.model}\n接口：${safeHostname(endpoint) || baseUrl}\n上下文资料：${results.length} 条`
+    detail: `模型：${settings.ai.model}\n接口：${ai.endpointHost}\n上下文资料：${results.length} 条`
   });
 
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${settings.ai.apiKey}`,
-      "Content-Type": "application/json"
+  const response = await ai.chatStreamResponse([
+    {
+      role: "system",
+      content: [
+        "你是本地知识库问答助手。只能基于提供的资料回答；如果资料不足，要明确说不知道。回答使用中文。结论在前，并在关键依据处引用资料 ID、URL 或文件路径。",
+        supplemental
+      ].filter(Boolean).join("\n\n")
     },
-    body: JSON.stringify({
-      model: settings.ai.model,
-      temperature: 0.2,
-      stream: true,
-      messages: [
-        {
-          role: "system",
-          content: [
-            "你是本地知识库问答助手。只能基于提供的资料回答；如果资料不足，要明确说不知道。回答使用中文。结论在前，并在关键依据处引用资料 ID、URL 或文件路径。",
-            supplemental
-          ].filter(Boolean).join("\n\n")
-        },
-        {
-          role: "user",
-          content: `问题：${question}\n\n本地知识库根目录：${kbDir}\n\n检索到的资料：\n${context || "没有检索到相关资料。"}`
-        }
-      ]
-    })
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`AI 问答失败：${response.status} ${text.slice(0, 300)}`);
-  }
+    {
+      role: "user",
+      content: `问题：${question}\n\n本地知识库根目录：${kbDir}\n\n检索到的资料：\n${context || "没有检索到相关资料。"}`
+    }
+  ]);
 
   let content = "";
-  if (!response.body) {
-    throw new Error("AI 接口没有返回可读取的流。");
-  }
-
   let streamBuffer = "";
   for await (const chunk of response.body) {
     streamBuffer += Buffer.from(chunk).toString("utf8");
@@ -2540,6 +2428,7 @@ async function searchKnowledgeBase(query, limit = 8) {
     const material = await readMaterialForSearch(id);
     if (!material) continue;
     const { metadata, document, processedDocument, commentsText, paths } = material;
+    if (metadata.integrityStatus === "quarantined") continue;
     const haystack = `${metadata.title}\n${(metadata.tags || []).join(" ")}\n${metadata.sourceType}\n${metadata.url || ""}\n${processedDocument}\n${document}\n${commentsText}`.toLowerCase();
     const score = scoreKnowledgeMatch(haystack, terms, metadata);
 
@@ -2818,36 +2707,11 @@ function chunkMaterialForEmbedding(material) {
 }
 
 async function createEmbedding(text) {
-  const vectors = await createEmbeddings([text]);
-  return vectors[0] || [];
+  return ai.createEmbedding(text);
 }
 
 async function createEmbeddings(inputs) {
-  if (!inputs.length) return [];
-  const baseUrl = settings.embedding.baseUrl.replace(/\/+$/, "");
-  const response = await fetch(`${baseUrl}/embeddings`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${settings.embedding.apiKey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: settings.embedding.model,
-      input: inputs,
-      ...(Number(settings.embedding.dimensions) > 0 ? { dimensions: Number(settings.embedding.dimensions) } : {})
-    })
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Embedding 生成失败：${response.status} ${text.slice(0, 300)}`);
-  }
-
-  const payload = await response.json();
-  const data = Array.isArray(payload.data) ? payload.data : [];
-  return data
-    .sort((a, b) => Number(a.index || 0) - Number(b.index || 0))
-    .map((item) => Array.isArray(item.embedding) ? item.embedding.map(Number) : []);
+  return ai.createEmbeddings(inputs);
 }
 
 function cosineSimilarity(a, b) {
@@ -3231,7 +3095,7 @@ async function startRefreshRunByIds(ids, options = {}) {
     .filter((job) => !isInvalidTeamsRootRefreshJob(job));
   const run = createRefreshRun(runnableJobs, options);
   Promise.resolve()
-    .then(async () => {
+    .then(async ({ res }) => {
       updateRefreshRun(run, { status: "running" });
       const result = await runRefreshJobsBatch(runnableJobs, { ...options, run });
       updateRefreshRun(run, {
@@ -3901,16 +3765,19 @@ async function runRefreshJob(job, options = {}) {
   });
 
   try {
-    const result = await withRefreshJobTimeout(job, options.run, async () => (
-      job.pageKind === "content"
-        ? await refreshContentJob({ ...job, lastStartedAt: startedAt }, options.refreshContext)
-        : await refreshListJob({ ...job, lastStartedAt: startedAt }, options.refreshContext)
-    ));
+    const result = await withRefreshJobTimeout(job, options.run, async (abortSignal) => {
+      const refreshContext = { ...(options.refreshContext || {}), abortSignal };
+      return job.pageKind === "content"
+        ? refreshContentJob({ ...job, lastStartedAt: startedAt }, refreshContext)
+        : refreshListJob({ ...job, lastStartedAt: startedAt }, refreshContext);
+    });
     await updateRefreshJobState(job.id, {
       status: "idle",
       lastRunAt: new Date().toISOString(),
       lastResult: result,
-      lastError: ""
+      lastError: "",
+      quarantined: false,
+      quarantineReason: ""
     });
     return result;
   } catch (error) {
@@ -3936,9 +3803,11 @@ async function runRefreshJob(job, options = {}) {
 async function withRefreshJobTimeout(job, run, task) {
   let timer;
   let timedOut = false;
+  const controller = new AbortController();
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(async () => {
       timedOut = true;
+      controller.abort();
       const error = new Error(`刷新任务超时：${job.name || job.id} 超过 ${Math.round(REFRESH_JOB_TIMEOUT_MS / 60000)} 分钟未完成。`);
       error.code = "REFRESH_JOB_TIMEOUT";
       if (run) updateRefreshRun(run, { error: error.message });
@@ -3947,10 +3816,18 @@ async function withRefreshJobTimeout(job, run, task) {
     }, REFRESH_JOB_TIMEOUT_MS);
   });
   try {
-    return await Promise.race([task(), timeout]);
+    return await Promise.race([task(controller.signal), timeout]);
   } finally {
     clearTimeout(timer);
     if (timedOut && run) updateRefreshRun(run, { status: "failed" });
+  }
+}
+
+function assertRefreshActive(refreshContext) {
+  if (refreshContext?.abortSignal?.aborted) {
+    const error = new Error("刷新任务已取消或超时，已阻止写入。");
+    error.code = "REFRESH_ABORTED";
+    throw error;
   }
 }
 
@@ -4037,6 +3914,21 @@ async function refreshListJob(job, refreshContext = null) {
 
   const fetchedAt = new Date().toISOString();
   const listFetched = await fetchForRefreshJob(job.url, { ...job, pageKind: "list" }, adapter, refreshContext);
+  assertRefreshActive(refreshContext);
+  if (listFetched.notModified) {
+    return {
+      id: job.id,
+      sourceType: adapter.sourceType,
+      listUrl: job.url,
+      linkCount: 0,
+      updatedItemCount: 0,
+      skippedItemCount: 1,
+      errorCount: 0,
+      updatedItems: [],
+      skippedItems: [{ url: job.url, reason: "http-not-modified" }],
+      errors: []
+    };
+  }
   const listUrl = listFetched.url || job.url;
   const tags = normalizeTags(job.tags || []);
   const listItem = await upsertFetchedItem({
@@ -4074,6 +3966,7 @@ async function refreshListJob(job, refreshContext = null) {
         continue;
       }
       const contentFetched = await fetchForRefreshJob(contentUrl, { ...job, pageKind: "content" }, adapter, refreshContext);
+      assertRefreshActive(refreshContext);
       const contentItem = await upsertFetchedItem({
         title: contentFetched.title || link.title || link.key || contentUrl,
         sourceType: adapter.sourceType,
@@ -4130,6 +4023,33 @@ async function refreshContentJob(job, refreshContext = null) {
   const adapter = detectSourceAdapter(job.url);
   const fetchedAt = new Date().toISOString();
   const fetched = await fetchForRefreshJob(job.url, { ...job, pageKind: "content" }, adapter, refreshContext);
+  assertRefreshActive(refreshContext);
+  if (fetched.notModified) {
+    const existing = await findItemByUrl(job.url);
+    if (!existing) throw new Error("Source returned 304 but no local item exists.");
+    const item = await readItem(existing.id);
+    const metadata = {
+      ...item.metadata,
+      lastFetchedAt: fetchedAt,
+      captureMethod: fetched.fetchMethod || "http-304",
+      httpValidators: fetched.httpValidators || item.metadata.httpValidators || {}
+    };
+    await fs.writeFile(path.join(itemsDir, existing.id, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+    return {
+      id: job.id,
+      sourceType: adapter.sourceType,
+      itemId: existing.id,
+      url: existing.url,
+      linkCount: 1,
+      updatedItemCount: 0,
+      skippedItemCount: 1,
+      errorCount: 0,
+      updatedItems: [],
+      skippedItems: [{ title: existing.title, itemId: existing.id, url: existing.url, reason: "http-not-modified" }],
+      errors: []
+    };
+  }
+  validateTeamsConversationIdentity(job, fetched, adapter);
   const item = await upsertFetchedItem({
     title: fetched.title || job.name || job.url,
     sourceType: adapter.sourceType,
@@ -4139,6 +4059,10 @@ async function refreshContentJob(job, refreshContext = null) {
     text: fetched.text,
     comments: fetched.comments || [],
     sourceUpdatedAt: fetched.sourceUpdatedAt || "",
+    captureMethod: fetched.fetchMethod || resolvedRefreshFetchMode(job, adapter),
+    httpValidators: fetched.httpValidators || {},
+    integrityStatus: adapter.sourceType === "teams" ? "verified" : undefined,
+    integrityReason: adapter.sourceType === "teams" ? "" : undefined,
     fetchedAt,
     pageKind: "content",
     fetchMode: resolvedRefreshFetchMode(job, adapter)
@@ -4170,6 +4094,21 @@ async function refreshContentJob(job, refreshContext = null) {
     }],
     errors: []
   };
+}
+
+function validateTeamsConversationIdentity(job, fetched, adapter = detectSourceAdapter(job?.url || "")) {
+  if (adapter.sourceType !== "teams") return;
+  const expectedConversationId = decodeURIComponent(extractTeamsDeepPath(job?.url || "").match(/^\/l\/chat\/([^/]+)/i)?.[1] || "");
+  const actualConversationId = cleanText(fetched?.conversationId || "");
+  if (expectedConversationId && actualConversationId) {
+    if (expectedConversationId === actualConversationId) return;
+    throw new Error(`Teams 会话 ID 校验失败：目标“${expectedConversationId}”，实际“${actualConversationId}”。已阻止写入。`);
+  }
+  const expected = cleanText(job?.name || "").replace(/\s+refresh$/i, "");
+  const actual = cleanText(fetched?.title || "");
+  if (!expected || !actual) return;
+  if (areCaptureTitlesConsistent(expected, actual)) return;
+  throw new Error(`Teams 会话校验失败：目标“${expected}”，页面实际为“${actual}”。已阻止写入，避免会话串线。`);
 }
 
 async function refreshJiraFilterJob(job) {
@@ -4241,7 +4180,13 @@ async function fetchForRefreshJob(url, job, adapter = detectSourceAdapter(url), 
   if (resolvedRefreshFetchMode(job, adapter) === "webdriver") {
     return fetchUrlWithWebdriverForRefresh(url, job, adapter, refreshContext);
   }
-  return fetchUrl(url, { pageKind: job.pageKind || "auto" });
+  const existing = await findItemByUrl(url);
+  return fetchUrl(url, {
+    pageKind: job.pageKind || "auto",
+    signal: refreshContext?.abortSignal,
+    maxItems: job.maxItems,
+    validators: existing?.httpValidators || {}
+  });
 }
 
 async function fetchUrlWithWebdriverForRefresh(url, job, adapter = detectSourceAdapter(url), refreshContext = null) {
@@ -4479,11 +4424,24 @@ function isRefreshJobCapturedItem(job, metadata) {
 
 async function fetchUrl(url, options = {}) {
   const adapter = detectSourceAdapter(url);
+  if (options.apiFirst !== false) {
+    try {
+      const apiResult = await fetchUrlFromSourceApi(url, adapter, options);
+      if (apiResult) return apiResult;
+    } catch (error) {
+      console.warn(`Source API fallback for ${url}:`, error.message || error);
+    }
+  }
   const headers = {
     "User-Agent": "MaterialOrganizer/0.1",
-    ...buildAuthHeaders(url)
+    ...buildAuthHeaders(url),
+    ...(options.validators?.etag ? { "If-None-Match": options.validators.etag } : {}),
+    ...(options.validators?.lastModified ? { "If-Modified-Since": options.validators.lastModified } : {})
   };
   const controller = new AbortController();
+  const abortFromCaller = () => controller.abort();
+  if (options.signal?.aborted) controller.abort();
+  options.signal?.addEventListener?.("abort", abortFromCaller, { once: true });
   const timer = setTimeout(() => controller.abort(), Number(options.timeoutMs || FETCH_TIMEOUT_MS));
   let response;
   try {
@@ -4496,13 +4454,27 @@ async function fetchUrl(url, options = {}) {
     throw error;
   } finally {
     clearTimeout(timer);
+    options.signal?.removeEventListener?.("abort", abortFromCaller);
   }
 
+  if (response.status === 304) {
+    return {
+      notModified: true,
+      url: response.url || url,
+      httpValidators: options.validators || {},
+      fetchMethod: "http-304"
+    };
+  }
   if (!response.ok) {
     throw new Error(`Could not fetch URL: ${response.status} ${response.statusText}`);
   }
 
+  assertSafeFetchedResponse(response, url);
+
   const raw = await response.text();
+  if (Buffer.byteLength(raw, "utf8") > MAX_FETCH_BYTES) {
+    throw new Error(`Fetched page is larger than ${Math.round(MAX_FETCH_BYTES / 1024 / 1024)} MB: ${url}`);
+  }
   const extracted = extractByAdapter(raw, url, adapter, options.pageKind || "auto");
   const title = extracted.title || extractTitle(raw);
   assertFetchedPageIsAuthenticated({
@@ -4518,13 +4490,268 @@ async function fetchUrl(url, options = {}) {
     text: extracted.text,
     comments: extracted.comments || [],
     sourceUpdatedAt: extracted.sourceUpdatedAt || "",
-    url: response.url || url
+    url: response.url || url,
+    fetchMethod: "html",
+    httpValidators: {
+      etag: cleanText(response.headers.get("etag") || ""),
+      lastModified: cleanText(response.headers.get("last-modified") || "")
+    }
   };
+}
+
+function assertSafeFetchedResponse(response, url) {
+  const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+  const contentLength = Number(response.headers.get("content-length") || 0);
+  if (contentLength > MAX_FETCH_BYTES) {
+    throw new Error(`Fetched page is larger than ${Math.round(MAX_FETCH_BYTES / 1024 / 1024)} MB: ${url}`);
+  }
+  if (!isSupportedCaptureContentType(contentType)) {
+    throw new Error(`Unsupported content type for page capture: ${contentType}`);
+  }
+}
+
+function responseValidators(response) {
+  return {
+    etag: cleanText(response?.headers?.get?.("etag") || ""),
+    lastModified: cleanText(response?.headers?.get?.("last-modified") || "")
+  };
+}
+
+async function fetchUrlFromSourceApi(url, adapter, options = {}) {
+  if (adapter.sourceType === "jira") return fetchJiraFromApi(url, adapter, options);
+  if (adapter.sourceType === "confluence") return fetchConfluenceFromApi(url, adapter);
+  if (adapter.sourceType === "github") return fetchGithubFromApi(url, adapter, options);
+  if (adapter.sourceType === "teams") return fetchTeamsFromGraph(url, adapter);
+  return null;
+}
+
+async function requestSourceJson(url, adapter, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Number(options.timeoutMs || FETCH_TIMEOUT_MS));
+  try {
+    const response = await fetch(url, {
+      method: options.method || "GET",
+      headers: {
+        "User-Agent": "MaterialOrganizer/0.1",
+        "Accept": "application/json",
+        ...(options.body ? { "Content-Type": "application/json" } : {}),
+        ...buildAuthHeaders(`https://${adapter.hostname}`),
+        ...(options.headers || {})
+      },
+      body: options.body ? JSON.stringify(options.body) : undefined,
+      signal: controller.signal
+    });
+    if (response.status === 401 || response.status === 403) {
+      throw new Error(`检测到 ${sourceLabel(adapter.sourceType)} 未登录，已停止抓取，未保存登录页。`);
+    }
+    if (response.status === 304) {
+      return { data: null, raw: "", response, notModified: true };
+    }
+    if (!response.ok) throw new Error(`Source API request failed: ${response.status} ${response.statusText}`);
+    const raw = await response.text();
+    if (Buffer.byteLength(raw, "utf8") > MAX_FETCH_BYTES) throw new Error("Source API response is too large.");
+    return { data: JSON.parse(raw), raw, response };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function requestSourceCollection(url, adapter, options = {}) {
+  const values = [];
+  let nextUrl = String(url);
+  let firstResponse = null;
+  let pages = 0;
+  while (nextUrl && pages < 20 && values.length < 1000) {
+    const result = await requestSourceJson(nextUrl, adapter, pages === 0 ? options : {});
+    if (result.notModified) return result;
+    if (!firstResponse) firstResponse = result.response;
+    const pageValues = Array.isArray(result.data) ? result.data : Array.isArray(result.data?.value) ? result.data.value : [];
+    values.push(...pageValues);
+    const link = String(result.response?.headers?.get?.("link") || "");
+    const linkNext = link.split(",").map((part) => part.trim()).find((part) => /rel=["']?next["']?/i.test(part))?.match(/<([^>]+)>/)?.[1] || "";
+    nextUrl = cleanText(result.data?.["@odata.nextLink"] || linkNext || "");
+    pages += 1;
+  }
+  return {
+    data: values.slice(0, 1000),
+    raw: JSON.stringify(values.slice(0, 1000), null, 2),
+    response: firstResponse,
+    pageCount: pages
+  };
+}
+
+async function fetchJiraFromApi(url, adapter, options = {}) {
+  const key = safePathname(url).match(/\/browse\/([A-Z][A-Z0-9]+-\d+)/i)?.[1];
+  const filterId = extractFilterId(url);
+  if (!key && !filterId) return null;
+  const origin = `https://${adapter.hostname}`;
+  if (filterId) {
+    const filter = await requestSourceJson(`${origin}/rest/api/2/filter/${encodeURIComponent(filterId)}`, adapter);
+    const jql = filter.data?.jql;
+    if (!jql) return null;
+    const search = await requestSourceJson(`${origin}/rest/api/2/search`, adapter, {
+      method: "POST",
+      body: { jql, maxResults: Math.max(1, Number(options.maxItems || 100)), fields: ["summary", "status", "assignee", "updated"] }
+    });
+    const issues = (search.data?.issues || []).map((issue) => ({
+      key: issue.key,
+      href: `${origin}/browse/${issue.key}`,
+      summary: cleanText(issue.fields?.summary || ""),
+      status: cleanText(issue.fields?.status?.name || ""),
+      assignee: cleanText(issue.fields?.assignee?.displayName || issue.fields?.assignee?.name || ""),
+      updated: cleanText(issue.fields?.updated || "")
+    }));
+    return renderJiraApiFilter(url, adapter, filter.data, issues, search.raw);
+  }
+  const result = await requestSourceJson(`${origin}/rest/api/2/issue/${encodeURIComponent(key)}?expand=renderedFields,changelog&fields=*all`, adapter);
+  const commentResult = await requestSourceJson(`${origin}/rest/api/2/issue/${encodeURIComponent(key)}/comment?maxResults=1000`, adapter);
+  return renderJiraApiIssue(url, adapter, result.data, JSON.stringify({ issue: result.data, comments: commentResult.data }, null, 2), commentResult.data?.comments || []);
+}
+
+function renderJiraApiFilter(url, adapter, filter, issues, raw) {
+  const title = cleanText(filter?.name || `Jira Filter ${extractFilterId(url)}`);
+  return {
+    raw,
+    title,
+    text: [`# ${title}`, "", `Source: ${url}`, `Adapter: ${adapter.id}-api`, "", "## Issues", "", ...issues.map((issue) => `- [${issue.key}](${issue.href}) ${[issue.summary, issue.status && `status: ${issue.status}`, issue.assignee && `assignee: ${issue.assignee}`, issue.updated && `updated: ${issue.updated}`].filter(Boolean).join(" · ")}`)].join("\n"),
+    comments: [],
+    sourceUpdatedAt: latestTimestampValue(issues.map((issue) => issue.updated)),
+    url,
+    fetchMethod: "jira-rest"
+  };
+}
+
+function renderJiraApiIssue(url, adapter, issue, raw, apiComments = []) {
+  const fields = issue?.fields || {};
+  const rendered = issue?.renderedFields || {};
+  const key = issue?.key || safePathname(url).split("/").pop();
+  const title = `${key} ${cleanText(fields.summary || "")}`.trim();
+  const comments = (apiComments.length ? apiComments : fields.comment?.comments || []).map((comment) => ({
+    id: String(comment.id || ""),
+    author: cleanText(comment.author?.displayName || comment.author?.name || ""),
+    createdAt: cleanText(comment.created || comment.updated || ""),
+    body: cleanText(htmlToText(comment.renderedBody || "") || comment.body || ""),
+    url: `${url}?focusedCommentId=${comment.id}`
+  }));
+  const fieldLines = [
+    ["Type", fields.issuetype?.name], ["Status", fields.status?.name], ["Priority", fields.priority?.name],
+    ["Resolution", fields.resolution?.name], ["Assignee", fields.assignee?.displayName], ["Reporter", fields.reporter?.displayName], ["Updated", fields.updated]
+  ].filter(([, value]) => value).map(([name, value]) => `- ${name}: ${cleanText(value)}`);
+  const description = cleanText(htmlToText(rendered.description || "") || fields.description || "") || "_No description captured._";
+  return {
+    raw,
+    title,
+    text: [`# ${title}`, "", `Source: ${url}`, `Adapter: ${adapter.id}-api`, "", "## Fields", "", ...fieldLines, "", "## Description", "", description, "", "## Comments", "", ...(comments.length ? comments.map((comment) => `### ${comment.author} · ${comment.createdAt}\n\n${comment.body}`) : ["_No comments captured._"])].join("\n"),
+    comments,
+    sourceUpdatedAt: cleanText(fields.updated || ""),
+    url,
+    fetchMethod: "jira-rest"
+  };
+}
+
+async function fetchConfluenceFromApi(url, adapter) {
+  const parsed = new URL(url);
+  let pageId = parsed.searchParams.get("pageId") || "";
+  const origin = `https://${adapter.hostname}`;
+  if (!pageId) {
+    let spaceKey = parsed.searchParams.get("spaceKey") || "";
+    let title = parsed.searchParams.get("title") || "";
+    const display = parsed.pathname.match(/^\/display\/([^/]+)\/(.+)$/i);
+    if (display) {
+      spaceKey = decodeURIComponent(display[1]);
+      title = decodeURIComponent(display[2].replace(/\+/g, " "));
+    }
+    if (!spaceKey || !title) return null;
+    const query = new URLSearchParams({ type: "page", spaceKey, title, limit: "1" });
+    const lookup = await requestSourceJson(`${origin}/rest/api/content?${query}`, adapter);
+    pageId = lookup.data?.results?.[0]?.id || "";
+  }
+  if (!pageId) return null;
+  const result = await requestSourceJson(`${origin}/rest/api/content/${encodeURIComponent(pageId)}?expand=body.storage,version,space,metadata.labels`, adapter);
+  const commentResult = await requestSourceJson(`${origin}/rest/api/content/${encodeURIComponent(pageId)}/child/comment?limit=200&expand=body.storage,version`, adapter).catch(() => ({ data: { results: [] } }));
+  const page = result.data || {};
+  const bodyHtml = page.body?.storage?.value || "";
+  const comments = (commentResult.data?.results || []).map((comment) => ({
+    id: String(comment.id || ""), author: cleanText(comment.version?.by?.displayName || ""),
+    createdAt: cleanText(comment.version?.when || ""), body: confluenceHtmlToMarkdown(comment.body?.storage?.value || "", url),
+    url: `${url}#comment-${comment.id}`
+  }));
+  const title = cleanText(page.title || url);
+  const labels = (page.metadata?.labels?.results || []).map((label) => label.name).filter(Boolean);
+  return {
+    raw: result.raw,
+    title,
+    text: [`# ${title}`, "", `Source: ${url}`, `Adapter: ${adapter.id}-api`, `Page ID: ${pageId}`, page.space?.name ? `Space: ${page.space.name}` : "", page.version?.number ? `Version: ${page.version.number}` : "", labels.length ? `Labels: ${labels.join(", ")}` : "", "", "## Content", "", confluenceHtmlToMarkdown(bodyHtml, url), "", "## Comments", "", ...(comments.length ? comments.map((comment) => `### ${comment.author} · ${comment.createdAt}\n\n${comment.body}`) : ["_No comments captured._"])].filter((line) => line !== "").join("\n"),
+    comments,
+    sourceUpdatedAt: cleanText(page.version?.when || (page.version?.number ? `version:${page.version.number}` : "")),
+    url,
+    fetchMethod: "confluence-rest",
+    httpValidators: responseValidators(result.response)
+  };
+}
+
+async function fetchGithubFromApi(url, adapter, options = {}) {
+  const profile = settings.sources?.[adapter.hostname] || {};
+  if (!profile.token && profile.authMode !== "cookie" && profile.authMode !== "basic") return null;
+  const origin = `https://${adapter.hostname}`;
+  if (safePathname(url) === "/notifications") {
+    const parsed = new URL(url);
+    const apiUrl = new URL(`${origin}/api/v3/notifications`);
+    apiUrl.searchParams.set("all", "true");
+    apiUrl.searchParams.set("per_page", String(Math.max(1, Math.min(100, Number(options.maxItems || 50)))));
+    const result = await requestSourceCollection(apiUrl, adapter, {
+      headers: {
+        ...(options.validators?.etag ? { "If-None-Match": options.validators.etag } : {}),
+        ...(options.validators?.lastModified ? { "If-Modified-Since": options.validators.lastModified } : {})
+      }
+    });
+    if (result.notModified) {
+      return { notModified: true, url, fetchMethod: "github-rest-304", httpValidators: options.validators || {} };
+    }
+    const notifications = (result.data || []).map((item) => ({
+      id: String(item.id || ""), title: cleanText(item.subject?.title || ""), href: cleanText(item.subject?.url || "").replace(`${origin}/api/v3/repos/`, `${origin}/`).replace(/\/(issues|pulls)\/(\d+)$/, "/$1/$2").replace("/pulls/", "/pull/"),
+      repository: cleanText(item.repository?.full_name || ""), updatedAt: cleanText(item.updated_at || ""), status: item.unread ? "unread" : "read"
+    }));
+    const title = "GitHub Notifications";
+    return { raw: result.raw, title, text: [`# ${title}`, "", `Source: ${url}`, `Adapter: ${adapter.id}-api`, "", "## Notifications", "", ...notifications.map((item) => `- [${item.title}](${item.href}) ${[item.repository, item.status, item.updatedAt && `updated: ${item.updatedAt}`].filter(Boolean).join(" · ")}`)].join("\n"), comments: [], sourceUpdatedAt: latestTimestampValue(notifications.map((item) => item.updatedAt)), url, fetchMethod: "github-rest", httpValidators: responseValidators(result.response) };
+  }
+  const match = safePathname(url).match(/^\/([^/]+)\/([^/]+)\/(issues|pull|discussions)\/(\d+)/i);
+  if (!match || match[3].toLowerCase() === "discussions") return null;
+  const [, owner, repo, kind, number] = match;
+  const resource = kind.toLowerCase() === "pull" ? "pulls" : "issues";
+  const issueResult = await requestSourceJson(`${origin}/api/v3/repos/${owner}/${repo}/${resource}/${number}`, adapter);
+  const commentsResult = await requestSourceCollection(`${origin}/api/v3/repos/${owner}/${repo}/issues/${number}/comments?per_page=100`, adapter);
+  const issue = issueResult.data || {};
+  const comments = (commentsResult.data || []).map((comment) => ({ id: String(comment.id || ""), author: cleanText(comment.user?.login || ""), createdAt: cleanText(comment.created_at || ""), body: cleanText(comment.body || ""), url: cleanText(comment.html_url || "") }));
+  const title = `${owner}/${repo}#${number} ${cleanText(issue.title || "")}`;
+  return { raw: JSON.stringify({ issue, comments: commentsResult.data }, null, 2), title, text: [`# ${title}`, "", `Source: ${url}`, `Adapter: ${adapter.id}-api`, "", "## Fields", "", `- State: ${issue.state || "unknown"}`, `- Author: ${issue.user?.login || ""}`, `- Updated: ${issue.updated_at || ""}`, `- Labels: ${(issue.labels || []).map((label) => label.name).join(", ")}`, "", "## Description", "", cleanText(issue.body || "") || "_No description captured._", "", "## Comments", "", ...(comments.length ? comments.map((comment) => `### ${comment.author} · ${comment.createdAt}\n\n${comment.body}`) : ["_No comments captured._"])].join("\n"), comments, sourceUpdatedAt: latestTimestampValue([issue.updated_at, ...comments.map((comment) => comment.createdAt)]), url: issue.html_url || url, fetchMethod: "github-rest", httpValidators: responseValidators(issueResult.response) };
+}
+
+async function fetchTeamsFromGraph(url, adapter) {
+  const profile = settings.sources?.[adapter.hostname] || {};
+  if (profile.authMode !== "bearer" || !profile.token) return null;
+  const deepPath = extractTeamsDeepPath(url);
+  const chatId = decodeURIComponent(deepPath.match(/^\/l\/chat\/([^/]+)/i)?.[1] || "");
+  if (!chatId) return null;
+  const graphAdapter = { ...adapter, hostname: "teams.microsoft.com" };
+  const chatResult = await requestSourceJson(`https://graph.microsoft.com/v1.0/chats/${encodeURIComponent(chatId)}`, graphAdapter, { headers: { Authorization: `Bearer ${profile.token}` } });
+  const result = await requestSourceCollection(`https://graph.microsoft.com/v1.0/chats/${encodeURIComponent(chatId)}/messages?$top=50`, graphAdapter, { headers: { Authorization: `Bearer ${profile.token}` } });
+  const comments = (result.data || []).map((message) => ({ id: String(message.id || ""), author: cleanText(message.from?.user?.displayName || message.from?.application?.displayName || ""), createdAt: cleanText(message.createdDateTime || message.lastModifiedDateTime || ""), body: cleanText(htmlToText(message.body?.content || "")), url: cleanText(message.webUrl || url) })).filter((message) => message.body);
+  const title = cleanText(chatResult.data?.topic || `Teams ${chatId.slice(0, 18)}`);
+  return { raw: result.raw, title, text: renderTeamsTextFromComments(title, url, adapter, comments), comments, sourceUpdatedAt: latestTimestampValue(comments.map((comment) => comment.createdAt)), url: canonicalizeMaterialUrl(url), fetchMethod: "microsoft-graph", conversationId: chatId };
 }
 
 async function fetchUrlWithWebdriver(url, options = {}) {
   if (!url) throw new Error("URL is required.");
   const adapter = detectSourceAdapter(url);
+  if (adapter.sourceType !== "teams" && options.apiFirst !== false) {
+    try {
+      const apiResult = await fetchUrlFromSourceApi(url, adapter, options);
+      if (apiResult) return apiResult;
+    } catch (error) {
+      console.warn(`Source API fallback to WebDriver for ${url}:`, error.message || error);
+    }
+  }
   const session = options.session || await ensureWebdriverSession(adapter.hostname, url, {
     headed: Boolean(options.headed),
     autoClose: options.keepSession !== true,
@@ -4587,7 +4814,8 @@ async function fetchUrlWithWebdriver(url, options = {}) {
       text: extracted.text,
       comments: extracted.comments || [],
       sourceUpdatedAt: extracted.sourceUpdatedAt || "",
-      url: currentUrl
+      url: currentUrl,
+      fetchMethod: "webdriver"
     };
   } finally {
     if (!options.session && session.autoClose) {
@@ -4741,7 +4969,8 @@ async function fetchTeamsWithWebdriver(page, url, adapter) {
     text: extracted.text,
     comments: extracted.comments || [],
     sourceUpdatedAt: extracted.sourceUpdatedAt || "",
-    url: finalUrl
+    url: finalUrl,
+    fetchMethod: "webdriver"
   };
 }
 
@@ -4957,7 +5186,10 @@ async function ensureWebdriverSession(hostname, url, options = {}) {
   }
 
   await fs.mkdir(webdriverRoot, { recursive: true });
+  await fs.chmod(webdriverRoot, 0o700).catch(() => {});
   const userDataDir = path.join(webdriverRoot, slugify(key));
+  await fs.mkdir(userDataDir, { recursive: true });
+  await fs.chmod(userDataDir, 0o700).catch(() => {});
   const windowPlacement = webdriverWindowPlacement(windowMode, manual);
   const context = await chromium.launchPersistentContext(userDataDir, {
     headless,
@@ -5391,7 +5623,7 @@ async function scrollTeamsMessages(page, options = {}) {
   const minScrollsBeforeOverlapStop = Number(options.minScrollsBeforeOverlapStop || 2);
   const previousKeys = teamsMessageKeySet(options.previousMessages || []);
   const observed = [];
-  const remember = async () => {
+  const remember = async ({ res }) => {
     const visible = await readVisibleTeamsMessages(page);
     observed.push(...(visible.messages || []));
   };
@@ -6007,8 +6239,9 @@ function extractContentPage(html, url, adapter) {
     return extractConfluencePage(html, url, adapter);
   }
 
-  const title = extractTitle(html) || url;
-  const mainHtml = pickMainHtml(html, adapter);
+  const readable = extractReadableArticle(html, url);
+  const title = readable?.title || extractTitle(html) || url;
+  const mainHtml = readable?.content || pickMainHtml(html, adapter);
   const text = [
     `# ${title}`,
     "",
@@ -6017,10 +6250,24 @@ function extractContentPage(html, url, adapter) {
     "",
     "## Extracted Content",
     "",
-    htmlToText(mainHtml)
+    readable?.textContent || htmlToText(mainHtml)
   ].join("\n").trim();
 
-  return { title, text, comments: [] };
+  return { title, text, comments: [], sourceUpdatedAt: readable?.publishedTime || "" };
+}
+
+function extractReadableArticle(html, url) {
+  try {
+    const dom = new JSDOM(String(html || ""), { url });
+    const parsed = new Readability(dom.window.document.cloneNode(true), {
+      charThreshold: 120,
+      maxElemsToParse: 100000
+    }).parse();
+    if (!parsed?.textContent?.trim()) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
 function extractConfluencePage(html, url, adapter) {
@@ -6960,7 +7207,8 @@ async function readBody(req) {
 
 function sendJson(res, status, payload) {
   res.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8"
+    "Content-Type": "application/json; charset=utf-8",
+    ...securityHeaders()
   });
   res.end(JSON.stringify(payload));
 }
@@ -6969,7 +7217,8 @@ function sendJsonDownload(res, filename, payload) {
   const content = `${JSON.stringify(payload, null, 2)}\n`;
   res.writeHead(200, {
     "Content-Type": "application/json; charset=utf-8",
-    "Content-Disposition": `attachment; filename="${filename}"`
+    "Content-Disposition": `attachment; filename="${filename}"`,
+    ...securityHeaders()
   });
   res.end(content);
 }
@@ -6978,7 +7227,8 @@ function startSse(res) {
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache",
-    "Connection": "keep-alive"
+    "Connection": "keep-alive",
+    ...securityHeaders()
   });
 }
 
@@ -7012,9 +7262,20 @@ async function serveStatic(req, res, url) {
   };
 
   res.writeHead(200, {
-    "Content-Type": contentTypes[ext] || "application/octet-stream"
+    "Content-Type": contentTypes[ext] || "application/octet-stream",
+    "Cache-Control": ext === ".html" ? "no-cache" : "public, max-age=3600",
+    ...securityHeaders()
   });
   res.end(await fs.readFile(filePath));
+}
+
+function securityHeaders() {
+  return {
+    "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY"
+  };
 }
 
 async function ensureKnowledgeBase() {
@@ -7171,41 +7432,28 @@ async function suggestSupplementalContext(existingEntries = []) {
   const existing = normalizeSupplementalEntries(existingEntries.length ? existingEntries : await readSupplementalEntries());
   const corpus = await buildSupplementalAnalysisCorpus();
   if (!corpus.trim()) throw new Error("当前资料库没有足够内容可分析。");
-  const baseUrl = settings.ai.baseUrl.replace(/\/+$/, "");
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${settings.ai.apiKey}`,
-      "Content-Type": "application/json"
+
+  const payload = await ai.chatPayload([
+    {
+      role: "system",
+      content: [
+        "你是资料库术语分析助手。",
+        "请从资料片段中找出可能需要用户补充解释的缩写、项目名、模块名、测试名、产品代号、组织内部词汇。",
+        "不要重复已有候选项。",
+        "不要编造确定含义，只说明为什么需要用户补充或确认。",
+        "只返回 JSON，格式为 {\"entries\":[{\"term\":\"CI+\",\"category\":\"缩写\",\"reason\":\"多次出现但上下文不完整\",\"explanation\":\"\"}]}。"
+      ].join("\n")
     },
-    body: JSON.stringify({
-      model: settings.ai.model,
-      temperature: 0.2,
-      messages: [
-        {
-          role: "system",
-          content: [
-            "你是资料库术语分析助手。",
-            "请从资料片段中找出可能需要用户补充解释的缩写、项目名、模块名、测试名、产品代号、组织内部词汇。",
-            "不要重复已有候选项。",
-            "不要编造确定含义，只说明为什么需要用户补充或确认。",
-            "只返回 JSON，格式为 {\"entries\":[{\"term\":\"CI+\",\"category\":\"缩写\",\"reason\":\"多次出现但上下文不完整\",\"explanation\":\"\"}]}。"
-          ].join("\n")
-        },
-        {
-          role: "user",
-          content: [
-            `已有候选项：${existing.map((entry) => entry.term).filter(Boolean).join(", ") || "none"}`,
-            "",
-            corpus
-          ].join("\n")
-        }
-      ]
-    })
-  });
-  const text = await response.text();
-  if (!response.ok) throw new Error(`AI 分析补充资料失败：${response.status} ${text.slice(0, 300)}`);
-  const payload = JSON.parse(text);
+    {
+      role: "user",
+      content: [
+        `已有候选项：${existing.map((entry) => entry.term).filter(Boolean).join(", ") || "none"}`,
+        "",
+        corpus
+      ].join("\n")
+    }
+  ], { temperature: 0.2 });
+
   const parsed = parseJsonObjectFromText(payload.choices?.[0]?.message?.content || "");
   const existingTerms = new Set(existing.map((entry) => entry.term.toLowerCase()).filter(Boolean));
   return normalizeSupplementalEntries(parsed.entries || [])
@@ -7239,10 +7487,12 @@ async function loadSettings() {
   if (!(await exists(settingsPath))) {
     await fs.mkdir(configDir, { recursive: true });
     await fs.writeFile(settingsPath, `${JSON.stringify(defaults, null, 2)}\n`, "utf8");
+    await fs.chmod(settingsPath, 0o600).catch(() => {});
     return defaults;
   }
 
   const saved = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+  await fs.chmod(settingsPath, 0o600).catch(() => {});
   return mergeSettings(defaults, saved);
 }
 
@@ -7297,6 +7547,55 @@ async function collectDataFiles(baseDir, relativeDir = "") {
     });
   }
   return files;
+}
+
+async function storageStats() {
+  const [knowledgeBytes, snapshotBytes, webdriverBytes] = await Promise.all([
+    directorySize(kbDir),
+    snapshotStorageSize(),
+    directorySize(webdriverRoot)
+  ]);
+  return {
+    knowledgeBytes,
+    snapshotBytes,
+    webdriverBytes,
+    retentionCount: SNAPSHOT_RETENTION_COUNT
+  };
+}
+
+async function directorySize(dir) {
+  if (!(await exists(dir))) return 0;
+  let total = 0;
+  for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+    const target = path.join(dir, entry.name);
+    if (entry.isDirectory()) total += await directorySize(target);
+    else if (entry.isFile()) total += (await fs.stat(target)).size;
+  }
+  return total;
+}
+
+async function snapshotStorageSize() {
+  let total = 0;
+  for (const id of await safeReaddir(itemsDir)) {
+    total += await directorySize(path.join(itemsDir, id, "snapshots"));
+  }
+  return total;
+}
+
+async function cleanupOldSnapshots() {
+  let removedSnapshots = 0;
+  let reclaimedBytes = 0;
+  for (const id of await safeReaddir(itemsDir)) {
+    const root = path.join(itemsDir, id, "snapshots");
+    const snapshots = (await safeReaddir(root)).sort().reverse();
+    for (const stale of snapshots.slice(SNAPSHOT_RETENTION_COUNT)) {
+      const target = path.join(root, stale);
+      reclaimedBytes += await directorySize(target);
+      await fs.rm(target, { recursive: true, force: true });
+      removedSnapshots += 1;
+    }
+  }
+  return { removedSnapshots, reclaimedBytes, retentionCount: SNAPSHOT_RETENTION_COUNT };
 }
 
 async function importDataBundle(bundle, options = {}) {
@@ -7633,6 +7932,8 @@ function normalizeRefreshJob(input, previous = {}) {
     fetchMode: cleanText(input.fetchMode ?? previous.fetchMode ?? "webdriver"),
     pageKind: cleanText(input.pageKind ?? previous.pageKind ?? "list"),
     managedBy: cleanText(input.managedBy ?? previous.managedBy ?? ""),
+    quarantined: Boolean(input.quarantined ?? previous.quarantined ?? false),
+    quarantineReason: cleanText(input.quarantineReason ?? previous.quarantineReason ?? ""),
     status: cleanText(input.status ?? previous.status ?? "idle"),
     lastRunAt: cleanText(input.lastRunAt ?? previous.lastRunAt ?? ""),
     lastStartedAt: cleanText(input.lastStartedAt ?? previous.lastStartedAt ?? ""),

@@ -10,7 +10,8 @@
 // before each Teams navigation; this script only *reports* items already
 // mis-captured so they can be re-fetched.
 //
-// It does NOT modify any files. Re-fetch via the running service:
+// Pass --quarantine to mark mismatched items so they are excluded from AI
+// search until a verified refresh repairs them. Re-fetch via the running service:
 //   ./ctl --start
 //   curl -sX POST http://127.0.0.1:8020/api/refresh-jobs/<jobId>/run
 // or batch:
@@ -26,6 +27,7 @@ import path from "node:path";
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const itemsDir = path.join(root, "knowledge-base", "items");
+const settingsPath = path.join(root, ".config", "settings.json");
 
 function normalize(value) {
   return String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
@@ -42,6 +44,7 @@ function isConsistent(title, jobName) {
 }
 
 async function main() {
+  const quarantine = process.argv.includes("--quarantine");
   const dirs = await fs.readdir(itemsDir);
   const mismatches = [];
   for (const id of dirs) {
@@ -59,7 +62,7 @@ async function main() {
     const jobName = (job.name || "").replace(/\s+refresh$/i, "");
     const jobId = job.id || "";
     if (!isConsistent(title, jobName)) {
-      mismatches.push({ id, title, jobName, jobId, url: metadata.url || "" });
+      mismatches.push({ id, title, jobName, jobId, url: metadata.url || "", metadata, metaPath });
     }
   }
 
@@ -76,6 +79,33 @@ async function main() {
     console.log(`    job id:         ${jobId}`);
     console.log(`    url:            ${url}`);
     console.log();
+  }
+
+  if (quarantine) {
+    for (const mismatch of mismatches) {
+      const next = {
+        ...mismatch.metadata,
+        integrityStatus: "quarantined",
+        integrityReason: `Teams conversation title mismatch: captured "${mismatch.title}", expected "${mismatch.jobName}"`,
+        integrityCheckedAt: new Date().toISOString()
+      };
+      await fs.writeFile(mismatch.metaPath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+    }
+    try {
+      const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+      const jobIds = new Set(mismatches.map((item) => item.jobId).filter(Boolean));
+      settings.refreshJobs = (settings.refreshJobs || []).map((job) => jobIds.has(job.id) ? {
+        ...job,
+        enabled: false,
+        quarantined: true,
+        quarantineReason: "Disabled because the captured Teams title did not match the subscription target. Re-enable after a verified refresh."
+      } : job);
+      await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+      await fs.chmod(settingsPath, 0o600);
+    } catch (error) {
+      console.warn(`Could not disable quarantined refresh jobs: ${error.message}`);
+    }
+    console.log(`Quarantined ${mismatches.length} mismatched Teams item(s).`);
   }
 
   console.log("To re-fetch with the navigation fix applied, start the service and run:");
