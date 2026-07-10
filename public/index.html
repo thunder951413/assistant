@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>工作助理</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/styles.css?v=3" />
   </head>
   <body>
     <div class="app-shell">
@@ -69,6 +69,7 @@
               <button class="source-item" data-source="jira">Jira</button>
               <button class="source-item" data-source="github">GitHub</button>
               <button class="source-item" data-source="teams">Teams</button>
+              <button class="source-item source-item-warning" data-source="" data-integrity-status="quarantined">隔离区</button>
             </div>
           </section>
 
@@ -796,6 +797,6 @@
 
     <script src="/vendor/purify.min.js"></script>
     <script src="/vendor/marked.umd.js"></script>
-    <script type="module" src="/app.js"></script>
+    <script type="module" src="/app.js?v=3"></script>
   </body>
 </html>

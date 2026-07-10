@@ -18,6 +18,8 @@ import {
 import { createRouter } from "./router.js";
 import { createAiClient } from "./ai-client.js";
 import { areCaptureTitlesConsistent, isSupportedCaptureContentType, paginate } from "./capture-utils.js";
+import { createItemStore, renderDocument, extractBodyFromDocument, extractSummaryFromDocument } from "./item-store.js";
+import { computeSourceHealth, createRunHistory, lineDiff } from "./reliability.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -38,6 +40,9 @@ const refreshRuntime = {
   queued: new Set(),
   runs: new Map()
 };
+const store = createItemStore(() => ({ itemsDir, tagsDir, indexesDir }));
+const refreshHistory = createRunHistory(path.join(configDir, "runtime", "refresh-history.jsonl"));
+
 const FETCH_TIMEOUT_MS = 45 * 1000;
 const REFRESH_JOB_TIMEOUT_MS = 4 * 60 * 1000;
 const REFRESH_RUN_RETENTION_MS = 6 * 60 * 60 * 1000;
@@ -47,6 +52,7 @@ const MAX_FETCH_BYTES = 12 * 1024 * 1024;
 const port = Number(process.env.PORT || 8020);
 
 await ensureKnowledgeBase();
+await rebuildIndexes();
 await syncContentRefreshJobsFromItems();
 await reconcileStaleRunningRefreshJobs();
 startRefreshScheduler();
@@ -81,7 +87,10 @@ api.get("/api/items", async ({ url, res }) => {
     sourceType: url.searchParams.get("sourceType"),
     query: url.searchParams.get("q"),
     updates: url.searchParams.get("updates"),
-    includeLists: url.searchParams.get("includeLists")
+    includeLists: url.searchParams.get("includeLists"),
+    integrityStatus: url.searchParams.get("integrityStatus"),
+    dateFrom: url.searchParams.get("dateFrom"),
+    dateTo: url.searchParams.get("dateTo")
   });
   const pageData = paginate(allItems, url.searchParams.get("page") || 1, url.searchParams.get("pageSize") || allItems.length || 1);
   const items = url.searchParams.has("page") || url.searchParams.has("pageSize") ? pageData.items : allItems;
@@ -97,6 +106,10 @@ api.post("/api/items", async ({ req, res }) => {
 api.get("/api/items/:id", async ({ params, res }) => {
   const item = await readItem(params.id);
   sendJson(res, 200, { item });
+});
+
+api.get("/api/items/:id/diff", async ({ params, res }) => {
+  sendJson(res, 200, { diff: await itemLatestDiff(params.id) });
 });
 
 api.delete("/api/items/:id", async ({ params, res }) => {
@@ -228,7 +241,7 @@ api.post("/api/search", async ({ req, res }) => {
 
 api.post("/api/knowledge-search", async ({ req, res }) => {
   const body = await readBody(req);
-  const results = await searchKnowledgeBase(body.query || "", body.limit || 8);
+  const results = await searchKnowledgeBase(body.query || "", body.limit || 8, body.filters || {});
   sendJson(res, 200, { rootDir: kbDir, results });
 });
 
@@ -295,12 +308,14 @@ api.patch("/api/settings", async ({ req, res }) => {
 });
 
 // Export / import ----------------------------------------------
-api.get("/api/export/settings", async ({ res }) => {
+api.get("/api/export/settings", async ({ url, res }) => {
+  const includeSecrets = url.searchParams.get("includeSecrets") === "1";
   sendJsonDownload(res, exportFilename("assistant-settings"), {
     type: "material-organizer-settings",
     version: 1,
     exportedAt: new Date().toISOString(),
-    settings
+    settings: includeSecrets ? settings : redactSettings(settings),
+    secretsIncluded: includeSecrets
   });
 });
 
@@ -332,6 +347,14 @@ api.get("/api/source-profiles", async ({ res }) => {
 
 api.get("/api/storage-stats", async ({ res }) => {
   sendJson(res, 200, { stats: await storageStats() });
+});
+
+api.get("/api/health", async ({ res }) => {
+  sendJson(res, 200, await serviceHealth());
+});
+
+api.get("/api/source-health", async ({ res }) => {
+  sendJson(res, 200, { sources: computeSourceHealth(await listItems({ includeLists: true, includeInvalidTeamsRoot: true }), publicRefreshJobs()) });
 });
 
 api.post("/api/storage-cleanup", async ({ res }) => {
@@ -404,6 +427,10 @@ api.get("/api/refresh-runs", async ({ res }) => {
   sendJson(res, 200, { runs: publicRefreshRuns() });
 });
 
+api.get("/api/refresh-history", async ({ url, res }) => {
+  sendJson(res, 200, { history: await refreshHistory.list(url.searchParams.get("limit") || 50) });
+});
+
 api.get("/api/refresh-runs/:runId", async ({ params, res }) => {
   const run = publicRefreshRun(params.runId);
   if (!run) throw new Error("Refresh run not found.");
@@ -463,8 +490,6 @@ async function createItem(input) {
 
   title = title || "Untitled material";
   const id = await uniqueItemId(slugify(`${sourceType}-${title}`));
-  const itemDir = path.join(itemsDir, id);
-  await fs.mkdir(itemDir, { recursive: true });
 
   const metadata = {
     id,
@@ -488,10 +513,10 @@ async function createItem(input) {
     pendingContentUpdatedAt: cleanText(input.pendingContentUpdatedAt || "")
   };
 
-  await fs.writeFile(path.join(itemDir, rawFileName), rawContent, "utf8");
-  await fs.writeFile(path.join(itemDir, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
-  await fs.writeFile(path.join(itemDir, "comments.jsonl"), renderJsonLines(comments), "utf8");
-  await fs.writeFile(path.join(itemDir, "document.md"), renderDocument(metadata, extractedContent, summary), "utf8");
+  await store.writeRawContent(id, rawContent, rawFileName.endsWith(".html") ? "text/html" : "", rawFileName);
+  await store.writeMetadata(id, metadata);
+  await store.writeComments(id, comments);
+  await store.writeDocument(id, metadata, extractedContent, summary);
   if (metadata.pageKind === "list" && metadata.url) {
     metadata.refreshJob = await ensureRefreshJobForListUrl(metadata.url, {
       title,
@@ -508,8 +533,8 @@ async function createItem(input) {
     });
     if (linkedImport.linkCount) {
       metadata.listImport = linkedImport;
-      await fs.writeFile(path.join(itemDir, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
-      await fs.writeFile(path.join(itemDir, "document.md"), renderDocument(metadata, extractedContent, summary), "utf8");
+      await store.writeMetadata(id, metadata);
+      await store.writeDocument(id, metadata, extractedContent, summary);
     }
   } else if (metadata.url) {
     metadata.refreshJob = await ensureRefreshJobForContentUrl(metadata.url, {
@@ -518,8 +543,8 @@ async function createItem(input) {
       fetchMode: metadata.fetchMode || "auto",
       managedBy: metadata.managedBy || "content-page"
     });
-    await fs.writeFile(path.join(itemDir, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
-    await fs.writeFile(path.join(itemDir, "document.md"), renderDocument(metadata, extractedContent, summary), "utf8");
+    await store.writeMetadata(id, metadata);
+    await store.writeDocument(id, metadata, extractedContent, summary);
   }
   await rebuildIndexes();
 
@@ -816,7 +841,7 @@ async function refreshItemWithContext(id, refreshContext = null) {
       captureMethod: fetched.fetchMethod || item.metadata.captureMethod || "http-304",
       httpValidators: fetched.httpValidators || item.metadata.httpValidators || {}
     };
-    await fs.writeFile(path.join(itemDir, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+    await store.writeMetadata(id, metadata);
     return readItem(id);
   }
   validateTeamsConversationIdentity({ url: item.metadata.url, name: item.metadata.title }, fetched, detectSourceAdapter(item.metadata.url || ""));
@@ -864,10 +889,10 @@ async function refreshItemWithContext(id, refreshContext = null) {
   };
 
   const rawFileName = metadata.rawFileName || "raw.html";
-  await fs.writeFile(path.join(itemDir, rawFileName), fetched.raw, "utf8");
-  await fs.writeFile(path.join(itemDir, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
-  await fs.writeFile(path.join(itemDir, "comments.jsonl"), renderJsonLines(fetched.comments || []), "utf8");
-  await fs.writeFile(path.join(itemDir, "document.md"), renderDocument(metadata, fetched.text), "utf8");
+  await store.writeRawContent(id, fetched.raw, rawFileName.endsWith(".html") ? "text/html" : "", rawFileName);
+  await store.writeMetadata(id, metadata);
+  await store.writeComments(id, fetched.comments || []);
+  await store.writeDocument(id, metadata, fetched.text);
   return readItem(id);
 }
 
@@ -960,10 +985,10 @@ async function upsertFetchedItem(input) {
     }
   };
 
-  await fs.writeFile(path.join(itemDir, metadata.rawFileName), input.raw, "utf8");
-  await fs.writeFile(path.join(itemDir, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
-  await fs.writeFile(path.join(itemDir, "comments.jsonl"), renderJsonLines(input.comments || []), "utf8");
-  await fs.writeFile(path.join(itemDir, "document.md"), renderDocument(metadata, input.text), "utf8");
+  await store.writeRawContent(existing.id, input.raw, metadata.rawFileName.endsWith(".html") ? "text/html" : "", metadata.rawFileName);
+  await store.writeMetadata(existing.id, metadata);
+  await store.writeComments(existing.id, input.comments || []);
+  await store.writeDocument(existing.id, metadata, input.text);
   await rebuildIndexes();
   const refreshed = await readItem(existing.id);
   refreshed.refreshChanged = hasUpdate;
@@ -1450,8 +1475,10 @@ async function updateTags(id, tags) {
     tags: normalizeTags(tags),
     updatedAt: new Date().toISOString()
   };
-  await fs.writeFile(path.join(itemsDir, id, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
-  await fs.writeFile(path.join(itemsDir, id, "document.md"), renderDocument(metadata, extractBodyFromDocument(item.document), extractSummaryFromDocument(item.document)), "utf8");
+  const body = extractBodyFromDocument(item.document);
+  const summary = extractSummaryFromDocument(item.document);
+  await store.writeMetadata(id, metadata);
+  await store.writeDocument(id, metadata, body, summary);
   await rebuildIndexes();
   return readItem(id);
 }
@@ -1465,8 +1492,10 @@ async function updateTitle(id, title) {
     title: nextTitle,
     updatedAt: new Date().toISOString()
   };
-  await fs.writeFile(path.join(itemsDir, id, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
-  await fs.writeFile(path.join(itemsDir, id, "document.md"), renderDocument(metadata, extractBodyFromDocument(item.document), extractSummaryFromDocument(item.document)), "utf8");
+  const body = extractBodyFromDocument(item.document);
+  const summary = extractSummaryFromDocument(item.document);
+  await store.writeMetadata(id, metadata);
+  await store.writeDocument(id, metadata, body, summary);
   await rebuildIndexes();
   return readItem(id);
 }
@@ -1532,8 +1561,10 @@ async function acknowledgeItemUpdate(id) {
     contentUpdatedAt: "",
     updateAcknowledgedAt: new Date().toISOString()
   };
-  await fs.writeFile(path.join(itemsDir, id, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
-  await fs.writeFile(path.join(itemsDir, id, "document.md"), renderDocument(metadata, extractBodyFromDocument(item.document), extractSummaryFromDocument(item.document)), "utf8");
+  const body = extractBodyFromDocument(item.document);
+  const summary = extractSummaryFromDocument(item.document);
+  await store.writeMetadata(id, metadata);
+  await store.writeDocument(id, metadata, body, summary);
   await rebuildIndexes();
   return readItem(id);
 }
@@ -1996,6 +2027,9 @@ async function processItemWithAi(id) {
   if (!settings.ai?.baseUrl || !settings.ai?.apiKey || !settings.ai?.model) {
     throw new Error("请先在设置页配置 AI 接口后再生成整理版。");
   }
+  if (!isRemoteAiAllowed(item.metadata)) {
+    throw new Error("该数据源已禁止发送到远程 AI。可继续本地查看和检索，或在数据源设置中重新授权。");
+  }
 
   const prompt = resolveProcessingPrompt(item.metadata.sourceType);
   const processedText = unwrapMarkdownFence(await processDocumentWithOpenAICompatible(item, prompt));
@@ -2010,9 +2044,8 @@ async function processItemWithAi(id) {
     pendingContentUpdatedAt: "",
     updatedAt: now
   };
-  const itemDir = path.join(itemsDir, id);
-  await fs.writeFile(path.join(itemDir, "processed.md"), renderProcessedDocument(metadata, processedText), "utf8");
-  await fs.writeFile(path.join(itemDir, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+  await store.writeProcessedDocument(id, renderProcessedDocument(metadata, processedText));
+  await store.writeMetadata(id, metadata);
   await rebuildIndexes();
   return readItem(id);
 }
@@ -2064,84 +2097,32 @@ async function processDocumentWithOpenAICompatible(item, prompt) {
 }
 
 async function readItem(id) {
-  if (!id || id.includes("..") || id.includes("/")) {
-    throw new Error("Invalid item id.");
-  }
-
-  const itemDir = path.join(itemsDir, id);
-  const metadata = JSON.parse(await fs.readFile(path.join(itemDir, "metadata.json"), "utf8"));
-  const document = await fs.readFile(path.join(itemDir, "document.md"), "utf8");
-  const processedPath = path.join(itemDir, "processed.md");
-  const processedDocument = await exists(processedPath) ? await fs.readFile(processedPath, "utf8") : "";
-  const commentsPath = path.join(itemDir, "comments.jsonl");
-  const comments = await readJsonLines(commentsPath);
-  return { metadata, document, processedDocument, comments };
+  return store.read(id);
 }
 
 async function deleteItem(id) {
-  if (!id || id.includes("..") || id.includes("/")) {
-    throw new Error("Invalid item id.");
-  }
-
-  const itemDir = path.join(itemsDir, id);
-  if (!(await exists(itemDir))) {
-    throw new Error("Item not found.");
-  }
-
-  await fs.rm(itemDir, { recursive: true, force: true });
-  await rebuildIndexes();
+  return store.delete(id);
 }
 
 async function listItems(filters = {}) {
-  const dirs = await safeReaddir(itemsDir);
-  const items = [];
-
-  for (const id of dirs) {
-    const metadataPath = path.join(itemsDir, id, "metadata.json");
-    if (!(await exists(metadataPath))) continue;
-    const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
-    const document = await fs.readFile(path.join(itemsDir, id, "document.md"), "utf8");
-    const processedPath = path.join(itemsDir, id, "processed.md");
-    const processedDocument = await exists(processedPath) ? await fs.readFile(processedPath, "utf8") : "";
-    const searchText = `${metadata.title} ${(metadata.tags || []).join(" ")} ${processedDocument} ${document}`.toLowerCase();
-
-    if (!isTruthyFilter(filters.includeLists) && metadata.pageKind === "list") continue;
-    if (!isTruthyFilter(filters.includeInvalidTeamsRoot) && isInvalidTeamsRootCapture(metadata)) continue;
-    if (filters.tag && !(metadata.tags || []).includes(filters.tag)) continue;
-    if (filters.sourceType && metadata.sourceType !== filters.sourceType) continue;
-    if (isTruthyFilter(filters.updates) && !metadata.contentUpdatedAt) continue;
-    if (filters.query && !searchText.includes(filters.query.toLowerCase())) continue;
-
-    items.push({
-      ...metadata,
-      hasProcessed: Boolean(processedDocument),
-      excerpt: summarizeExcerpt(processedDocument || document)
-    });
-  }
-
-  return items.sort((a, b) => {
-    const updateState = Number(Boolean(b.contentUpdatedAt)) - Number(Boolean(a.contentUpdatedAt));
-    if (updateState !== 0) return updateState;
-    const updateTime = String(b.contentUpdatedAt || "").localeCompare(String(a.contentUpdatedAt || ""));
-    if (updateTime !== 0) return updateTime;
-    return String(b.updatedAt).localeCompare(String(a.updatedAt));
+  return store.list({
+    tag: filters.tag,
+    sourceType: filters.sourceType,
+    query: filters.query,
+    integrityStatus: filters.integrityStatus,
+    dateFrom: filters.dateFrom,
+    dateTo: filters.dateTo,
+    predicate: (metadata) => {
+      if (!isTruthyFilter(filters.includeLists) && metadata.pageKind === "list") return false;
+      if (!isTruthyFilter(filters.includeInvalidTeamsRoot) && isInvalidTeamsRootCapture(metadata)) return false;
+      if (isTruthyFilter(filters.updates) && !metadata.contentUpdatedAt) return false;
+      return true;
+    }
   });
 }
 
 async function searchItems(query) {
-  if (!query.trim()) return [];
-  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
-  const items = await listItems();
-
-  return items
-    .map((item) => {
-      const haystack = `${item.title} ${item.excerpt} ${(item.tags || []).join(" ")}`.toLowerCase();
-      const score = terms.reduce((sum, term) => sum + (haystack.includes(term) ? 1 : 0), 0);
-      return { item, score };
-    })
-    .filter((result) => result.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 10);
+  return store.search(query);
 }
 
 async function buildAskContext(question) {
@@ -2180,7 +2161,7 @@ async function answerFromKnowledgeBase(message) {
     throw new Error("请输入问题。");
   }
 
-  const results = await searchKnowledgeBase(cleanMessage, 8);
+  const results = await searchKnowledgeBase(cleanMessage, 8, { remoteAiOnly: true });
   const trace = [
     {
       type: "thinking",
@@ -2292,7 +2273,7 @@ async function streamAnswerFromKnowledgeBase(message, res) {
       detail: `准备基于本地知识库回答：“${cleanMessage.slice(0, 120)}”`
     });
 
-    const results = await searchKnowledgeBase(cleanMessage, 8);
+    const results = await searchKnowledgeBase(cleanMessage, 8, { remoteAiOnly: true });
     const sources = results.map(toPublicKnowledgeSource);
     sendSse(res, "trace", {
       type: "tool",
@@ -2417,7 +2398,7 @@ function parseOpenAIStreamPayloads(chunk) {
   return { payloads, rest };
 }
 
-async function searchKnowledgeBase(query, limit = 8) {
+async function searchKnowledgeBase(query, limit = 8, filters = {}) {
   const terms = tokenizeQuery(query);
   const desiredLimit = Math.max(1, Number(limit) || 8);
   const embeddingEnabled = isEmbeddingEnabled();
@@ -2429,6 +2410,11 @@ async function searchKnowledgeBase(query, limit = 8) {
     if (!material) continue;
     const { metadata, document, processedDocument, commentsText, paths } = material;
     if (metadata.integrityStatus === "quarantined") continue;
+    if (filters.remoteAiOnly && !isRemoteAiAllowed(metadata)) continue;
+    if (filters.sourceType && metadata.sourceType !== filters.sourceType) continue;
+    if (filters.tag && !(metadata.tags || []).includes(filters.tag)) continue;
+    if (filters.dateFrom && String(metadata.updatedAt || "") < String(filters.dateFrom)) continue;
+    if (filters.dateTo && String(metadata.updatedAt || "") > String(filters.dateTo)) continue;
     const haystack = `${metadata.title}\n${(metadata.tags || []).join(" ")}\n${metadata.sourceType}\n${metadata.url || ""}\n${processedDocument}\n${document}\n${commentsText}`.toLowerCase();
     const score = scoreKnowledgeMatch(haystack, terms, metadata);
 
@@ -2897,8 +2883,10 @@ async function renameTag(from, to) {
       tags: nextTags,
       updatedAt: new Date().toISOString()
     };
-    await fs.writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
-    await fs.writeFile(documentPath, renderDocument(metadata, extractBodyFromDocument(item.document), extractSummaryFromDocument(item.document)), "utf8");
+    const body = extractBodyFromDocument(item.document);
+    const summary = extractSummaryFromDocument(item.document);
+    await store.writeMetadata(id, metadata);
+    await store.writeDocument(id, metadata, body, summary);
     touchedItems.push({ id, title: metadata.title });
   }
 
@@ -2943,8 +2931,10 @@ async function deleteTags(tags) {
       tags: nextTags,
       updatedAt: new Date().toISOString()
     };
-    await fs.writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
-    await fs.writeFile(documentPath, renderDocument(metadata, extractBodyFromDocument(item.document), extractSummaryFromDocument(item.document)), "utf8");
+    const body = extractBodyFromDocument(item.document);
+    const summary = extractSummaryFromDocument(item.document);
+    await store.writeMetadata(id, metadata);
+    await store.writeDocument(id, metadata, body, summary);
     touchedItems.push({ id, title: metadata.title });
   }
 
@@ -2976,34 +2966,7 @@ async function writeManualTags(tags) {
 }
 
 async function rebuildIndexes() {
-  await fs.mkdir(tagsDir, { recursive: true });
-  await fs.mkdir(indexesDir, { recursive: true });
-
-  const items = await listItems();
-  const byTag = {};
-  const bySource = {};
-
-  for (const item of items) {
-    bySource[item.sourceType] ||= [];
-    bySource[item.sourceType].push(item.id);
-
-    for (const tag of item.tags || []) {
-      byTag[tag] ||= [];
-      byTag[tag].push(item.id);
-    }
-  }
-
-  await fs.writeFile(path.join(indexesDir, "by-tag.json"), `${JSON.stringify(byTag, null, 2)}\n`, "utf8");
-  await fs.writeFile(path.join(indexesDir, "by-source.json"), `${JSON.stringify(bySource, null, 2)}\n`, "utf8");
-  await fs.writeFile(path.join(indexesDir, "by-updated.json"), `${JSON.stringify(items.map((item) => item.id), null, 2)}\n`, "utf8");
-
-  const existingTagFiles = await safeReaddir(tagsDir);
-  for (const file of existingTagFiles) {
-    if (file.endsWith(".json")) await fs.unlink(path.join(tagsDir, file));
-  }
-  for (const [tag, ids] of Object.entries(byTag)) {
-    await fs.writeFile(path.join(tagsDir, `${slugify(tag)}.json`), `${JSON.stringify({ tag, items: ids }, null, 2)}\n`, "utf8");
-  }
+  return store.rebuildIndexes();
 }
 
 function startRefreshScheduler() {
@@ -3095,7 +3058,7 @@ async function startRefreshRunByIds(ids, options = {}) {
     .filter((job) => !isInvalidTeamsRootRefreshJob(job));
   const run = createRefreshRun(runnableJobs, options);
   Promise.resolve()
-    .then(async ({ res }) => {
+    .then(async () => {
       updateRefreshRun(run, { status: "running" });
       const result = await runRefreshJobsBatch(runnableJobs, { ...options, run });
       updateRefreshRun(run, {
@@ -3237,6 +3200,7 @@ async function runRefreshJobsByIds(ids, options = {}) {
 async function runRefreshJobsBatch(jobs, options = {}) {
   const runnableJobs = jobs
     .filter((job) => options.force || job.enabled)
+    .filter((job) => options.force || (!job.circuitOpen && (!job.nextRetryAt || Date.parse(job.nextRetryAt) <= Date.now())))
     .filter((job) => !isInvalidTeamsRootRefreshJob(job));
   const queuedIds = [];
   for (const job of runnableJobs) {
@@ -3315,6 +3279,18 @@ async function runRefreshJobsBatch(jobs, options = {}) {
       summary.errorCount = Number(summary.errorCount || 0) + 1;
     }
     await notifyRefreshBatchResult(summary);
+    await refreshHistory.append({
+      id: run?.id || `refresh-${Date.now()}`,
+      sourceType: cleanText(options.sourceType || "all"),
+      startedAt: summary.startedAt,
+      finishedAt: summary.finishedAt,
+      jobCount: summary.jobCount,
+      successCount: summary.successCount,
+      failureCount: summary.failureCount,
+      updatedItemCount: summary.updatedItemCount,
+      errorCount: summary.errorCount,
+      canceled: Boolean(summary.canceled)
+    });
     return summary;
   } finally {
     for (const id of queuedIds) refreshRuntime.queued.delete(id);
@@ -3331,11 +3307,13 @@ function keepRefreshGroupOpenForLogin(refreshContext) {
 async function markRefreshJobFailed(job, error) {
   const unreachable = isNetworkUnavailableForJob(job, error);
   const lastError = unreachable ? networkUnavailableMessage(job) : error.message || String(error);
+  const retry = refreshFailureState(job);
   await updateRefreshJobState(job.id, {
     status: unreachable ? "unreachable" : "failed",
     lastRunAt: new Date().toISOString(),
     lastError,
-    lastResult: failedRefreshJobResult(job, lastError)
+    lastResult: failedRefreshJobResult(job, lastError),
+    ...retry
   });
 }
 
@@ -3777,17 +3755,22 @@ async function runRefreshJob(job, options = {}) {
       lastResult: result,
       lastError: "",
       quarantined: false,
-      quarantineReason: ""
+      quarantineReason: "",
+      consecutiveFailures: 0,
+      nextRetryAt: "",
+      circuitOpen: false
     });
     return result;
   } catch (error) {
     const unreachable = isNetworkUnavailableForJob(job, error);
     const lastError = unreachable ? networkUnavailableMessage(job) : error.message || String(error);
+    const retry = refreshFailureState(job);
     await updateRefreshJobState(job.id, {
       status: unreachable ? "unreachable" : "failed",
       lastRunAt: new Date().toISOString(),
       lastError,
-      lastResult: failedRefreshJobResult(job, lastError)
+      lastResult: failedRefreshJobResult(job, lastError),
+      ...retry
     });
     if (unreachable) {
       const friendlyError = new Error(lastError);
@@ -7017,34 +7000,6 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function renderDocument(metadata, body, summary = "") {
-  const tags = (metadata.tags || []).join(", ") || "none";
-  const url = metadata.url || "local input";
-  const refreshNote = metadata.refreshNote
-    ? `\n## Latest Refresh\n\n- Previous length: ${metadata.refreshNote.previousDocumentLength}\n- Current length: ${metadata.refreshNote.currentDocumentLength}\n- Delta: ${metadata.refreshNote.lengthDelta}\n`
-    : "";
-  const summaryBlock = summary.trim() ? `\n## Summary\n\n${summary.trim()}\n` : "";
-
-  return `# ${metadata.title}
-
-## Metadata
-
-- ID: ${metadata.id}
-- Source: ${metadata.sourceType}
-- URL: ${url}
-- Tags: ${tags}
-- Created: ${metadata.createdAt}
-- Updated: ${metadata.updatedAt}
-- Last fetched: ${metadata.lastFetchedAt || "not fetched"}
-- Source updated: ${metadata.sourceUpdatedAt || "unknown"}
-${refreshNote}
-${summaryBlock}
-## Content
-
-${body.trim() || "_No content captured yet._"}
-`;
-}
-
 function renderProcessedDocument(metadata, body) {
   const url = metadata.url || "local input";
   return `# ${metadata.title}
@@ -7063,12 +7018,6 @@ ${body.trim() || "_No organized content generated yet._"}
 `;
 }
 
-function extractBodyFromDocument(document) {
-  const marker = "\n## Content\n\n";
-  const index = document.indexOf(marker);
-  return index === -1 ? document : document.slice(index + marker.length);
-}
-
 function unwrapMarkdownFence(markdown) {
   const source = String(markdown || "").trim();
   const match = source.match(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```\s*$/i);
@@ -7079,15 +7028,6 @@ function extractProcessedBodyFromDocument(document) {
   const marker = "\n## AI Organized Content\n\n";
   const index = document.indexOf(marker);
   return index === -1 ? document : document.slice(index + marker.length);
-}
-
-function extractSummaryFromDocument(document) {
-  const startMarker = "\n## Summary\n\n";
-  const endMarker = "\n## Content\n\n";
-  const start = document.indexOf(startMarker);
-  const end = document.indexOf(endMarker);
-  if (start === -1 || end === -1 || end <= start) return "";
-  return document.slice(start + startMarker.length, end).trim();
 }
 
 function normalizeSourceType(sourceType, url) {
@@ -7287,6 +7227,56 @@ async function ensureKnowledgeBase() {
   if (!(await exists(agentsPath))) {
     await fs.writeFile(agentsPath, defaultAgentsGuide(), "utf8");
   }
+  const schemaPath = path.join(kbDir, "schema.json");
+  let currentVersion = 0;
+  try { currentVersion = Number(JSON.parse(await fs.readFile(schemaPath, "utf8")).version || 0); } catch {}
+  if (currentVersion < 1) {
+    await fs.writeFile(schemaPath, `${JSON.stringify({ version: 1, migratedAt: new Date().toISOString() }, null, 2)}\n`, "utf8");
+  }
+}
+
+async function itemLatestDiff(id) {
+  const item = await readItem(id);
+  const snapshotsRoot = path.join(itemsDir, id, "snapshots");
+  const names = (await safeReaddir(snapshotsRoot)).sort().reverse();
+  for (const snapshotId of names) {
+    const documentPath = path.join(snapshotsRoot, snapshotId, "document.md");
+    if (!(await exists(documentPath))) continue;
+    const before = await fs.readFile(documentPath, "utf8");
+    return { snapshotId, ...lineDiff(before, item.document) };
+  }
+  return { snapshotId: "", changed: false, addedLines: 0, removedLines: 0, text: "还没有历史快照可供比较。", truncated: false };
+}
+
+async function serviceHealth() {
+  const items = await listItems({ includeLists: true, includeInvalidTeamsRoot: true });
+  let disk = { freeBytes: null, totalBytes: null, warning: false };
+  try {
+    const stat = await fs.statfs(kbDir);
+    disk = { freeBytes: stat.bavail * stat.bsize, totalBytes: stat.blocks * stat.bsize, warning: stat.bavail * stat.bsize < 1024 ** 3 };
+  } catch {}
+  const jobs = publicRefreshJobs();
+  return {
+    ok: true,
+    version: "0.1.0",
+    uptimeSeconds: Math.round(process.uptime()),
+    timestamp: new Date().toISOString(),
+    knowledgeBase: { root: kbDir, itemCount: items.length, quarantinedCount: items.filter((item) => item.integrityStatus === "quarantined").length },
+    refresh: { jobCount: jobs.length, runningCount: jobs.filter((job) => job.running).length, failedCount: jobs.filter((job) => ["failed", "unreachable"].includes(job.status)).length, circuitOpenCount: jobs.filter((job) => job.circuitOpen).length },
+    disk
+  };
+}
+
+function redactSettings(value) {
+  const copy = structuredClone(value);
+  if (copy.ai) copy.ai.apiKey = "";
+  if (copy.embedding) copy.embedding.apiKey = "";
+  for (const profile of Object.values(copy.sources || {})) {
+    profile.password = "";
+    profile.cookie = "";
+    profile.token = "";
+  }
+  return copy;
 }
 
 function supplementalContextPath() {
@@ -7900,7 +7890,10 @@ function defaultRefreshJob(id, name, url) {
     lastRunAt: "",
     lastStartedAt: "",
     lastError: "",
-    lastResult: null
+    lastResult: null,
+    consecutiveFailures: 0,
+    nextRetryAt: "",
+    circuitOpen: false
   };
 }
 
@@ -7938,7 +7931,21 @@ function normalizeRefreshJob(input, previous = {}) {
     lastRunAt: cleanText(input.lastRunAt ?? previous.lastRunAt ?? ""),
     lastStartedAt: cleanText(input.lastStartedAt ?? previous.lastStartedAt ?? ""),
     lastError: cleanText(input.lastError ?? previous.lastError ?? ""),
-    lastResult: input.lastResult ?? previous.lastResult ?? null
+    lastResult: input.lastResult ?? previous.lastResult ?? null,
+    consecutiveFailures: Math.max(0, Number(input.consecutiveFailures ?? previous.consecutiveFailures ?? 0) || 0),
+    nextRetryAt: cleanText(input.nextRetryAt ?? previous.nextRetryAt ?? ""),
+    circuitOpen: Boolean(input.circuitOpen ?? previous.circuitOpen ?? false)
+  };
+}
+
+function refreshFailureState(job) {
+  const consecutiveFailures = Math.max(0, Number(job.consecutiveFailures) || 0) + 1;
+  const circuitOpen = consecutiveFailures >= 5;
+  const delayMinutes = Math.min(24 * 60, 5 * 2 ** Math.min(8, consecutiveFailures - 1));
+  return {
+    consecutiveFailures,
+    circuitOpen,
+    nextRetryAt: circuitOpen ? "" : new Date(Date.now() + delayMinutes * 60000).toISOString()
   };
 }
 
@@ -7961,7 +7968,8 @@ function defaultSourceProfile(hostname, sourceType) {
     cookie: "",
     token: "",
     webdriverHeadless: false,
-    webdriverWindowMode: "compact"
+    webdriverWindowMode: "compact",
+    allowRemoteAi: true
   };
 }
 
@@ -7974,6 +7982,7 @@ function mergeSourceProfiles(base = {}, patch = {}) {
       ...profile,
       hostname,
       webdriverHeadless: Boolean(profile.webdriverHeadless ?? previous.webdriverHeadless),
+      allowRemoteAi: Boolean(profile.allowRemoteAi ?? previous.allowRemoteAi ?? true),
       webdriverWindowMode: normalizeWebdriverWindowMode(profile.webdriverWindowMode ?? previous.webdriverWindowMode),
       password: profile.password === "********" ? previous.password : cleanText(profile.password ?? previous.password),
       cookie: profile.cookie === "********" ? previous.cookie : cleanText(profile.cookie ?? previous.cookie),
@@ -7981,6 +7990,17 @@ function mergeSourceProfiles(base = {}, patch = {}) {
     };
   }
   return next;
+}
+
+function isRemoteAiAllowed(metadata) {
+  let remote = false;
+  try {
+    const host = new URL(settings.ai?.baseUrl || "").hostname;
+    remote = Boolean(host && !["localhost", "127.0.0.1", "::1"].includes(host));
+  } catch {}
+  if (!remote) return true;
+  const hostname = safeHostname(metadata.url || "");
+  return settings.sources?.[hostname]?.allowRemoteAi !== false;
 }
 
 function publicSourceProfiles() {

@@ -61,6 +61,7 @@ const state = {
   detailMode: localStorage.getItem("materialOrganizer.detailMode") || "processed",
   selectedId: null,
   sourceType: "",
+  integrityStatus: "",
   tag: "",
   query: "",
   page: 1,
@@ -356,6 +357,7 @@ document.querySelectorAll("[data-source-shortcut]").forEach((button) => {
       item.classList.toggle("is-active", item.dataset.source === button.dataset.sourceShortcut);
     });
     state.sourceType = button.dataset.sourceShortcut;
+    state.integrityStatus = "";
     state.tag = "";
     await loadItems();
     renderTags();
@@ -367,6 +369,7 @@ document.querySelectorAll(".source-item").forEach((button) => {
     document.querySelectorAll(".source-item").forEach((item) => item.classList.remove("is-active"));
     button.classList.add("is-active");
     state.sourceType = button.dataset.source;
+    state.integrityStatus = button.dataset.integrityStatus || "";
     state.tag = "";
     await loadItems();
     renderTags();
@@ -471,6 +474,7 @@ async function loadItems() {
   if (state.sourceType) params.set("sourceType", state.sourceType);
   if (state.tag) params.set("tag", state.tag);
   if (state.query) params.set("q", state.query);
+  if (state.integrityStatus) params.set("integrityStatus", state.integrityStatus);
   params.set("page", "1");
   params.set("pageSize", String(state.pageSize));
 
@@ -490,6 +494,7 @@ async function loadMoreItems() {
   if (state.sourceType) params.set("sourceType", state.sourceType);
   if (state.tag) params.set("tag", state.tag);
   if (state.query) params.set("q", state.query);
+  if (state.integrityStatus) params.set("integrityStatus", state.integrityStatus);
   params.set("page", String(state.page + 1));
   params.set("pageSize", String(state.pageSize));
   const { items, total } = await api(`/api/items?${params}`);
@@ -532,13 +537,15 @@ function renderMaterialsNewBadge() {
 async function loadHomeOverview() {
   if (!homeTotalItems) return;
   try {
-    const [{ items }, { tags }] = await Promise.all([
+    const [{ items }, { tags }, health] = await Promise.all([
       api("/api/items"),
-      api("/api/tags")
+      api("/api/tags"),
+      api("/api/source-health")
     ]);
     state.homeOverview = {
       items: items || [],
-      tags: tags || []
+      tags: tags || [],
+      sourceHealth: health.sources || []
     };
     renderHomeOverview();
   } catch (error) {
@@ -621,6 +628,7 @@ function renderHomeRefreshTasks(jobs) {
   }
 
   homeRefreshTaskRows.innerHTML = summaries.map((summary) => {
+    const health = state.homeOverview?.sourceHealth?.find((row) => row.sourceType === summary.source);
     const isConfirming = state.homeSourceRefresh.confirmSource === summary.source;
     const isRunning = state.homeSourceRefresh.runningSource === summary.source;
     const summaryRunning = !isRunning && summary.status.kind === "running";
@@ -646,7 +654,7 @@ function renderHomeRefreshTasks(jobs) {
           </div>
         </td>
         <td>${escapeHtml(`${summary.enabled}/${summary.total} 已启用`)}</td>
-        <td><span class="task-status task-status-${escapeHtml(status.kind)}">${escapeHtml(status.label)}</span></td>
+        <td><span class="task-status task-status-${escapeHtml(status.kind)}">${escapeHtml(status.label)}</span>${health ? `<div class="health-score ${health.score < 70 ? "is-warning" : ""}">质量 ${escapeHtml(health.score)} 分${health.quarantinedItems ? ` · 隔离 ${escapeHtml(health.quarantinedItems)}` : ""}</div>` : ""}</td>
         <td>${escapeHtml(summary.latestRunAt ? relativeTime(summary.latestRunAt) : "未运行")}</td>
         <td>${escapeHtml(`${summary.successRate}%`)}</td>
         <td>
@@ -1702,6 +1710,7 @@ function renderDetail(item) {
         <button id="processItemButton" ${metadata.integrityStatus === "quarantined" ? "disabled" : ""}>${hasProcessed ? "重新生成整理" : "生成 AI 整理"}</button>
         <button id="editTagsButton">标签</button>
         <button id="refreshButton">刷新</button>
+        <button id="diffItemButton">查看变更</button>
         <button id="deleteItemButton" class="danger-button">删除</button>
       </div>
       <div class="detail-meta-block">
@@ -1725,6 +1734,7 @@ function renderDetail(item) {
       </div>
       <div id="detailDoc" class="detail-doc markdown-body">${renderMarkdown(displayedDocument)}</div>
     </div>
+    <section id="detailDiff" class="detail-diff" hidden></section>
   `;
   setupDetailTitleMarquee();
   setupDetailToc();
@@ -1795,6 +1805,22 @@ function renderDetail(item) {
       await selectItem(metadata.id);
     } catch (error) {
       alert(error.message);
+    }
+  });
+
+  document.querySelector("#diffItemButton").addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    const panel = document.querySelector("#detailDiff");
+    button.disabled = true;
+    try {
+      const { diff } = await api(`/api/items/${encodeURIComponent(metadata.id)}/diff`);
+      panel.hidden = false;
+      panel.innerHTML = `<div class="detail-diff-header"><strong>最近快照差异</strong><span>新增 ${escapeHtml(diff.addedLines)} 行 · 删除 ${escapeHtml(diff.removedLines)} 行${diff.truncated ? " · 已截断" : ""}</span></div><pre>${escapeHtml(diff.text || "没有变化")}</pre>`;
+      button.textContent = "已显示变更";
+    } catch (error) {
+      alert(error.message);
+    } finally {
+      button.disabled = false;
     }
   });
 
@@ -3132,6 +3158,10 @@ function renderSourceProfiles(profiles) {
         <input data-field="webdriverHeadless" type="checkbox" ${profile.webdriverHeadless ? "checked" : ""} />
         <span>后台抓取使用无头浏览器</span>
       </label>
+      <label class="checkbox-row">
+        <input data-field="allowRemoteAi" type="checkbox" ${profile.allowRemoteAi !== false ? "checked" : ""} />
+        <span>允许将该来源的相关片段发送到远程 AI</span>
+      </label>
       <label>
         Webdriver 窗口模式
         <select data-field="webdriverWindowMode">
@@ -3239,6 +3269,7 @@ function renderRefreshJobs(jobs) {
         状态：${escapeHtml(formatRefreshStatus(job.running ? "running" : job.status || "idle"))} · 上次刷新：${escapeHtml(job.lastRunAt ? formatDate(job.lastRunAt) : "未刷新")}
       </div>
       ${job.quarantined ? `<div class="detail-note integrity-warning">${escapeHtml(job.quarantineReason || "该 Teams 任务因历史会话串线已暂停。点击立即刷新进行验证，成功后再启用自动刷新。")}</div>` : ""}
+      ${job.circuitOpen ? `<div class="detail-note integrity-warning">连续失败 ${escapeHtml(job.consecutiveFailures || 5)} 次，自动刷新已熔断。手动“立即刷新”成功后会自动恢复。</div>` : job.nextRetryAt ? `<div class="item-meta">自动重试：${escapeHtml(formatDate(job.nextRetryAt))}（连续失败 ${escapeHtml(job.consecutiveFailures || 0)} 次）</div>` : ""}
       ${job.lastError ? `<div class="item-meta">错误：${escapeHtml(job.lastError)}</div>` : ""}
       ${job.lastResult && !["failed", "unreachable", "running"].includes(job.status) ? `<div class="item-meta">结果：更新 ${escapeHtml(job.lastResult.updatedItemCount ?? job.lastResult.updatedIssueCount ?? 0)} / ${escapeHtml(job.lastResult.linkCount ?? job.lastResult.issueCount ?? 0)} 个内容页，跳过 ${escapeHtml(job.lastResult.skippedItemCount || 0)}</div>` : ""}
       <input data-field="fetchMode" type="hidden" value="${escapeHtml(job.fetchMode || "auto")}" />

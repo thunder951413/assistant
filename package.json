@@ -10,7 +10,7 @@
     "service:stop": "node scripts/service.js --stop",
     "service:restart": "node scripts/service.js --restart",
     "service:status": "node scripts/service.js --status",
-    "check": "node --check src/server.js && node --check src/utils.js",
+    "check": "node --check src/server.js && node --check src/utils.js && node --check src/router.js && node --check src/ai-client.js && node --check src/capture-utils.js && node --check src/item-store.js && node --check src/reliability.js && node --check scripts/service.js && node --check scripts/cleanup-stale-flags.js && node --check scripts/report-teams-title-mismatches.js",
     "test": "node --test"
   },
   "engines": {
