@@ -4178,7 +4178,7 @@ async function fetchUrlWithWebdriverForRefresh(url, job, adapter = detectSourceA
     pageKind: job.pageKind || "auto",
     session: refreshContext?.webdriverSession,
     page: refreshContext?.webdriverPage,
-    maxGithubExpansionPasses: resolvePageKind(url, job.pageKind || "auto") === "content" ? 3 : 0,
+    maxGithubExpansionPasses: resolvePageKind(url, job.pageKind || "auto") === "content" ? 12 : 0,
     existingGithubComments
   };
   try {
@@ -4205,7 +4205,7 @@ function validateFetchedGithubNotRegressed(url, adapter, fetched, existingCommen
   const previousCount = Array.isArray(existingComments) ? existingComments.length : 0;
   const nextCount = Array.isArray(fetched?.comments) ? fetched.comments.length : 0;
   if (previousCount < 5) return;
-  if (nextCount >= Math.max(3, Math.floor(previousCount * 0.4))) return;
+  if (nextCount >= Math.max(3, Math.floor(previousCount * 0.8))) return;
   throw new Error([
     "GitHub 抓取到的评论数量明显少于已有内容，已跳过覆盖以避免资料变少。",
     `已有 ${previousCount} 条，本次 ${nextCount} 条。`,
@@ -5310,7 +5310,7 @@ async function expandGithubDynamicContent(page, adapter, pageKind, options = {})
     // GitHub can keep background subscriptions open.
   }
 
-  if (await currentGithubPageOverlapsExisting(page, adapter, options.existingComments || [])) {
+  if (await currentGithubPageCoversExisting(page, adapter, options.existingComments || [])) {
     return;
   }
 
@@ -5332,6 +5332,10 @@ async function expandGithubDynamicContent(page, adapter, pageKind, options = {})
     }
     await page.waitForTimeout(clicked ? 900 : 400);
     const after = await githubPageGrowthSnapshot(page);
+    if ((options.existingComments || []).length
+      && after.comments >= Math.ceil(options.existingComments.length * 0.9)) {
+      break;
+    }
     if (clicked) {
       stableCount = 0;
     } else if (after.comments <= before.comments
@@ -5345,17 +5349,20 @@ async function expandGithubDynamicContent(page, adapter, pageKind, options = {})
   }
 }
 
-async function currentGithubPageOverlapsExisting(page, adapter, existingComments) {
+async function currentGithubPageCoversExisting(page, adapter, existingComments) {
   if (!Array.isArray(existingComments) || !existingComments.length) return false;
   const raw = await page.content();
   const extracted = extractByAdapter(raw, page.url(), adapter, "content");
-  return githubCommentsOverlap(extracted.comments || [], existingComments);
+  return githubCommentsCoverExisting(extracted.comments || [], existingComments);
 }
 
-function githubCommentsOverlap(currentComments, existingComments) {
+function githubCommentsCoverExisting(currentComments, existingComments) {
   const existingKeys = githubCommentKeySet(existingComments);
   if (!existingKeys.size) return false;
-  return (currentComments || []).some((comment) => githubCommentKeys(comment).some((key) => existingKeys.has(key)));
+  const current = currentComments || [];
+  const overlapCount = current.filter((comment) => githubCommentKeys(comment).some((key) => existingKeys.has(key))).length;
+  return current.length >= Math.ceil(existingComments.length * 0.9)
+    && overlapCount >= Math.ceil(existingComments.length * 0.8);
 }
 
 function githubCommentKeySet(comments) {
@@ -5606,7 +5613,7 @@ async function scrollTeamsMessages(page, options = {}) {
   const minScrollsBeforeOverlapStop = Number(options.minScrollsBeforeOverlapStop || 2);
   const previousKeys = teamsMessageKeySet(options.previousMessages || []);
   const observed = [];
-  const remember = async ({ res }) => {
+  const remember = async () => {
     const visible = await readVisibleTeamsMessages(page);
     observed.push(...(visible.messages || []));
   };
@@ -7262,7 +7269,7 @@ async function serviceHealth() {
     uptimeSeconds: Math.round(process.uptime()),
     timestamp: new Date().toISOString(),
     knowledgeBase: { root: kbDir, itemCount: items.length, quarantinedCount: items.filter((item) => item.integrityStatus === "quarantined").length },
-    refresh: { jobCount: jobs.length, runningCount: jobs.filter((job) => job.running).length, failedCount: jobs.filter((job) => ["failed", "unreachable"].includes(job.status)).length, circuitOpenCount: jobs.filter((job) => job.circuitOpen).length },
+    refresh: { jobCount: jobs.length, runningCount: jobs.filter((job) => job.running).length, failedCount: jobs.filter((job) => job.enabled && ["failed", "unreachable"].includes(job.status)).length, circuitOpenCount: jobs.filter((job) => job.enabled && job.circuitOpen).length },
     disk
   };
 }

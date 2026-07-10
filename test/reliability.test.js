@@ -19,6 +19,10 @@ describe("reliability utilities", () => {
     const rows = computeSourceHealth([{ sourceType: "teams", title: "", excerpt: "x", quarantined: true }], [{ url: "https://teams.microsoft.com/x", enabled: true, status: "failed" }]);
     assert.equal(rows[0].sourceType, "teams"); assert.equal(rows[0].failedJobs, 1); assert.ok(rows[0].score < 100);
   });
+  it("does not count disabled historical failures as active source failures", () => {
+    const [row] = computeSourceHealth([], [{ url: "https://teams.microsoft.com/x", enabled: false, status: "failed" }]);
+    assert.equal(row.failedJobs, 0);
+  });
   it("creates a compact readable line diff", () => {
     const diff = lineDiff("a\nb\nc", "a\nB\nc");
     assert.equal(diff.changed, true); assert.match(diff.text, /- b/); assert.match(diff.text, /\+ B/);

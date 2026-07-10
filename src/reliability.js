@@ -70,7 +70,7 @@ export function computeSourceHealth(items = [], jobs = [], now = Date.now()) {
     }
     const row = get(sourceType);
     if (job.enabled) row.enabledJobs += 1;
-    if (["failed", "unreachable"].includes(job.status) || job.circuitOpen) row.failedJobs += 1;
+    if (job.enabled && (["failed", "unreachable"].includes(job.status) || job.circuitOpen)) row.failedJobs += 1;
     if (job.status === "idle" && job.lastRunAt > row.latestSuccessAt) row.latestSuccessAt = job.lastRunAt;
   }
   return [...sources.values()].map((row) => {

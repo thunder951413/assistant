@@ -562,7 +562,7 @@ function renderHomeOverview() {
   const refreshJobsList = state.refreshJobs || [];
   const enabledJobs = refreshJobsList.filter((job) => job.enabled).length;
   const runningJobs = refreshJobsList.filter((job) => job.running).length;
-  const failedJobs = refreshJobsList.filter((job) => ["failed", "unreachable"].includes(job.status)).length;
+  const failedJobs = refreshJobsList.filter((job) => job.enabled && ["failed", "unreachable"].includes(job.status)).length;
 
   homeTotalItems.textContent = String(items.length);
   homeUpdateCount.textContent = String(state.updateCount || 0);
@@ -752,9 +752,9 @@ function summarizeRefreshSources(jobs) {
     group.total += 1;
     group.enabled += job.enabled ? 1 : 0;
     group.running += status.kind === "running" ? 1 : 0;
-    group.failed += status.kind === "failed" ? 1 : 0;
-    group.warning += status.kind === "warning" ? 1 : 0;
-    group.succeeded += status.kind === "success" ? 1 : 0;
+    group.failed += job.enabled && status.kind === "failed" ? 1 : 0;
+    group.warning += job.enabled && status.kind === "warning" ? 1 : 0;
+    group.succeeded += job.enabled && status.kind === "success" ? 1 : 0;
     if (job.enabled) group.progressSum += progress.percent;
     group.updated += delta.updated;
     group.totalResult += delta.total;
@@ -792,7 +792,9 @@ function sourceSummaryStatus(group) {
 }
 
 async function refreshHomeSource(source, options = {}) {
-  const jobsToRun = (state.refreshJobs || []).filter((job) => sourceTypeForSubscription(job) === source);
+  const jobsToRun = (state.refreshJobs || []).filter((job) => (
+    sourceTypeForSubscription(job) === source && (options.clearFirst || job.enabled)
+  ));
   const startedAt = new Date().toISOString();
   const token = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   state.homeSourceRefresh.confirmSource = "";
