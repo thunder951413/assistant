@@ -2,15 +2,27 @@
   "name": "material-organizer",
   "version": "0.1.0",
   "private": true,
+  "description": "Local material capture and knowledge organization app.",
+  "author": "thunder951413",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thunder951413/assistant.git"
+  },
   "type": "module",
+  "main": "desktop/main.js",
   "scripts": {
     "start": "node src/server.js",
+    "desktop": "electron .",
+    "browsers:install": "node scripts/install-playwright-browsers.js",
+    "pack:mac": "npm run browsers:install && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dir --publish never",
+    "dist:mac": "npm run browsers:install && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg zip --publish never",
+    "dist:mac:signed": "npm run browsers:install && electron-builder --mac dmg zip --publish never",
     "service": "node scripts/service.js",
     "service:start": "node scripts/service.js --start",
     "service:stop": "node scripts/service.js --stop",
     "service:restart": "node scripts/service.js --restart",
     "service:status": "node scripts/service.js --status",
-    "check": "node --check src/server.js && node --check src/utils.js && node --check src/router.js && node --check src/ai-client.js && node --check src/capture-utils.js && node --check src/item-store.js && node --check src/reliability.js && node --check public/app.js && node --check scripts/service.js && node --check scripts/cleanup-stale-flags.js && node --check scripts/report-teams-title-mismatches.js",
+    "check": "node --check src/server.js && node --check src/utils.js && node --check src/router.js && node --check src/ai-client.js && node --check src/capture-utils.js && node --check src/item-store.js && node --check src/reliability.js && node --check public/app.js && node --check desktop/main.js && node --check scripts/service.js && node --check scripts/install-playwright-browsers.js && node --check scripts/cleanup-stale-flags.js && node --check scripts/report-teams-title-mismatches.js",
     "test": "node --test"
   },
   "engines": {
@@ -22,5 +34,47 @@
     "jsdom": "^24.1.3",
     "marked": "^15.0.12",
     "playwright": "^1.60.0"
+  },
+  "devDependencies": {
+    "electron": "^43.1.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.local.material-organizer",
+    "productName": "Material Organizer",
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+    "asar": true,
+    "files": [
+      "desktop/**/*",
+      "src/**/*",
+      "public/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/playwright-browsers",
+        "to": "playwright-browsers",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false
+    },
+    "publish": [
+      {
+        "provider": "github"
+      }
+    ]
   }
 }

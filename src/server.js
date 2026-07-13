@@ -24,7 +24,7 @@ import { computeSourceHealth, createRunHistory, lineDiff } from "./reliability.j
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const publicDir = path.join(rootDir, "public");
-const configDir = path.join(rootDir, ".config");
+const configDir = resolveWritableDir(process.env.ASSISTANT_CONFIG_DIR, path.join(rootDir, ".config"));
 const settingsPath = path.join(configDir, "settings.json");
 const webdriverRoot = path.join(configDir, "webdriver");
 let settings = await loadSettings();
@@ -50,6 +50,7 @@ const SNAPSHOT_RETENTION_COUNT = 20;
 const MAX_FETCH_BYTES = 12 * 1024 * 1024;
 
 const port = Number(process.env.PORT || 8020);
+const host = process.env.HOST || "127.0.0.1";
 
 await ensureKnowledgeBase();
 await rebuildIndexes();
@@ -72,8 +73,8 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(port, "127.0.0.1", () => {
-  console.log(`Material Organizer running at http://localhost:${port}`);
+server.listen(port, host, () => {
+  console.log(`Material Organizer running at http://${host}:${port}`);
 });
 
 // ---- Route table (replaces the 386-line if/else chain) ----
@@ -7675,7 +7676,7 @@ async function saveSettings(input) {
 
 function defaultSettings() {
   return {
-    documentRoot: path.join(rootDir, "knowledge-base"),
+    documentRoot: defaultDocumentRoot(),
     ai: {
       baseUrl: "",
       apiKey: "",
@@ -8024,7 +8025,15 @@ function publicSourceProfiles() {
 
 function resolveDocumentRoot(documentRoot) {
   const configured = cleanText(documentRoot);
-  return configured ? path.resolve(configured) : path.join(rootDir, "knowledge-base");
+  return configured ? path.resolve(configured) : defaultDocumentRoot();
+}
+
+function defaultDocumentRoot() {
+  return resolveWritableDir(process.env.ASSISTANT_DOCUMENT_ROOT, path.join(rootDir, "knowledge-base"));
+}
+
+function resolveWritableDir(value, fallback) {
+  return path.resolve(cleanText(value) || fallback);
 }
 
 function configureKnowledgeBase() {

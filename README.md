@@ -41,14 +41,17 @@
 │   ├── index.html       # 前端页面
 │   ├── app.js           # 前端交互逻辑
 │   └── styles.css       # 页面样式
+├── desktop/
+│   └── main.js          # Electron 桌面应用入口
 ├── scripts/
-│   └── service.js       # 后台服务启停脚本
+│   ├── service.js       # 后台服务启停脚本
+│   └── install-playwright-browsers.js
 ├── test/
 │   └── utils.test.js    # 工具函数测试
 ├── docs/
 │   └── mvp-plan.md      # MVP 设计记录
-├── knowledge-base/      # 默认知识库目录
-├── .config/             # 本地设置、运行日志、Webdriver session
+├── knowledge-base/      # 开发模式默认知识库目录，已被 git 忽略
+├── .config/             # 开发模式本地设置、运行日志、Webdriver session，已被 git 忽略
 ├── package.json
 └── README.md
 ```
@@ -63,6 +66,12 @@ npm install
 
 ```bash
 npx playwright install chromium
+```
+
+打包桌面应用时使用仓库内的浏览器资源目录：
+
+```bash
+npm run browsers:install
 ```
 
 ## 启动
@@ -112,12 +121,46 @@ node scripts/service.js --status
 .config/runtime/assistant.log
 ```
 
+## 桌面应用与发布
+
+本项目可以打包为 Electron 桌面应用，并随包提供 Playwright Chromium：
+
+```bash
+npm run pack:mac
+npm run dist:mac
+```
+
+`pack:mac` 会生成未压缩的 `.app` 目录用于本机验证；`dist:mac` 会生成 GitHub Release 可上传的 `dmg` 和 `zip`。默认脚本会跳过 macOS 自动签名，避免本机钥匙串弹窗或 CI 没有证书时卡住；如果已配置签名证书，可运行：
+
+```bash
+npm run dist:mac:signed
+```
+
+GitHub 发布通过 `.github/workflows/release.yml` 完成。推送 `v*` tag 后，Actions 会分别构建 macOS arm64 和 x64 包并创建 Release：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+桌面应用的设置、知识库、运行缓存和 Webdriver 登录态默认写入系统应用数据目录，不会写入仓库：
+
+```text
+~/Library/Application Support/material-organizer/
+```
+
 ## 配置
 
 首次启动会生成本地配置：
 
 ```text
 .config/settings.json
+```
+
+桌面应用会改为写入系统应用数据目录：
+
+```text
+~/Library/Application Support/material-organizer/config/settings.json
 ```
 
 也可以在页面的“设置”里维护这些配置：
@@ -141,10 +184,16 @@ AI 接口会调用：
 
 ## 知识库存储
 
-默认资料库路径：
+开发模式默认资料库路径：
 
 ```text
 knowledge-base/
+```
+
+桌面应用默认资料库路径：
+
+```text
+~/Library/Application Support/material-organizer/knowledge-base/
 ```
 
 可以在设置页修改为其他本地目录。资料会按以下协议保存：
@@ -195,7 +244,7 @@ knowledge-base/
 1. 进入“设置”。
 2. 在“抓取”里点击对应站点的 Webdriver 登录入口。
 3. 在弹出的 Chromium 窗口中手动登录。
-4. 登录态会保存到 `.config/webdriver/<hostname>/`。
+4. 开发模式登录态会保存到 `.config/webdriver/<hostname>/`；桌面应用会保存到系统应用数据目录的 `config/webdriver/<hostname>/`。
 5. 回到“新增资料”，抓取方式选择“Webdriver 抓取”。
 6. 输入过滤页或内容页 URL，点击解析预览。
 
