@@ -128,19 +128,21 @@ node scripts/service.js --status
 ```bash
 npm run pack:mac
 npm run dist:mac
+npm run dist:win
+npm run dist:linux
 ```
 
-`pack:mac` 会生成未压缩的 `.app` 目录用于本机验证；`dist:mac` 会生成 GitHub Release 可上传的 `dmg` 和 `zip`。默认脚本会跳过 macOS 自动签名，避免本机钥匙串弹窗或 CI 没有证书时卡住；如果已配置签名证书，可运行：
+`pack:mac` 会生成未压缩的 `.app` 目录用于本机验证。`dist:mac` 会生成 `dmg` 和 `zip`，`dist:win` 会生成 Windows 安装包和 `zip`，`dist:linux` 会生成 `AppImage` 和 `deb`。默认 macOS 脚本会跳过自动签名，避免本机钥匙串弹窗或 CI 没有证书时卡住；如果已配置签名证书，可运行：
 
 ```bash
 npm run dist:mac:signed
 ```
 
-GitHub 发布通过 `.github/workflows/release.yml` 完成。推送 `v*` tag 后，Actions 会分别构建 macOS arm64 和 x64 包并创建 Release：
+GitHub 发布通过 `.github/workflows/release.yml` 完成。推送 `v*` tag 后，Actions 会在对应系统 runner 上安装该平台的 Playwright Chromium，并构建 macOS arm64、macOS x64、Windows x64 和 Linux x64 包后创建 Release：
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 桌面应用的设置、知识库、运行缓存和 Webdriver 登录态默认写入系统应用数据目录，不会写入仓库：

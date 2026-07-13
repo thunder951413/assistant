@@ -1,6 +1,6 @@
 {
   "name": "material-organizer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Local material capture and knowledge organization app.",
   "author": "thunder951413",
@@ -17,6 +17,8 @@
     "pack:mac": "npm run browsers:install && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dir --publish never",
     "dist:mac": "npm run browsers:install && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg zip --publish never",
     "dist:mac:signed": "npm run browsers:install && electron-builder --mac dmg zip --publish never",
+    "dist:win": "npm run browsers:install && electron-builder --win nsis zip --x64 --publish never",
+    "dist:linux": "npm run browsers:install && electron-builder --linux AppImage deb --x64 --publish never",
     "service": "node scripts/service.js",
     "service:start": "node scripts/service.js --start",
     "service:stop": "node scripts/service.js --stop",
@@ -70,6 +72,19 @@
       ],
       "hardenedRuntime": true,
       "gatekeeperAssess": false
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ]
+    },
+    "linux": {
+      "category": "Utility",
+      "target": [
+        "AppImage",
+        "deb"
+      ]
     },
     "publish": [
       {
