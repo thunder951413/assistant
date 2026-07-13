@@ -1,9 +1,13 @@
 {
   "name": "material-organizer",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "Local material capture and knowledge organization app.",
-  "author": "thunder951413",
+  "author": {
+    "name": "thunder951413",
+    "email": "thunder951413@163.com"
+  },
+  "desktopName": "material-organizer",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/thunder951413/assistant.git"
@@ -81,6 +85,8 @@
     },
     "linux": {
       "category": "Utility",
+      "maintainer": "thunder951413 <thunder951413@163.com>",
+      "syncDesktopName": true,
       "target": [
         "AppImage",
         "deb"

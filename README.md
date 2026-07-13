@@ -141,8 +141,8 @@ npm run dist:mac:signed
 GitHub 发布通过 `.github/workflows/release.yml` 完成。推送 `v*` tag 后，Actions 会在对应系统 runner 上安装该平台的 Playwright Chromium，并构建 macOS arm64、macOS x64、Windows x64 和 Linux x64 包后创建 Release：
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 桌面应用的设置、知识库、运行缓存和 Webdriver 登录态默认写入系统应用数据目录，不会写入仓库：
