@@ -1,4 +1,10 @@
 import http from "node:http";
+import { createHash, randomBytes } from "node:crypto";
+import { validateApiRequest } from "./api-security.js";
+import { atomicWriteFile } from "./atomic-files.js";
+import { exportBundle, importBundle } from "./bundle-store.js";
+import { assertModelMaterials, canUseMaterial, matchesMaterialFilters, normalizeChatHistory } from "./ai-policy.js";
+import { createChatSessionStore } from "./chat-session-store.js";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,6 +24,7 @@ import {
 import { createRouter } from "./router.js";
 import { createAiClient } from "./ai-client.js";
 import { areCaptureTitlesConsistent, isSupportedCaptureContentType, paginate } from "./capture-utils.js";
+import { collectVirtualTeamsMessages, extractTeamsMessagesFromDocument, mergeTeamsCaptureMessages, mergeTeamsCommentsByIdentity, nextDueCaptureSlot, normalizeCaptureCompleteness, prepareListCapture, readResponseBodyLimited, shouldCloseOwnedWebdriverSession, teamsCaptureMessageKeys, withWebdriverSessionQueue } from "./capture-policy.js";
 import { createItemStore, renderDocument, extractBodyFromDocument, extractSummaryFromDocument } from "./item-store.js";
 import { computeSourceHealth, createRunHistory, lineDiff } from "./reliability.js";
 
@@ -27,13 +34,22 @@ const publicDir = path.join(rootDir, "public");
 const configDir = resolveWritableDir(process.env.ASSISTANT_CONFIG_DIR, path.join(rootDir, ".config"));
 const settingsPath = path.join(configDir, "settings.json");
 const webdriverRoot = path.join(configDir, "webdriver");
+const captureToken = await loadCaptureToken();
 let settings = await loadSettings();
-const ai = createAiClient(() => settings);
+const ai = createAiClient(() => settings, { authorize: (materials, purpose) => assertModelMaterials(materials, settings, purpose) });
+const chatSessionStore = createChatSessionStore(path.join(configDir, "chat-sessions.json"));
 let kbDir = resolveDocumentRoot(settings.documentRoot);
 let itemsDir = path.join(kbDir, "items");
 let tagsDir = path.join(kbDir, "tags");
 let indexesDir = path.join(kbDir, "indexes");
 const webdriverSessions = new Map();
+const itemUrlMutationLocks = new Map();
+const pendingItemIds = new Set();
+let itemIdReservationQueue = Promise.resolve();
+const embeddingBuilds = new Map();
+let settingsWriteQueue = Promise.resolve();
+let libraryMaintenance = false;
+let activeApiOperations = 0;
 const refreshRuntime = {
   timer: null,
   running: new Set(),
@@ -46,6 +62,7 @@ const refreshHistory = createRunHistory(path.join(configDir, "runtime", "refresh
 const FETCH_TIMEOUT_MS = 45 * 1000;
 const REFRESH_JOB_TIMEOUT_MS = 4 * 60 * 1000;
 const REFRESH_RUN_RETENTION_MS = 6 * 60 * 60 * 1000;
+const TEAMS_LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const SNAPSHOT_RETENTION_COUNT = 20;
 const MAX_FETCH_BYTES = 12 * 1024 * 1024;
 
@@ -63,18 +80,20 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || "/", `http://${req.headers.host}`);
 
     if (url.pathname.startsWith("/api/")) {
+      validateApiRequest(req, url, { captureToken });
       await handleApi(req, res, url);
       return;
     }
 
     await serveStatic(req, res, url);
   } catch (error) {
-    sendJson(res, 500, { error: error.message || "Internal server error" });
+    if (!res.headersSent) sendJson(res, error.statusCode || 500, { error: error.message || "Internal server error" });
+    else if (!res.writableEnded) res.end();
   }
 });
 
 server.listen(port, host, () => {
-  console.log(`Material Organizer running at http://${host}:${port}`);
+  console.log(`Material Organizer running at http://${host}:${server.address().port}`);
 });
 
 // ---- Route table (replaces the 386-line if/else chain) ----
@@ -102,6 +121,12 @@ api.post("/api/items", async ({ req, res }) => {
   const body = await readBody(req);
   const item = await createItem(body);
   sendJson(res, 201, { item });
+});
+
+api.post("/api/items/upsert-capture", async ({ req, res }) => {
+  const body = await readBody(req);
+  const item = await upsertCapturedItem(body);
+  sendJson(res, 200, { item, changed: Boolean(item.refreshChanged) });
 });
 
 api.get("/api/items/:id", async ({ params, res }) => {
@@ -151,6 +176,17 @@ api.post("/api/items/:id/ack-update", async ({ params, res }) => {
 });
 
 api.post("/api/items/:id/refresh", async ({ params, res }) => {
+  const existing = await readItem(params.id);
+  if (existing.metadata.sourceType === "teams") {
+    const job = await ensureRefreshJobForContentUrl(existing.metadata.url, {
+      title: existing.metadata.title,
+      fetchMode: "webdriver",
+      managedBy: "content-page"
+    });
+    const run = await startRefreshRunByIds([job.id], { force: true, sourceType: "teams" });
+    sendJson(res, 202, { run, jobs: publicRefreshJobs() });
+    return;
+  }
   const item = await refreshItem(params.id);
   sendJson(res, 200, { item });
 });
@@ -158,13 +194,13 @@ api.post("/api/items/:id/refresh", async ({ params, res }) => {
 // Preview & summarize ------------------------------------------
 api.post("/api/preview-source", async ({ req, res }) => {
   const body = await readBody(req);
-  const preview = await previewSource(body);
+  const preview = await withResponseCancellation(res, signal => previewSource({ ...body, signal }));
   sendJson(res, 200, { preview });
 });
 
 api.post("/api/summarize", async ({ req, res }) => {
   const body = await readBody(req);
-  const summary = await summarizeContent(body);
+  const summary = await withResponseCancellation(res, signal => summarizeContent({ ...body, signal }));
   sendJson(res, 200, { summary });
 });
 
@@ -438,33 +474,59 @@ api.get("/api/refresh-runs/:runId", async ({ params, res }) => {
   sendJson(res, 200, { run });
 });
 
+api.post("/api/refresh-runs/:runId/teams-ready", async ({ params, res }) => {
+  const run = await confirmTeamsRefreshReady(params.runId);
+  sendJson(res, 200, { run, jobs: publicRefreshJobs() });
+});
+
 api.post("/api/refresh-runs/:runId/cancel", async ({ params, res }) => {
   const run = await cancelRefreshRun(params.runId);
   sendJson(res, 200, { run, jobs: publicRefreshJobs() });
 });
 
 // Chat ---------------------------------------------------------
+api.get("/api/chat-sessions", async ({ res }) => sendJson(res, 200, await chatSessionStore.read()));
+api.patch("/api/chat-sessions", async ({ req, res }) => sendJson(res, 200, await chatSessionStore.write(await readBody(req))));
+api.get("/api/capture-token", async ({ res }) => sendJson(res, 200, { token: captureToken }));
+
 api.post("/api/chat", async ({ req, res }) => {
   const body = await readBody(req);
-  const answer = await answerFromKnowledgeBase(body.message || "");
+  const answer = await answerFromKnowledgeBase(body.message || "", { history: normalizeChatHistory(body.history) });
   sendJson(res, 200, answer);
 });
 
 api.post("/api/chat-stream", async ({ req, res }) => {
   const body = await readBody(req);
-  await streamAnswerFromKnowledgeBase(body.message || "", res);
+  const controller = new AbortController();
+  const abort = () => { if (!res.writableEnded) controller.abort(); };
+  res.on("close", abort);
+  try { await streamAnswerFromKnowledgeBase(body.message || "", res, { history: normalizeChatHistory(body.history), signal: controller.signal }); }
+  finally { res.removeListener("close", abort); }
 });
 
 // ---- Dispatch -------------------------------------------------
 
 async function handleApi(req, res, url) {
-  const matched = await api.handle(req, res, url);
-  if (!matched) {
-    sendJson(res, 404, { error: "Not found" });
-  }
+  if (libraryMaintenance) { sendJson(res, 409, { error: "资料库正在导入，请稍后重试。" }); return; }
+  activeApiOperations += 1;
+  try {
+    const matched = await api.handle(req, res, url);
+    if (!matched) sendJson(res, 404, { error: "Not found" });
+  } finally { activeApiOperations -= 1; }
 }
 
 async function createItem(input) {
+  const url = canonicalizeMaterialUrl(input.url || "");
+  return withItemUrlMutationLock(url, async () => {
+    if (url) {
+      const existing = await findItemByUrl(url);
+      if (existing) return readItem(existing.id);
+    }
+    return createItemUnlocked(input);
+  });
+}
+
+async function createItemUnlocked(input) {
   const now = new Date().toISOString();
   const itemUrl = canonicalizeMaterialUrl(input.url || "");
   const sourceType = normalizeSourceType(input.sourceType, itemUrl || input.url);
@@ -479,7 +541,9 @@ async function createItem(input) {
   let comments = normalizeComments(input.comments);
 
   if (!rawContent && itemUrl && (sourceType === "web" || sourceType === "jira" || sourceType === "github" || sourceType === "confluence" || sourceType === "teams")) {
-    const fetched = sourceType === "teams" ? await fetchUrlWithWebdriver(itemUrl) : await fetchUrl(itemUrl);
+    const fetched = sourceType === "teams" && !hasTeamsGraphCredentials(detectSourceAdapter(itemUrl))
+      ? await fetchUrlWithWebdriver(itemUrl)
+      : await fetchUrl(itemUrl);
     rawContent = fetched.raw;
     extractedContent = fetched.text;
     rawFileName = "raw.html";
@@ -490,7 +554,7 @@ async function createItem(input) {
   }
 
   title = title || "Untitled material";
-  const id = await uniqueItemId(slugify(`${sourceType}-${title}`));
+  const id = await reserveUniqueItemId(slugify(`${sourceType}-${title}`));
 
   const metadata = {
     id,
@@ -511,14 +575,28 @@ async function createItem(input) {
     httpValidators: input.httpValidators || {},
     integrityStatus: cleanText(input.integrityStatus || ""),
     integrityReason: cleanText(input.integrityReason || ""),
-    pendingContentUpdatedAt: cleanText(input.pendingContentUpdatedAt || "")
+    pendingContentUpdatedAt: cleanText(input.pendingContentUpdatedAt || ""),
+    contentUpdatedAt: cleanText(input.contentUpdatedAt || input.pendingContentUpdatedAt || ""),
+    completeness: normalizeCaptureCompleteness(input.completeness),
+    coverage: input.coverage && typeof input.coverage === "object" ? input.coverage : {},
+    identityEvidence: input.identityEvidence && typeof input.identityEvidence === "object" ? input.identityEvidence : {},
+    subscribe: input.subscribe !== undefined ? Boolean(input.subscribe) : undefined
   };
 
-  await store.writeRawContent(id, rawContent, rawFileName.endsWith(".html") ? "text/html" : "", rawFileName);
-  await store.writeMetadata(id, metadata);
-  await store.writeComments(id, comments);
-  await store.writeDocument(id, metadata, extractedContent, summary);
-  if (metadata.pageKind === "list" && metadata.url) {
+  try {
+    await store.commit(id, {
+      metadata,
+      body: extractedContent,
+      summary,
+      comments,
+      raw: rawContent,
+      rawContentType: rawFileName.endsWith(".html") ? "text/html" : "",
+      rawFileName
+    });
+  } finally {
+    pendingItemIds.delete(id);
+  }
+  if (metadata.subscribe !== false && metadata.pageKind === "list" && metadata.url) {
     metadata.refreshJob = await ensureRefreshJobForListUrl(metadata.url, {
       title,
       sourceType,
@@ -534,20 +612,18 @@ async function createItem(input) {
     });
     if (linkedImport.linkCount) {
       metadata.listImport = linkedImport;
-      await store.writeMetadata(id, metadata);
-      await store.writeDocument(id, metadata, extractedContent, summary);
+      await store.commit(id, { metadata, body: extractedContent, summary });
     }
-  } else if (metadata.url) {
+  } else if (metadata.subscribe !== false && metadata.url) {
     metadata.refreshJob = await ensureRefreshJobForContentUrl(metadata.url, {
       title,
       sourceType,
       fetchMode: metadata.fetchMode || "auto",
       managedBy: metadata.managedBy || "content-page"
     });
-    await store.writeMetadata(id, metadata);
-    await store.writeDocument(id, metadata, extractedContent, summary);
+    await store.commit(id, { metadata, body: extractedContent, summary });
   }
-  await rebuildIndexes();
+  if (!input.deferIndex) await rebuildIndexes();
 
   return readItem(id);
 }
@@ -645,8 +721,8 @@ async function previewSource(input) {
   if (canonicalDetectedUrl && shouldFetchForPreview(input, pasted)) {
     try {
       const fetched = shouldFetchWithWebdriver(canonicalDetectedUrl, input.fetchMode, requestedPageKind)
-        ? await fetchUrlWithWebdriver(canonicalDetectedUrl, { pageKind: requestedPageKind })
-        : await fetchUrl(canonicalDetectedUrl, { pageKind: requestedPageKind });
+        ? await fetchUrlWithWebdriver(canonicalDetectedUrl, { pageKind: requestedPageKind, signal: input.signal })
+        : await fetchUrl(canonicalDetectedUrl, { pageKind: requestedPageKind, signal: input.signal });
       title = title || fetched.title || canonicalDetectedUrl;
       rawContent = fetched.raw;
       extractedContent = fetched.text;
@@ -654,17 +730,24 @@ async function previewSource(input) {
       lastFetchedAt = now;
       input.sourceUpdatedAt = fetched.sourceUpdatedAt || "";
       input.comments = fetched.comments || [];
+      input.captureMethod = fetched.fetchMethod || input.captureMethod;
+      input.completeness = fetched.completeness || input.completeness;
+      input.coverage = fetched.coverage || input.coverage;
+      input.identityEvidence = fetched.identityEvidence || input.identityEvidence;
       parseNote = "网页内容已抓取并过滤为可读文本。";
       linkedItems = extractPreviewLinkedItems(rawContent, canonicalDetectedUrl, sourceType, requestedPageKind);
     } catch (error) {
       const authError = isAuthenticationRequiredError(error);
       title = title || canonicalDetectedUrl;
-      rawContent = pasted || canonicalDetectedUrl;
-      extractedContent = pasted || `无法直接抓取该页面。可以粘贴页面正文后再解析。\n\n错误：${error.message}`;
+      if (error?.name === "AbortError" || input.signal?.aborted) throw error;
+      const hasPastedBody = Boolean(pasted && pasted !== detectedUrl && pasted !== canonicalDetectedUrl);
+      rawContent = hasPastedBody ? pasted : "";
+      extractedContent = hasPastedBody ? pasted : "";
       parseStatus = "needs-review";
       parseNote = authError
         ? error.message
-        : "页面可能需要登录或 webdriver。当前保留你粘贴的内容供确认。";
+        : "页面抓取失败。请检查登录或网络后重试，或粘贴页面正文。";
+      input.errorNote = error.message || String(error);
       skipRefreshJob = authError;
     }
   } else if (canonicalDetectedUrl && looksLikeHtml(pasted)) {
@@ -717,6 +800,11 @@ async function previewSource(input) {
     } : null,
     comments: normalizeComments(input.comments),
     sourceUpdatedAt: cleanText(input.sourceUpdatedAt || ""),
+    captureMethod: cleanText(input.captureMethod || ""),
+    completeness: normalizeCaptureCompleteness(input.completeness),
+    coverage: input.coverage && typeof input.coverage === "object" ? input.coverage : {},
+    identityEvidence: input.identityEvidence && typeof input.identityEvidence === "object" ? input.identityEvidence : {},
+    errorNote: cleanText(input.errorNote || ""),
     linkedItems,
     refreshJob,
     parseStatus,
@@ -791,7 +879,7 @@ async function summarizeContent(input) {
   }
 
   if (settings.ai?.baseUrl && settings.ai?.apiKey && settings.ai?.model) {
-    return summarizeWithOpenAICompatible(content);
+    return summarizeWithOpenAICompatible(content, { url: input.url || "", sourceType: input.sourceType || "text" }, { signal: input.signal });
   }
 
   return {
@@ -801,7 +889,7 @@ async function summarizeContent(input) {
   };
 }
 
-async function summarizeWithOpenAICompatible(content) {
+async function summarizeWithOpenAICompatible(content, metadata = {}, options = {}) {
   const text = await ai.chat([
     {
       role: "system",
@@ -811,7 +899,7 @@ async function summarizeWithOpenAICompatible(content) {
       role: "user",
       content: content.slice(0, 24000)
     }
-  ]);
+  ], { materials: [metadata], signal: options.signal });
 
   return {
     mode: "ai",
@@ -845,6 +933,9 @@ async function refreshItemWithContext(id, refreshContext = null) {
     await store.writeMetadata(id, metadata);
     return readItem(id);
   }
+  if (fetched.commentsComplete === false) {
+    fetched = { ...fetched, comments: mergeCapturedComments(item.comments || [], fetched.comments || []) };
+  }
   validateTeamsConversationIdentity({ url: item.metadata.url, name: item.metadata.title }, fetched, detectSourceAdapter(item.metadata.url || ""));
   fetched = mergeFetchedTeamsInputWithExisting(item, {
     ...fetched,
@@ -877,11 +968,14 @@ async function refreshItemWithContext(id, refreshContext = null) {
     sourceUpdatedAt: nextSourceUpdatedAt,
     captureMethod: fetched.fetchMethod || item.metadata.captureMethod || "html",
     httpValidators: fetched.httpValidators || item.metadata.httpValidators || {},
-    integrityStatus: item.metadata.sourceType === "teams" ? "verified" : item.metadata.integrityStatus || "",
-    integrityReason: item.metadata.sourceType === "teams" ? "" : item.metadata.integrityReason || "",
-    contentUpdatedAt: item.metadata.contentUpdatedAt || "",
+    integrityStatus: fetched.integrityStatus !== undefined ? cleanText(fetched.integrityStatus) : cleanText(item.metadata.integrityStatus || ""),
+    integrityReason: fetched.integrityReason !== undefined ? cleanText(fetched.integrityReason) : cleanText(item.metadata.integrityReason || ""),
+    contentUpdatedAt: hasUpdate ? now : item.metadata.contentUpdatedAt || "",
     pendingContentUpdatedAt: hasUpdate ? now : item.metadata.pendingContentUpdatedAt || "",
-    processedStale: hasUpdate && item.metadata.processedAt ? true : false,
+    processedStale: hasUpdate ? Boolean(item.metadata.processedAt) : Boolean(item.metadata.processedStale),
+    completeness: normalizeCaptureCompleteness(fetched.completeness, item.metadata.completeness || "unknown"),
+    coverage: fetched.coverage && typeof fetched.coverage === "object" ? fetched.coverage : item.metadata.coverage || {},
+    identityEvidence: fetched.identityEvidence && typeof fetched.identityEvidence === "object" ? fetched.identityEvidence : item.metadata.identityEvidence || {},
     refreshNote: {
       previousDocumentLength: previousLength,
       currentDocumentLength: fetched.text.length,
@@ -890,10 +984,14 @@ async function refreshItemWithContext(id, refreshContext = null) {
   };
 
   const rawFileName = metadata.rawFileName || "raw.html";
-  await store.writeRawContent(id, fetched.raw, rawFileName.endsWith(".html") ? "text/html" : "", rawFileName);
-  await store.writeMetadata(id, metadata);
-  await store.writeComments(id, fetched.comments || []);
-  await store.writeDocument(id, metadata, fetched.text);
+  await store.commit(id, {
+    metadata,
+    body: fetched.text,
+    comments: fetched.comments || [],
+    raw: fetched.raw,
+    rawContentType: rawFileName.endsWith(".html") ? "text/html" : "",
+    rawFileName
+  });
   return readItem(id);
 }
 
@@ -914,10 +1012,18 @@ async function fetchForMetadata(metadata, refreshContext = null) {
 }
 
 async function upsertFetchedItem(input) {
+  const url = canonicalizeMaterialUrl(input.url || "");
+  return withItemUrlMutationLock(url, () => upsertFetchedItemUnlocked(input));
+}
+
+async function upsertFetchedItemUnlocked(input) {
+  if (input.sourceType === "teams" && input.comments?.length) {
+    input = mergeFetchedTeamsInputWithExisting({ metadata: { sourceType: "teams", url: input.url, title: input.title }, comments: [] }, input);
+  }
   const itemUrl = canonicalizeMaterialUrl(input.url || "");
   const existing = await findItemByUrl(itemUrl);
   if (!existing) {
-    const created = await createItem({
+    const created = await createItemUnlocked({
       title: input.title,
       sourceType: input.sourceType,
       url: itemUrl,
@@ -936,13 +1042,25 @@ async function upsertFetchedItem(input) {
       httpValidators: input.httpValidators,
       integrityStatus: input.integrityStatus,
       integrityReason: input.integrityReason,
-      pendingContentUpdatedAt: input.fetchedAt
+      pendingContentUpdatedAt: input.fetchedAt,
+      contentUpdatedAt: input.fetchedAt,
+      completeness: input.completeness,
+      coverage: input.coverage,
+      identityEvidence: input.identityEvidence,
+      subscribe: input.subscribe,
+      deferIndex: input.deferIndex
     });
     created.refreshChanged = true;
     return created;
   }
 
   const item = await readItem(existing.id);
+  if (input.commentsComplete === false) {
+    input = {
+      ...input,
+      comments: mergeCapturedComments(item.comments || [], input.comments || [])
+    };
+  }
   input = mergeFetchedTeamsInputWithExisting(item, input);
   validateFetchedItemNotRegressed(item, input);
   const itemDir = path.join(itemsDir, existing.id);
@@ -967,9 +1085,12 @@ async function upsertFetchedItem(input) {
     updatedAt: hasUpdate ? input.fetchedAt : item.metadata.updatedAt,
     lastFetchedAt: input.fetchedAt,
     sourceUpdatedAt: nextSourceUpdatedAt,
-    contentUpdatedAt: item.metadata.contentUpdatedAt || "",
+    contentUpdatedAt: hasUpdate ? input.fetchedAt : item.metadata.contentUpdatedAt || "",
     pendingContentUpdatedAt: hasUpdate ? input.fetchedAt : item.metadata.pendingContentUpdatedAt || "",
-    processedStale: hasUpdate && item.metadata.processedAt ? true : false,
+    processedStale: hasUpdate ? Boolean(item.metadata.processedAt) : Boolean(item.metadata.processedStale),
+    completeness: normalizeCaptureCompleteness(input.completeness, item.metadata.completeness || "unknown"),
+    coverage: input.coverage && typeof input.coverage === "object" ? input.coverage : item.metadata.coverage || {},
+    identityEvidence: input.identityEvidence && typeof input.identityEvidence === "object" ? input.identityEvidence : item.metadata.identityEvidence || {},
     rawFileName: item.metadata.rawFileName || "raw.html",
     pageKind: input.pageKind || item.metadata.pageKind || null,
     fetchMode: input.fetchMode || item.metadata.fetchMode || null,
@@ -986,14 +1107,68 @@ async function upsertFetchedItem(input) {
     }
   };
 
-  await store.writeRawContent(existing.id, input.raw, metadata.rawFileName.endsWith(".html") ? "text/html" : "", metadata.rawFileName);
-  await store.writeMetadata(existing.id, metadata);
-  await store.writeComments(existing.id, input.comments || []);
-  await store.writeDocument(existing.id, metadata, input.text);
-  await rebuildIndexes();
+  await store.commit(existing.id, {
+    metadata,
+    body: input.text,
+    comments: input.comments || [],
+    raw: input.raw,
+    rawContentType: metadata.rawFileName.endsWith(".html") ? "text/html" : "",
+    rawFileName: metadata.rawFileName
+  });
+  if (!input.deferIndex) await rebuildIndexes();
   const refreshed = await readItem(existing.id);
   refreshed.refreshChanged = hasUpdate;
   return refreshed;
+}
+
+async function upsertCapturedItem(input = {}) {
+  const now = new Date().toISOString();
+  const url = canonicalizeMaterialUrl(input.url || "");
+  if (!url) throw new Error("URL is required.");
+  const sourceType = normalizeSourceType(input.sourceType || "", url);
+  const comments = normalizeComments(input.comments || []);
+  const title = cleanText(input.title || sourceTypeLabel(sourceType));
+  const text = cleanText(input.extractedContent || input.text || renderCapturedText({
+    title,
+    url,
+    sourceType,
+    comments,
+    content: input.content || input.rawContent || ""
+  }));
+  const raw = cleanText(input.rawContent || input.raw || text);
+  return upsertFetchedItem({
+    title,
+    sourceType,
+    url,
+    tags: normalizeTags(input.tags || []),
+    raw,
+    text,
+    comments,
+    sourceUpdatedAt: cleanText(input.sourceUpdatedAt || latestTimestampValue(comments.map((comment) => comment.createdAt)) || ""),
+    fetchedAt: cleanText(input.fetchedAt || now),
+    pageKind: cleanText(input.pageKind || "content"),
+    fetchMode: cleanText(input.fetchMode || "userscript"),
+    captureMethod: cleanText(input.captureMethod || "userscript"),
+    integrityStatus: cleanText(input.integrityStatus || ""),
+    integrityReason: cleanText(input.integrityReason || ""),
+    completeness: normalizeCaptureCompleteness(input.completeness, sourceType === "teams" ? "partial" : "unknown"),
+    coverage: input.coverage && typeof input.coverage === "object" ? input.coverage : {},
+    identityEvidence: input.identityEvidence && typeof input.identityEvidence === "object" ? input.identityEvidence : {},
+    subscribe: input.subscribe
+  });
+}
+
+function renderCapturedText({ title, url, sourceType, comments, content }) {
+  if (sourceType === "teams") {
+    return renderTeamsTextFromComments(title || "Microsoft Teams conversation", url, detectSourceAdapter(url), comments || []);
+  }
+  return [
+    `# ${title || "Captured material"}`,
+    "",
+    `Source: ${url}`,
+    "",
+    cleanText(content || "")
+  ].join("\n");
 }
 
 async function saveItemSnapshot(itemDir, metadata, timestamp) {
@@ -1031,23 +1206,8 @@ function mergeFetchedTeamsInputWithExisting(item, input) {
   if (sourceType !== "teams") return input;
   const previousComments = Array.isArray(item.comments) ? item.comments : [];
   const nextComments = Array.isArray(input.comments) ? input.comments : [];
-  if (!previousComments.length || !nextComments.length) return input;
-  if (previousComments.length >= 10 && nextComments.length < 3) return input;
-  if (previousComments.length >= 10 && nextComments.length < previousComments.length) {
-    const title = cleanText(item.metadata.title || input.title || "Microsoft Teams conversation");
-    const url = canonicalizeMaterialUrl(item.metadata.url || input.url || "");
-    const adapter = detectSourceAdapter(url || input.url || "");
-    return {
-      ...input,
-      title,
-      url: url || input.url,
-      comments: previousComments,
-      text: renderTeamsTextFromComments(title, url || input.url || item.metadata.url || "", adapter, previousComments),
-      sourceUpdatedAt: item.metadata.sourceUpdatedAt || input.sourceUpdatedAt || ""
-    };
-  }
-  const mergedComments = mergeTeamsComments([...previousComments, ...nextComments]);
-  if (mergedComments.length <= nextComments.length) return input;
+  if (!nextComments.length) return input;
+  const mergedComments = mergeTeamsCommentsByIdentity(previousComments, nextComments);
   const title = cleanText(input.title || item.metadata.title || "Microsoft Teams conversation");
   const url = canonicalizeMaterialUrl(input.url || item.metadata.url || "");
   const adapter = detectSourceAdapter(url || item.metadata.url || "");
@@ -1065,6 +1225,16 @@ function mergeFetchedTeamsInputWithExisting(item, input) {
   };
 }
 
+function mergeCapturedComments(existing = [], observed = []) {
+  const byKey = new Map();
+  for (const comment of [...existing, ...observed]) {
+    const id = cleanText(comment?.id || "");
+    const key = id || [cleanText(comment?.author), cleanText(comment?.createdAt), cleanText(comment?.body)].join("\n");
+    if (key) byKey.set(key, comment);
+  }
+  return [...byKey.values()];
+}
+
 async function findItemByUrl(url) {
   const normalized = normalizeUrlForMatch(url);
   if (!normalized) return null;
@@ -1076,6 +1246,22 @@ async function findItemByUrl(url) {
     if (normalizeUrlForMatch(metadata.url) === normalized) return metadata;
   }
   return null;
+}
+
+async function withItemUrlMutationLock(url, task) {
+  const key = normalizeUrlForMatch(url) || `local:${String(url || "").trim()}`;
+  const previous = itemUrlMutationLocks.get(key) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  const queued = previous.catch(() => {}).then(() => current);
+  itemUrlMutationLocks.set(key, queued);
+  await previous.catch(() => {});
+  try {
+    return await task();
+  } finally {
+    release();
+    if (itemUrlMutationLocks.get(key) === queued) itemUrlMutationLocks.delete(key);
+  }
 }
 
 function shouldSkipContentRefresh(existingMetadata, listUpdatedAt, adapter = detectSourceAdapter(existingMetadata?.url || "")) {
@@ -1187,7 +1373,7 @@ async function ensureRefreshJobForListUrl(url, options = {}) {
     refreshJobs: mergeRefreshJobs(settings.refreshJobs || [], [job])
   };
   await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 
   return {
     id: job.id,
@@ -1241,7 +1427,7 @@ async function ensureRefreshJobForContentUrl(url, options = {}) {
     refreshJobs: mergeRefreshJobs(settings.refreshJobs || [], [job])
   };
   await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 
   return {
     id: job.id,
@@ -1277,6 +1463,8 @@ async function syncContentRefreshJobsFromItems() {
   }
 
   for (const item of items) {
+    // Older metadata has no subscribe field and keeps its existing behavior.
+    if (item.subscribe === false) continue;
     if (!item.url || item.pageKind === "list") continue;
     if (isInvalidTeamsRootCapture(item)) continue;
     if (isSubscriptionManagedItem(item)) {
@@ -1322,7 +1510,7 @@ async function syncContentRefreshJobsFromItems() {
     refreshJobs: mergeRefreshJobs(settings.refreshJobs || [], jobsToAdd)
   };
   await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   return jobsToAdd.length;
 }
 
@@ -1396,6 +1584,7 @@ function defaultRefreshFetchModeForAdapter(adapter, requestedMode) {
 
 function shouldFetchWithWebdriver(url, requestedMode, pageKind = "auto", sourceType = "") {
   const adapter = detectSourceAdapter(url || "");
+  if (adapter.sourceType === "teams" && hasTeamsGraphCredentials(adapter)) return false;
   if (requiresWebdriverExpansion(adapter)) return true;
   if (requestedMode === "webdriver") return true;
   if (requestedMode === "fetch") return false;
@@ -1441,7 +1630,8 @@ async function importLinkedItemsFromList(input) {
         pageKind: "content",
         fetchMode,
         managedBy: "subscription",
-        parentUrl: input.parentUrl || input.url
+        parentUrl: input.parentUrl || input.url,
+        deferIndex: true
       });
       imported.push({
         key: link.key || link.number || "",
@@ -1470,6 +1660,11 @@ function mergeTags(...tagLists) {
 }
 
 async function updateTags(id, tags) {
+  const existing = await readItem(id);
+  return withItemUrlMutationLock(existing.metadata.url || "", () => updateTagsUnlocked(id, tags));
+}
+
+async function updateTagsUnlocked(id, tags) {
   const item = await readItem(id);
   const metadata = {
     ...item.metadata,
@@ -1478,13 +1673,17 @@ async function updateTags(id, tags) {
   };
   const body = extractBodyFromDocument(item.document);
   const summary = extractSummaryFromDocument(item.document);
-  await store.writeMetadata(id, metadata);
-  await store.writeDocument(id, metadata, body, summary);
+  await store.commit(id, { metadata, body, summary });
   await rebuildIndexes();
   return readItem(id);
 }
 
 async function updateTitle(id, title) {
+  const existing = await readItem(id);
+  return withItemUrlMutationLock(existing.metadata.url || "", () => updateTitleUnlocked(id, title));
+}
+
+async function updateTitleUnlocked(id, title) {
   const item = await readItem(id);
   const nextTitle = cleanText(title).slice(0, 180);
   if (!nextTitle) throw new Error("标题不能为空。");
@@ -1495,8 +1694,7 @@ async function updateTitle(id, title) {
   };
   const body = extractBodyFromDocument(item.document);
   const summary = extractSummaryFromDocument(item.document);
-  await store.writeMetadata(id, metadata);
-  await store.writeDocument(id, metadata, body, summary);
+  await store.commit(id, { metadata, body, summary });
   await rebuildIndexes();
   return readItem(id);
 }
@@ -1532,7 +1730,7 @@ async function recommendTitleWithOpenAICompatible(item) {
         body
       ].join("\n")
     }
-  ]);
+  ], { materials: [item.metadata] });
 
   return cleanGeneratedTitle(text);
 }
@@ -1554,6 +1752,11 @@ function cleanGeneratedTitle(title) {
 }
 
 async function acknowledgeItemUpdate(id) {
+  const existing = await readItem(id);
+  return withItemUrlMutationLock(existing.metadata.url || "", () => acknowledgeItemUpdateUnlocked(id));
+}
+
+async function acknowledgeItemUpdateUnlocked(id) {
   const item = await readItem(id);
   if (!item.metadata.contentUpdatedAt) return item;
 
@@ -1564,15 +1767,14 @@ async function acknowledgeItemUpdate(id) {
   };
   const body = extractBodyFromDocument(item.document);
   const summary = extractSummaryFromDocument(item.document);
-  await store.writeMetadata(id, metadata);
-  await store.writeDocument(id, metadata, body, summary);
+  await store.commit(id, { metadata, body, summary });
   await rebuildIndexes();
   return readItem(id);
 }
 
 async function recommendTagsForItem(id) {
   const item = await readItem(id);
-  const allTags = (await listTags()).map((tag) => tag.name);
+  const allTags = await modelVisibleTags();
   const currentTags = item.metadata.tags || [];
   const content = [
     `Title: ${item.metadata.title}`,
@@ -1585,7 +1787,7 @@ async function recommendTagsForItem(id) {
   ].join("\n").slice(0, 24000);
 
   if (settings.ai?.baseUrl && settings.ai?.apiKey && settings.ai?.model) {
-    const tags = await recommendTagsWithOpenAICompatible({ content, allTags, currentTags });
+    const tags = await recommendTagsWithOpenAICompatible({ content, allTags, currentTags, metadata: item.metadata });
     return {
       mode: "ai",
       tags,
@@ -1611,12 +1813,12 @@ async function recommendTagsForItems(ids) {
   for (const id of uniqueIds) {
     try {
       const item = await readItem(id);
-      if (item.metadata.integrityStatus !== "quarantined") items.push(item);
+      if (canUseMaterial(item.metadata, settings)) items.push(item);
     } catch {
       // Ignore deleted or invalid items in a long-running batch.
     }
   }
-  const allTags = (await listTags()).map((tag) => tag.name);
+  const allTags = await modelVisibleTags();
   const result = settings.ai?.baseUrl && settings.ai?.apiKey && settings.ai?.model
     ? await recommendBatchTagsWithOpenAICompatible(items, allTags)
     : recommendBatchTagsLocally(items, allTags);
@@ -1626,7 +1828,7 @@ async function recommendTagsForItems(ids) {
 async function recommendBatchTagsWithOpenAICompatible(items, allTags) {
   const supplemental = await supplementalPromptBlock();
   const documents = items.map((item) => {
-    const processed = item.processedDocument
+    const processed = item.processedDocument && !item.metadata.processedStale
       ? extractProcessedBodyFromDocument(item.processedDocument)
       : "";
     const source = processed || extractBodyFromDocument(item.document);
@@ -1662,7 +1864,7 @@ async function recommendBatchTagsWithOpenAICompatible(items, allTags) {
         documents
       ].join("\n")
     }
-  ], { temperature: 0.1 });
+  ], { materials: items.map(item => item.metadata), temperature: 0.1 });
 
   return parseJsonObjectFromText(payload.choices?.[0]?.message?.content || "");
 }
@@ -1714,7 +1916,7 @@ async function classifyItems(ids, categories = []) {
   for (const id of uniqueIds) {
     try {
       const item = await readItem(id);
-      if (item.metadata.integrityStatus !== "quarantined") items.push(item);
+      if (canUseMaterial(item.metadata, settings)) items.push(item);
     } catch {
       // Ignore items deleted while a list classification request is running.
     }
@@ -1744,7 +1946,7 @@ async function classifyItem(id, categories = []) {
 async function classifyItemsWithOpenAICompatible(items, categories = []) {
   const supplemental = await supplementalPromptBlock();
   const documents = items.map((item) => {
-    const processed = item.processedDocument
+    const processed = item.processedDocument && !item.metadata.processedStale
       ? extractProcessedBodyFromDocument(item.processedDocument)
       : "";
     const source = processed || extractBodyFromDocument(item.document);
@@ -1782,14 +1984,14 @@ async function classifyItemsWithOpenAICompatible(items, categories = []) {
         documents
       ].filter(Boolean).join("\n")
     }
-  ], { temperature: 0.1 });
+  ], { materials: items.map(item => item.metadata), temperature: 0.1 });
 
   return parseJsonObjectFromText(payload.choices?.[0]?.message?.content || "");
 }
 
 async function classifyItemWithOpenAICompatible(item, categories) {
   const supplemental = await supplementalPromptBlock();
-  const processed = item.processedDocument
+  const processed = item.processedDocument && !item.metadata.processedStale
     ? extractProcessedBodyFromDocument(item.processedDocument)
     : "";
   const source = processed || extractBodyFromDocument(item.document);
@@ -1818,7 +2020,7 @@ async function classifyItemWithOpenAICompatible(item, categories) {
         source.slice(0, 5000)
       ].join("\n")
     }
-  ], { temperature: 0.1 });
+  ], { materials: [item.metadata], temperature: 0.1 });
 
   const parsed = parseJsonObjectFromText(payload.choices?.[0]?.message?.content || "");
   return normalizeSingleClassification(parsed, item, categories);
@@ -1938,7 +2140,7 @@ function normalizeItemClassification(result, items, categories = []) {
   };
 }
 
-async function recommendTagsWithOpenAICompatible({ content, allTags, currentTags }) {
+async function recommendTagsWithOpenAICompatible({ content, allTags, currentTags, metadata }) {
   const supplemental = await supplementalPromptBlock();
   const payload = await ai.chatPayload([
     {
@@ -1963,7 +2165,7 @@ async function recommendTagsWithOpenAICompatible({ content, allTags, currentTags
         content
       ].join("\n")
     }
-  ], { temperature: 0.1 });
+  ], { materials: [metadata], temperature: 0.1 });
 
   const text = payload.choices?.[0]?.message?.content?.trim() || "";
   const parsed = parseTagsFromAiText(text);
@@ -2020,7 +2222,7 @@ function normalizeRecommendedTags(tags, allTags, currentTags = []) {
   }).slice(0, 10);
 }
 
-async function processItemWithAi(id) {
+async function processItemWithAi(id, options = {}) {
   const item = await readItem(id);
   if (item.metadata.integrityStatus === "quarantined") {
     throw new Error("该资料因来源完整性校验失败已被隔离，验证刷新成功前不能进行 AI 整理。");
@@ -2033,25 +2235,31 @@ async function processItemWithAi(id) {
   }
 
   const prompt = resolveProcessingPrompt(item.metadata.sourceType);
-  const processedText = unwrapMarkdownFence(await processDocumentWithOpenAICompatible(item, prompt));
+  const processedText = unwrapMarkdownFence(await processDocumentWithOpenAICompatible(item, prompt, options));
+  return withItemUrlMutationLock(item.metadata.url || "", async () => {
   const now = new Date().toISOString();
+  options.signal?.throwIfAborted();
+  const latest = await readItem(id);
+  if (extractBodyFromDocument(latest.document) !== extractBodyFromDocument(item.document) || JSON.stringify(latest.comments) !== JSON.stringify(item.comments)) {
+    const error = new Error("资料在整理期间发生更新，请基于最新原文重新整理。"); error.statusCode = 409; throw error;
+  }
   const metadata = {
-    ...item.metadata,
+    ...latest.metadata,
     processedAt: now,
     processedModel: settings.ai.model,
     processedPromptSource: item.metadata.sourceType || "default",
     processedStale: false,
-    contentUpdatedAt: item.metadata.contentUpdatedAt || item.metadata.pendingContentUpdatedAt || "",
+    contentUpdatedAt: latest.metadata.contentUpdatedAt || "",
     pendingContentUpdatedAt: "",
     updatedAt: now
   };
-  await store.writeProcessedDocument(id, renderProcessedDocument(metadata, processedText));
-  await store.writeMetadata(id, metadata);
+  await store.commit(id, { metadata, processedDocument: renderProcessedDocument(metadata, processedText) });
   await rebuildIndexes();
   return readItem(id);
+  });
 }
 
-async function processDocumentWithOpenAICompatible(item, prompt) {
+async function processDocumentWithOpenAICompatible(item, prompt, options = {}) {
   const supplemental = await supplementalPromptBlock();
   const sourceBody = extractBodyFromDocument(item.document).trim();
   const summary = extractSummaryFromDocument(item.document).trim();
@@ -2094,7 +2302,7 @@ async function processDocumentWithOpenAICompatible(item, prompt) {
         comments ? `\n\n评论/对话结构化内容：\n${comments.slice(0, 12000)}` : ""
       ].join("\n")
     }
-  ]);
+  ], { materials: [item.metadata], signal: options.signal });
 }
 
 async function readItem(id) {
@@ -2156,13 +2364,13 @@ ${sourceLines.join("\n") || "- knowledge-base/indexes/by-updated.json\n- knowled
   };
 }
 
-async function answerFromKnowledgeBase(message) {
+async function answerFromKnowledgeBase(message, options = {}) {
   const cleanMessage = cleanText(message);
   if (!cleanMessage) {
     throw new Error("请输入问题。");
   }
 
-  const results = await searchKnowledgeBase(cleanMessage, 8, { remoteAiOnly: true });
+  const results = await searchKnowledgeBase([...(options.history || []).filter(entry => entry.role === "user").slice(-1).map(entry => entry.content), cleanMessage].join("\n"), 8, { remoteAiOnly: true });
   const trace = [
     {
       type: "thinking",
@@ -2183,7 +2391,7 @@ async function answerFromKnowledgeBase(message) {
     }
   ];
   if (settings.ai?.baseUrl && settings.ai?.apiKey && settings.ai?.model) {
-    return answerWithOpenAICompatible(cleanMessage, results, trace);
+    return answerWithOpenAICompatible(cleanMessage, results, trace, options);
   }
 
   return {
@@ -2203,7 +2411,7 @@ async function answerFromKnowledgeBase(message) {
   };
 }
 
-async function answerWithOpenAICompatible(question, results, trace = []) {
+async function answerWithOpenAICompatible(question, results, trace = [], options = {}) {
   const context = results.map((result, index) => {
     const source = result.item;
     return `资料 ${index + 1}
@@ -2237,11 +2445,12 @@ ${result.context}`;
         supplemental
       ].filter(Boolean).join("\n\n")
     },
+    ...normalizeChatHistory(options.history),
     {
       role: "user",
       content: `问题：${question}\n\n本地知识库根目录：${kbDir}\n\n检索到的资料：\n${context || "没有检索到相关资料。"}`
     }
-  ]);
+  ], { materials: results.map(result => result.item), signal: options.signal });
 
   return {
     role: "assistant",
@@ -2260,7 +2469,7 @@ ${result.context}`;
   };
 }
 
-async function streamAnswerFromKnowledgeBase(message, res) {
+async function streamAnswerFromKnowledgeBase(message, res, options = {}) {
   startSse(res);
   try {
     const cleanMessage = cleanText(message);
@@ -2274,7 +2483,7 @@ async function streamAnswerFromKnowledgeBase(message, res) {
       detail: `准备基于本地知识库回答：“${cleanMessage.slice(0, 120)}”`
     });
 
-    const results = await searchKnowledgeBase(cleanMessage, 8, { remoteAiOnly: true });
+    const results = await searchKnowledgeBase([...(options.history || []).filter(entry => entry.role === "user").slice(-1).map(entry => entry.content), cleanMessage].join("\n"), 8, { remoteAiOnly: true });
     const sources = results.map(toPublicKnowledgeSource);
     sendSse(res, "trace", {
       type: "tool",
@@ -2291,7 +2500,7 @@ async function streamAnswerFromKnowledgeBase(message, res) {
     sendSse(res, "sources", { sources });
 
     if (settings.ai?.baseUrl && settings.ai?.apiKey && settings.ai?.model) {
-      await streamWithOpenAICompatible(cleanMessage, results, sources, res);
+      await streamWithOpenAICompatible(cleanMessage, results, sources, res, options);
       return;
     }
 
@@ -2316,7 +2525,7 @@ async function streamAnswerFromKnowledgeBase(message, res) {
   }
 }
 
-async function streamWithOpenAICompatible(question, results, sources, res) {
+async function streamWithOpenAICompatible(question, results, sources, res, options = {}) {
   const context = buildOpenAIContext(results);
   const supplemental = await supplementalPromptBlock();
   sendSse(res, "trace", {
@@ -2333,16 +2542,18 @@ async function streamWithOpenAICompatible(question, results, sources, res) {
         supplemental
       ].filter(Boolean).join("\n\n")
     },
+    ...normalizeChatHistory(options.history),
     {
       role: "user",
       content: `问题：${question}\n\n本地知识库根目录：${kbDir}\n\n检索到的资料：\n${context || "没有检索到相关资料。"}`
     }
-  ]);
+  ], { materials: results.map(result => result.item), signal: options.signal });
 
   let content = "";
   let streamBuffer = "";
+  const decoder = new TextDecoder();
   for await (const chunk of response.body) {
-    streamBuffer += Buffer.from(chunk).toString("utf8");
+    streamBuffer += decoder.decode(chunk, { stream: true });
     const parsed = parseOpenAIStreamPayloads(streamBuffer);
     streamBuffer = parsed.rest;
     for (const payload of parsed.payloads) {
@@ -2401,7 +2612,7 @@ function parseOpenAIStreamPayloads(chunk) {
 
 async function searchKnowledgeBase(query, limit = 8, filters = {}) {
   const terms = tokenizeQuery(query);
-  const desiredLimit = Math.max(1, Number(limit) || 8);
+  const desiredLimit = Math.min(100, Math.max(1, Number(limit) || 8));
   const embeddingEnabled = isEmbeddingEnabled();
   const dirs = await safeReaddir(itemsDir);
   const results = [];
@@ -2410,7 +2621,7 @@ async function searchKnowledgeBase(query, limit = 8, filters = {}) {
     const material = await readMaterialForSearch(id);
     if (!material) continue;
     const { metadata, document, processedDocument, commentsText, paths } = material;
-    if (metadata.integrityStatus === "quarantined") continue;
+    if (!matchesMaterialFilters(metadata, filters, settings)) continue;
     if (filters.remoteAiOnly && !isRemoteAiAllowed(metadata)) continue;
     if (filters.sourceType && metadata.sourceType !== filters.sourceType) continue;
     if (filters.tag && !(metadata.tags || []).includes(filters.tag)) continue;
@@ -2440,8 +2651,8 @@ async function searchKnowledgeBase(query, limit = 8, filters = {}) {
   }
 
   try {
-    const vectorResults = await searchKnowledgeBaseByEmbedding(query, terms, desiredLimit * 2);
-    const merged = mergeKnowledgeResults(results, vectorResults);
+    const vectorResults = await searchKnowledgeBaseByEmbedding(query, terms, desiredLimit * 2, filters);
+    const merged = mergeKnowledgeResults(results, vectorResults).filter(result => matchesMaterialFilters(result.item, filters, settings));
     return diversifyKnowledgeResults(merged, desiredLimit, terms);
   } catch (error) {
     console.error("Embedding search failed, falling back to keyword search:", error);
@@ -2452,31 +2663,23 @@ async function searchKnowledgeBase(query, limit = 8, filters = {}) {
 }
 
 async function readMaterialForSearch(id) {
-  const itemDir = path.join(itemsDir, id);
-  const metadataPath = path.join(itemDir, "metadata.json");
-  const documentPath = path.join(itemDir, "document.md");
-  if (!(await exists(metadataPath)) || !(await exists(documentPath))) return null;
-
-  const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
-  const document = await fs.readFile(documentPath, "utf8");
-  const processedPath = path.join(itemDir, "processed.md");
-  const processedDocument = await exists(processedPath) ? await fs.readFile(processedPath, "utf8") : "";
-  const commentsPath = path.join(itemDir, "comments.jsonl");
-  const comments = await readJsonLines(commentsPath);
-  const commentsText = comments.map((comment) => JSON.stringify(comment)).join("\n");
-  return {
-    metadata,
-    document,
-    processedDocument,
-    commentsText,
-    paths: {
-      metadata: metadataPath,
-      document: documentPath,
-      processed: processedDocument ? processedPath : "",
-      comments: commentsPath,
-      raw: path.join(itemDir, metadata.rawFileName || "raw.txt")
-    }
-  };
+  try {
+    const item = await store.read(id);
+    const itemDir = path.join(itemsDir, id);
+    const processedDocument = item.metadata.processedStale ? "" : item.processedDocument;
+    return {
+      ...item, processedDocument,
+      commentsText: item.comments.map(comment => JSON.stringify(comment)).join("\n"),
+      paths: {
+        metadata: path.join(itemDir, "metadata.json"), document: path.join(itemDir, "document.md"),
+        processed: processedDocument ? path.join(itemDir, "processed.md") : "",
+        comments: path.join(itemDir, "comments.jsonl"), raw: path.join(itemDir, item.metadata.rawFileName || "raw.txt")
+      }
+    };
+  } catch (error) {
+    if (!id.startsWith(".")) console.warn(`Skipping unreadable material ${id}: ${error.message}`);
+    return null;
+  }
 }
 
 function diversifyKnowledgeResults(results, limit, terms) {
@@ -2510,7 +2713,7 @@ function diversifyKnowledgeResults(results, limit, terms) {
   return selected.sort((a, b) => b.score - a.score || String(b.item.updatedAt).localeCompare(String(a.item.updatedAt)));
 }
 
-async function searchKnowledgeBaseByEmbedding(query, terms, limit) {
+async function searchKnowledgeBaseByEmbedding(query, terms, limit, filters = {}) {
   const cleanQuery = cleanText(query);
   if (!cleanQuery) return [];
   const index = await ensureEmbeddingIndex();
@@ -2530,12 +2733,12 @@ async function searchKnowledgeBaseByEmbedding(query, terms, limit) {
   const candidates = [...bestByItem.values()]
     .filter((candidate) => candidate.vectorScore > 0.2)
     .sort((a, b) => b.vectorScore - a.vectorScore)
-    .slice(0, Math.max(1, limit));
+;
 
   const results = [];
   for (const candidate of candidates) {
     const material = await readMaterialForSearch(candidate.record.itemId);
-    if (!material) continue;
+    if (!material || !matchesMaterialFilters(material.metadata, filters, settings) || !canUseMaterial(material.metadata, settings, "embedding")) continue;
     const { metadata, document, processedDocument, commentsText, paths } = material;
     results.push({
       score: candidate.vectorScore * 20,
@@ -2548,7 +2751,7 @@ async function searchKnowledgeBaseByEmbedding(query, terms, limit) {
       context: buildVectorKnowledgeContext(candidate.record.text, processedDocument || document, commentsText, terms)
     });
   }
-  return results;
+  return results.slice(0, Math.max(1, limit));
 }
 
 function mergeKnowledgeResults(keywordResults, vectorResults) {
@@ -2596,109 +2799,80 @@ function embeddingConfigKey() {
 }
 
 async function ensureEmbeddingIndex() {
-  await fs.mkdir(indexesDir, { recursive: true });
-  const currentManifest = await buildEmbeddingManifest();
   const filePath = embeddingIndexPath();
-  if (await exists(filePath)) {
-    try {
-      const saved = JSON.parse(await fs.readFile(filePath, "utf8"));
-      if (
-        saved.configKey === embeddingConfigKey()
-        && JSON.stringify(saved.manifest || []) === JSON.stringify(currentManifest)
-        && Array.isArray(saved.records)
-      ) {
-        return saved;
-      }
-    } catch {
-      // Rebuild malformed embedding indexes.
-    }
-  }
-
-  const rebuilt = await rebuildEmbeddingIndex(currentManifest);
-  await fs.writeFile(filePath, `${JSON.stringify(rebuilt)}\n`, "utf8");
-  return rebuilt;
+  const configKey = embeddingConfigKey();
+  const key = `${filePath}|${configKey}`;
+  if (embeddingBuilds.has(key)) return embeddingBuilds.get(key);
+  const build = (async () => {
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    const manifest = await buildEmbeddingManifest();
+    let saved = null;
+    try { saved = JSON.parse(await fs.readFile(filePath, "utf8")); } catch {}
+    if (saved?.version !== 2 || saved.configKey !== configKey) saved = null;
+    if (saved && JSON.stringify(saved.manifest) === JSON.stringify(manifest)) return saved;
+    const rebuilt = await rebuildEmbeddingIndex(manifest, saved);
+    if (filePath !== embeddingIndexPath() || configKey !== embeddingConfigKey()) throw new Error("索引配置已变更，请重新检索。");
+    const temp = `${filePath}.tmp`;
+    await fs.writeFile(temp, JSON.stringify(rebuilt), { encoding: "utf8", mode: 0o600 });
+    await fs.rename(temp, filePath);
+    return rebuilt;
+  })();
+  embeddingBuilds.set(key, build);
+  try { return await build; } finally { embeddingBuilds.delete(key); }
 }
 
 async function buildEmbeddingManifest() {
-  const dirs = await safeReaddir(itemsDir);
   const manifest = [];
-  for (const id of dirs) {
+  for (const id of await safeReaddir(itemsDir)) {
     const material = await readMaterialForSearch(id);
-    if (!material) continue;
-    if (material.metadata.pageKind === "list") continue;
-    manifest.push({
-      id,
-      updatedAt: material.metadata.updatedAt || "",
-      processedAt: material.metadata.processedAt || "",
-      sourceUpdatedAt: material.metadata.sourceUpdatedAt || ""
-    });
+    if (!material || material.metadata.pageKind === "list" || !canUseMaterial(material.metadata, settings, "embedding")) continue;
+    const contentHash = createHash("sha256").update(JSON.stringify(chunkMaterialForEmbedding(material))).digest("hex");
+    manifest.push({ id, contentHash });
   }
   return manifest.sort((a, b) => a.id.localeCompare(b.id));
 }
 
-async function rebuildEmbeddingIndex(manifest) {
+async function rebuildEmbeddingIndex(manifest, previous = null) {
   const records = [];
+  const hashes = new Map((previous?.manifest || []).map(entry => [entry.id, entry.contentHash]));
   for (const entry of manifest) {
     const material = await readMaterialForSearch(entry.id);
-    if (!material) continue;
-    const chunks = chunkMaterialForEmbedding(material).slice(0, 20);
-    if (!chunks.length) continue;
-    const vectors = await createEmbeddings(chunks.map((chunk) => chunk.text));
-    for (let index = 0; index < chunks.length; index += 1) {
-      records.push({
-        itemId: entry.id,
-        chunkId: chunks[index].id,
-        sourceType: material.metadata.sourceType,
-        title: material.metadata.title,
-        text: chunks[index].text,
-        vector: vectors[index] || []
-      });
+    if (!material || !canUseMaterial(material.metadata, settings, "embedding")) continue;
+    if (hashes.get(entry.id) === entry.contentHash) {
+      records.push(...(previous.records || []).filter(record => record.itemId === entry.id));
+      continue;
+    }
+    const chunks = chunkMaterialForEmbedding(material);
+    for (let offset = 0; offset < chunks.length; offset += 32) {
+      const batch = chunks.slice(offset, offset + 32);
+      const vectors = await createEmbeddings(batch.map(chunk => chunk.text), [material.metadata]);
+      batch.forEach((chunk, index) => records.push({
+        itemId: entry.id, chunkId: chunk.id, sourceType: material.metadata.sourceType,
+        title: material.metadata.title, text: chunk.text, vector: vectors[index]
+      }));
     }
   }
-  return {
-    version: 1,
-    configKey: embeddingConfigKey(),
-    generatedAt: new Date().toISOString(),
-    manifest,
-    records
-  };
+  return { version: 2, configKey: embeddingConfigKey(), generatedAt: new Date().toISOString(), manifest, records };
 }
 
 function chunkMaterialForEmbedding(material) {
   const metadata = material.metadata;
-  const base = material.processedDocument || material.document;
-  const body = extractBodyFromDocument(base).trim();
-  const header = [
-    `标题：${metadata.title}`,
-    `来源：${metadata.sourceType}`,
-    `URL：${metadata.url || "local input"}`,
-    `标签：${(metadata.tags || []).join(", ") || "none"}`
-  ].join("\n");
-  const text = `${header}\n\n${body}`.replace(/\n{3,}/g, "\n\n");
-  const paragraphs = text.split(/\n{2,}/).map((part) => part.trim()).filter(Boolean);
+  const base = !metadata.processedStale && material.processedDocument ? extractProcessedBodyFromDocument(material.processedDocument) : extractBodyFromDocument(material.document);
+  const header = `标题：${metadata.title}\n来源：${metadata.sourceType}\nURL：${metadata.url || "本地文本"}\n标签：${(metadata.tags || []).join(", ")}`;
+  const text = `${base}\n\n${material.commentsText || ""}`.trim();
   const chunks = [];
-  let current = "";
-  for (const paragraph of paragraphs) {
-    if ((current + "\n\n" + paragraph).length > 1200 && current) {
-      chunks.push(current);
-      current = paragraph;
-    } else {
-      current = current ? `${current}\n\n${paragraph}` : paragraph;
-    }
+  for (let offset = 0; offset < text.length; offset += 1400) {
+    chunks.push({ id: `${metadata.id}-${chunks.length + 1}`, text: `${header}\n\n${text.slice(offset, offset + 1600)}` });
   }
-  if (current) chunks.push(current);
-  return chunks.map((chunk, index) => ({
-    id: `${metadata.id || "item"}-${index + 1}`,
-    text: chunk.slice(0, 1800)
-  }));
+  return chunks;
 }
 
 async function createEmbedding(text) {
-  return ai.createEmbedding(text);
+  return ai.createEmbedding(text, { materials: [] });
 }
 
-async function createEmbeddings(inputs) {
-  return ai.createEmbeddings(inputs);
+async function createEmbeddings(inputs, materials = []) {
+  return ai.createEmbeddings(inputs, { materials });
 }
 
 function cosineSimilarity(a, b) {
@@ -2769,12 +2943,12 @@ function buildKnowledgeContext(document, commentsText, terms) {
 
 function buildLocalKnowledgeAnswer(question, results) {
   if (!results.length) {
-    return `我没有在本地知识库中找到和“${question}”明显相关的资料。\n\n知识库根目录：${kbDir}`;
+    return `我没有在本地知识库中找到和“${question}”明显相关的资料。可以换用资料中的关键词，或先添加相关资料。`;
   }
 
   const sources = results.map((result, index) => {
     const item = result.item;
-    return `${index + 1}. ${item.title} (${item.id})\n   来源：${item.sourceType} · ${item.url || "local input"}\n   最后抓取：${item.lastFetchedAt || "not fetched"}\n   文件：${item.paths.processed || item.paths.document}\n   相关片段：${result.context.slice(0, 420).replace(/\n/g, " ")}`;
+    return `${index + 1}. **${item.title}**\n\n   ${result.context.slice(0, 420).replace(/\n/g, " ")}`;
   }).join("\n\n");
 
   return `我在本地知识库里找到了这些相关资料。当前未配置 AI 接口，所以先返回可追溯的检索结果；配置 OpenAI 兼容接口后会直接基于这些内容生成回答。\n\n问题：${question}\n\n${sources}`;
@@ -2789,6 +2963,9 @@ function toPublicKnowledgeSource(result) {
     tags: result.item.tags || [],
     lastFetchedAt: result.item.lastFetchedAt,
     updatedAt: result.item.updatedAt,
+    completeness: result.item.completeness || "unknown",
+    coverage: result.item.coverage || {},
+    processedStale: Boolean(result.item.processedStale),
     score: result.score,
     paths: result.item.paths,
     excerpt: result.context.slice(0, 500)
@@ -2886,8 +3063,7 @@ async function renameTag(from, to) {
     };
     const body = extractBodyFromDocument(item.document);
     const summary = extractSummaryFromDocument(item.document);
-    await store.writeMetadata(id, metadata);
-    await store.writeDocument(id, metadata, body, summary);
+    await store.commit(id, { metadata, body, summary });
     touchedItems.push({ id, title: metadata.title });
   }
 
@@ -2934,8 +3110,7 @@ async function deleteTags(tags) {
     };
     const body = extractBodyFromDocument(item.document);
     const summary = extractSummaryFromDocument(item.document);
-    await store.writeMetadata(id, metadata);
-    await store.writeDocument(id, metadata, body, summary);
+    await store.commit(id, { metadata, body, summary });
     touchedItems.push({ id, title: metadata.title });
   }
 
@@ -2980,6 +3155,7 @@ function startRefreshScheduler() {
 }
 
 async function runDueRefreshJobs() {
+  if (libraryMaintenance) return;
   if (settings.doNotDisturb?.enabled) return;
   const now = new Date();
   const dueJobs = [];
@@ -2990,7 +3166,14 @@ async function runDueRefreshJobs() {
   }
   if (!dueJobs.length) return;
 
-  const result = await runRefreshJobsBatch(dueJobs);
+  const teamsJobs = dueJobs.filter((job) => detectSourceAdapter(job.url || "").sourceType === "teams");
+  const unattendedJobs = dueJobs.filter((job) => detectSourceAdapter(job.url || "").sourceType !== "teams");
+  if (teamsJobs.length) {
+    await startRefreshRunByIds(teamsJobs.map((job) => job.id), { sourceType: "teams" });
+  }
+  if (!unattendedJobs.length) return;
+
+  const result = await runRefreshJobsBatch(unattendedJobs);
   for (const entry of result.results || []) {
     if (entry.status === "failed") {
       console.error(`Scheduled refresh failed for ${entry.id}:`, entry.error || "unknown error");
@@ -3004,23 +3187,7 @@ async function runDueRefreshJobs() {
 }
 
 function nextDueRefreshSlot(job, now = new Date(), schedule = {}) {
-  const intervalMinutes = Math.max(5, Number(job.intervalMinutes) || 60);
-  const start = parseTimeOfDay(schedule?.startTime || "08:00", "08:00");
-  const end = parseTimeOfDay(schedule?.endTime || "20:00", "20:00");
-  const startAt = new Date(now);
-  startAt.setHours(start.hours, start.minutes, 0, 0);
-  const endAt = new Date(now);
-  endAt.setHours(end.hours, end.minutes, 0, 0);
-  if (endAt < startAt) endAt.setDate(endAt.getDate() + 1);
-  if (now < startAt || now > endAt) return null;
-
-  const elapsedMinutes = Math.floor((now.getTime() - startAt.getTime()) / 60000);
-  const slotIndex = Math.floor(elapsedMinutes / intervalMinutes);
-  const dueAt = new Date(startAt.getTime() + slotIndex * intervalMinutes * 60000);
-  if (dueAt > endAt) return null;
-  const lastRunAt = job.lastRunAt ? new Date(job.lastRunAt) : null;
-  if (lastRunAt && lastRunAt >= dueAt) return null;
-  return dueAt;
+  return nextDueCaptureSlot(job, now, schedule);
 }
 
 function parseTimeOfDay(value, fallback) {
@@ -3170,6 +3337,7 @@ async function cancelRefreshRun(id) {
     cancelRequested: true,
     error: "用户已请求取消刷新。"
   });
+  run.abortController?.abort();
   await closeRefreshRunContext(run);
   return publicRefreshRunFromRecord(run);
 }
@@ -3272,7 +3440,7 @@ async function runRefreshJobsBatch(jobs, options = {}) {
     }
     }
 
-    const aiProcessing = await processUpdatedItemsAfterRefresh(results);
+    const aiProcessing = await processUpdatedItemsAfterRefresh(results, { signal: run?.abortController?.signal });
     await annotateRefreshResultsWithAiProcessing(results, aiProcessing);
     const summary = summarizeRefreshBatch(results, startedAt, groups, contentResults, aiProcessing);
     if (run?.cancelRequested) {
@@ -3357,7 +3525,7 @@ async function reconcileStaleRunningRefreshJobs() {
     })
   };
   await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   return staleJobs.length;
 }
 
@@ -3391,7 +3559,7 @@ function sortRefreshGroups(groups) {
   });
 }
 
-async function createRefreshGroupContext(group) {
+async function createRefreshGroupContext(group, run = null) {
   const needsWebdriver = group.jobs.some((job) => {
     const adapter = detectSourceAdapter(job.url || "");
     return resolvedRefreshFetchMode(job, adapter) === "webdriver";
@@ -3402,21 +3570,34 @@ async function createRefreshGroupContext(group) {
   const sessionUrl = group.sourceType === "teams" ? `https://${adapter.hostname}` : targetUrl;
   const session = await ensureWebdriverSession(adapter.hostname, sessionUrl, {
     autoClose: false,
+    headed: group.sourceType === "teams",
+    manual: group.sourceType === "teams",
     windowMode: group.sourceType === "teams" || group.sourceType === "jira" ? "normal" : undefined
   });
   const page = await ensureSessionPage(session);
   session.page = page;
 
-  if (group.sourceType === "teams") {
-    await prepareTeamsRefreshGroup(page, adapter);
-  }
-
-  return {
+  const refreshContext = {
     adapter,
+    run,
     webdriverSession: session,
     webdriverPage: page,
-    closeWhenDone: !session.manual
+    closeWhenDone: group.sourceType === "teams" ? false : !session.manual
   };
+  if (group.sourceType === "teams") {
+    session.teamsUserConfirmedAt = "";
+    if (run) {
+      run.teamsReadyConfirmed = false;
+      run.teamsReadyConfirmedAt = "";
+    }
+  }
+  if (run) updateRefreshRun(run, { refreshContext });
+
+  if (group.sourceType === "teams") {
+    await prepareTeamsRefreshGroup(page, adapter, run, session);
+  }
+
+  return refreshContext;
 }
 
 async function verifyRefreshGroupAuthentication(group, refreshContext = null) {
@@ -3550,15 +3731,106 @@ function jiraLoginUrl(returnUrl, adapter) {
   }
 }
 
-async function prepareTeamsRefreshGroup(page, adapter) {
+async function prepareTeamsRefreshGroup(page, adapter, run = null, session = null) {
   const homeUrl = `https://${adapter.hostname}`;
-  await page.goto(homeUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-  await resolveTeamsLauncher(page, homeUrl);
-  try {
-    await page.waitForLoadState("networkidle", { timeout: 8000 });
-  } catch {
-    // Teams may keep background requests open; a loaded shell is enough before opening each subscription link.
+  const currentUrl = page.url();
+  const alreadyInMicrosoftFlow = /(?:^|\.)microsoft(?:online)?\.com$/i.test(safeHostname(currentUrl))
+    || /(?:^|\.)microsoft\.com$/i.test(safeHostname(currentUrl));
+  if (!alreadyInMicrosoftFlow) {
+    await page.goto(homeUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
   }
+
+  if (session?.teamsUserConfirmedAt && await isTeamsWebAppReady(page)) return;
+
+  if (!run) {
+    throw new Error("Teams 抓取需要先从订阅刷新启动 WebDriver，并在应用页面确认聊天窗口已就绪。");
+  }
+
+  updateRefreshRun(run, {
+    status: "waiting_for_teams_confirmation",
+    currentJobId: "",
+    currentJobName: "请在 WebDriver 中进入 Teams 聊天窗口，然后回到应用确认"
+  });
+
+  await waitForTeamsUserConfirmation(page, { run, session });
+}
+
+async function waitForTeamsUserConfirmation(page, options = {}) {
+  const deadline = Date.now() + Number(options.timeoutMs || TEAMS_LOGIN_TIMEOUT_MS);
+  while (Date.now() < deadline) {
+    if (options.run?.cancelRequested || page.isClosed()) {
+      const error = new Error("Teams 登录等待已取消。");
+      error.code = "REFRESH_ABORTED";
+      throw error;
+    }
+    if (options.run?.teamsReadyConfirmed && options.session?.teamsUserConfirmedAt) return;
+    await page.waitForTimeout(1000);
+  }
+  throw new Error([
+    "等待 Teams 页面确认超时，已停止抓取。",
+    "WebDriver 窗口会继续保留；请确认聊天窗口可见后重新刷新。"
+  ].join(" "));
+}
+
+async function confirmTeamsRefreshReady(runId) {
+  const run = refreshRuntime.runs.get(runId);
+  if (!run) throw new Error("Refresh run not found.");
+  if (run.status !== "waiting_for_teams_confirmation") {
+    throw new Error("当前刷新任务不在等待 Teams 确认状态。");
+  }
+  const session = run.refreshContext?.webdriverSession;
+  const page = run.refreshContext?.webdriverPage;
+  if (!session || !page || page.isClosed()) {
+    throw new Error("Teams WebDriver 会话已经关闭，请重新启动刷新。");
+  }
+  if (!(await isTeamsWebAppReady(page))) {
+    throw new Error("尚未检测到 Teams 聊天主界面。请在 WebDriver 中完成登录、选择“使用 Web 应用”，并确认聊天列表可见。");
+  }
+  const confirmedAt = new Date().toISOString();
+  session.teamsUserConfirmedAt = confirmedAt;
+  updateRefreshRun(run, {
+    teamsReadyConfirmed: true,
+    teamsReadyConfirmedAt: confirmedAt,
+    status: "running",
+    currentJobName: "Teams 页面已确认，准备定位目标对话"
+  });
+  return publicRefreshRunFromRecord(run);
+}
+
+async function isTeamsWebAppReady(page) {
+  if (!page || page.isClosed()) return false;
+  return page.evaluate(() => {
+    const hostname = window.location.hostname.toLowerCase();
+    const onTeamsHost = hostname === "teams.cloud.microsoft"
+      || hostname === "teams.microsoft.com"
+      || hostname.endsWith(".teams.microsoft.com");
+    if (!onTeamsHost) return false;
+
+    const authInput = document.querySelector([
+      "input[type='email']",
+      "input[name='loginfmt']",
+      "input[name='passwd']",
+      "input[type='password']"
+    ].join(","));
+    if (authInput) return false;
+
+    const bodyText = String(document.body?.innerText || "").replace(/\s+/g, " ");
+    const launcherVisible = /使用(?: Web|网页)|在此浏览器中继续|Use the web app|Continue on this browser/i.test(bodyText);
+    if (launcherVisible) return false;
+
+    const appShell = document.querySelector([
+      "[data-tid='app-layout-area--main']",
+      "[data-tid='app-bar']",
+      "[data-tid='chat-list']",
+      "[data-tid='chat-pane-list']",
+      "[data-tid='teams-app-bar']",
+      "[data-tid='left-rail']"
+    ].join(","));
+    if (appShell) return true;
+
+    const teamsNavigation = /(?:Activity|Chat|Teams|Calendar|Calls|Apps|活动|聊天|团队|日历|通话|应用)/i.test(bodyText);
+    return /\/(?:v2|_#\/|l\/)/i.test(window.location.pathname + window.location.hash) && teamsNavigation;
+  }).catch(() => false);
 }
 
 async function closeRefreshGroupContext(refreshContext) {
@@ -3580,8 +3852,8 @@ function rememberRefreshedContentUrls(refreshedUrls, result) {
   }
 }
 
-async function processUpdatedItemsAfterRefresh(results) {
-  const itemIds = await collectRefreshItemIdsNeedingAi(results);
+async function processUpdatedItemsAfterRefresh(results, options = {}) {
+  const itemIds = options.signal?.aborted ? [] : await collectRefreshItemIdsNeedingAi(results);
   if (!itemIds.length) {
     return { requestedCount: 0, processedCount: 0, skippedCount: 0, errorCount: 0, processedItems: [], errors: [] };
   }
@@ -3590,17 +3862,19 @@ async function processUpdatedItemsAfterRefresh(results) {
       requestedCount: itemIds.length,
       processedCount: 0,
       skippedCount: itemIds.length,
-      errorCount: itemIds.length,
+      errorCount: 0,
       processedItems: [],
-      errors: itemIds.map((itemId) => ({ itemId, error: "AI 接口未配置，刷新内容已暂存，未显示 NEW。" }))
+      errors: [],
+      note: "未配置 AI 接口，原文更新已保存并显示为未读。"
     };
   }
 
   const processedItems = [];
   const errors = [];
   for (const itemId of itemIds) {
+    if (options.signal?.aborted) break;
     try {
-      const item = await processItemWithAi(itemId);
+      const item = await processItemWithAi(itemId, options);
       processedItems.push({
         itemId,
         title: item.metadata.title,
@@ -3672,7 +3946,7 @@ async function annotateRefreshResultsWithAiProcessing(results, aiProcessing) {
     const aiProcessErrorCount = updatedEntries.filter((item) => failed.has(item.itemId)).length;
     entry.result = {
       ...entry.result,
-      newItemCount: aiProcessedCount,
+      newItemCount: Number(entry.result.updatedItemCount ?? entry.result.updatedIssueCount ?? 0),
       aiProcessedCount,
       aiProcessErrorCount,
       aiProcessingErrors: (aiProcessing.errors || []).filter((item) => updatedEntries.some((updated) => updated.itemId === item.itemId))
@@ -3693,7 +3967,7 @@ async function updateRefreshJobsLastResults(results) {
     ))
   };
   await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 }
 
 function summarizeRefreshBatch(results, startedAt, groups, contentResults = [], aiProcessing = null) {
@@ -3718,7 +3992,7 @@ function summarizeRefreshBatch(results, startedAt, groups, contentResults = [], 
     failureCount: failed.length + failedContent.length,
     linkCount: successful.reduce((sum, entry) => sum + Number(entry.result?.linkCount ?? entry.result?.issueCount ?? 0), 0) + contentResults.length,
     updatedItemCount: successful.reduce((sum, entry) => sum + Number(entry.result?.updatedItemCount ?? entry.result?.updatedIssueCount ?? 0), 0) + updatedContent.length,
-    newItemCount: aiProcessedCount,
+    newItemCount: successful.reduce((sum, entry) => sum + Number(entry.result?.updatedItemCount ?? entry.result?.updatedIssueCount ?? 0), 0) + updatedContent.length,
     aiProcessedCount,
     aiProcessErrorCount,
     aiProcessing: aiProcessing || { requestedCount: 0, processedCount: 0, skippedCount: 0, errorCount: 0, processedItems: [], errors: [] },
@@ -3788,6 +4062,7 @@ async function withRefreshJobTimeout(job, run, task) {
   let timer;
   let timedOut = false;
   const controller = new AbortController();
+  if (run) run.abortController = controller;
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(async () => {
       timedOut = true;
@@ -3803,6 +4078,7 @@ async function withRefreshJobTimeout(job, run, task) {
     return await Promise.race([task(controller.signal), timeout]);
   } finally {
     clearTimeout(timer);
+    if (run?.abortController === controller) run.abortController = null;
     if (timedOut && run) updateRefreshRun(run, { status: "failed" });
   }
 }
@@ -3915,6 +4191,13 @@ async function refreshListJob(job, refreshContext = null) {
   }
   const listUrl = listFetched.url || job.url;
   const tags = normalizeTags(job.tags || []);
+  // API adapters provide structured entries. Raw is evidence, never a format
+  // contract for the list consumer.
+  const listCapture = prepareListCapture(
+    listFetched,
+    job.maxItems,
+    () => extractContentLinksFromList(listFetched.raw, listUrl, adapter)
+  );
   const listItem = await upsertFetchedItem({
     title: listFetched.title,
     sourceType: adapter.sourceType,
@@ -3925,11 +4208,12 @@ async function refreshListJob(job, refreshContext = null) {
     comments: [],
     fetchedAt,
     pageKind: "list",
-    fetchMode: resolvedRefreshFetchMode(job, adapter)
+    fetchMode: resolvedRefreshFetchMode(job, adapter),
+    completeness: listCapture.completeness,
+    coverage: listCapture.coverage,
+    deferIndex: true
   });
-
-  const links = extractContentLinksFromList(listFetched.raw, listUrl, adapter)
-    .slice(0, Math.max(1, Number(job.maxItems) || 50));
+  const links = listCapture.links;
   const updatedItems = [];
   const skippedItems = [];
   const errors = [];
@@ -3959,12 +4243,14 @@ async function refreshListJob(job, refreshContext = null) {
         raw: contentFetched.raw,
         text: contentFetched.text,
         comments: contentFetched.comments || [],
+        commentsComplete: contentFetched.commentsComplete,
         sourceUpdatedAt: listUpdatedAt || contentFetched.sourceUpdatedAt,
         fetchedAt: new Date().toISOString(),
         pageKind: "content",
         fetchMode: resolvedRefreshFetchMode(job, adapter),
         managedBy: "subscription",
-        parentUrl: listUrl
+        parentUrl: listUrl,
+        deferIndex: true
       });
       const contentResult = {
         key: link.key || link.number || "",
@@ -3999,7 +4285,9 @@ async function refreshListJob(job, refreshContext = null) {
     errorCount: errors.length,
     updatedItems,
     skippedItems,
-    errors
+    errors,
+    completeness: listCapture.completeness,
+    coverage: listCapture.coverage
   };
 }
 
@@ -4034,6 +4322,12 @@ async function refreshContentJob(job, refreshContext = null) {
     };
   }
   validateTeamsConversationIdentity(job, fetched, adapter);
+  if (adapter.sourceType === "teams" && fetched.title && fetched.conversationId) {
+    const previousTitle = teamsConversationTitleForJob(job);
+    if (previousTitle && !areCaptureTitlesConsistent(previousTitle, fetched.title)) {
+      await updateRefreshJobState(job.id, { name: `${cleanText(fetched.title)} refresh` });
+    }
+  }
   const item = await upsertFetchedItem({
     title: fetched.title || job.name || job.url,
     sourceType: adapter.sourceType,
@@ -4042,6 +4336,7 @@ async function refreshContentJob(job, refreshContext = null) {
     raw: fetched.raw,
     text: fetched.text,
     comments: fetched.comments || [],
+    commentsComplete: fetched.commentsComplete,
     sourceUpdatedAt: fetched.sourceUpdatedAt || "",
     captureMethod: fetched.fetchMethod || resolvedRefreshFetchMode(job, adapter),
     httpValidators: fetched.httpValidators || {},
@@ -4082,7 +4377,7 @@ async function refreshContentJob(job, refreshContext = null) {
 
 function validateTeamsConversationIdentity(job, fetched, adapter = detectSourceAdapter(job?.url || "")) {
   if (adapter.sourceType !== "teams") return;
-  const expectedConversationId = decodeURIComponent(extractTeamsDeepPath(job?.url || "").match(/^\/l\/chat\/([^/]+)/i)?.[1] || "");
+  const expectedConversationId = extractTeamsConversationId(job?.url || "");
   const actualConversationId = cleanText(fetched?.conversationId || "");
   if (expectedConversationId && actualConversationId) {
     if (expectedConversationId === actualConversationId) return;
@@ -4179,6 +4474,8 @@ async function fetchUrlWithWebdriverForRefresh(url, job, adapter = detectSourceA
     pageKind: job.pageKind || "auto",
     session: refreshContext?.webdriverSession,
     page: refreshContext?.webdriverPage,
+    run: refreshContext?.run || null,
+    teamsConversationTitle: adapter.sourceType === "teams" ? teamsConversationTitleForJob(job) : "",
     maxGithubExpansionPasses: resolvePageKind(url, job.pageKind || "auto") === "content" ? 12 : 0,
     existingGithubComments
   };
@@ -4251,6 +4548,7 @@ async function readExistingGithubComments(url, adapter = detectSourceAdapter(url
 }
 
 function resolvedRefreshFetchMode(job, adapter) {
+  if (adapter.sourceType === "teams" && hasTeamsGraphCredentials(adapter)) return "fetch";
   if (requiresWebdriverExpansion(adapter)) return "webdriver";
   if (
     adapter.sourceType === "github"
@@ -4272,7 +4570,7 @@ async function updateRefreshJobState(id, patch) {
     ))
   };
   await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 }
 
 async function deleteRefreshJob(id) {
@@ -4287,7 +4585,7 @@ async function deleteRefreshJob(id) {
     refreshJobs: nextJobs
   };
   await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   return publicRefreshJobs();
 }
 
@@ -4305,7 +4603,7 @@ async function deleteRefreshJobItems(id) {
     if (!(await exists(metadataPath))) continue;
     const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
     if (!isRefreshJobCapturedItem(job, metadata)) continue;
-    await fs.rm(path.join(itemsDir, itemId), { recursive: true, force: true });
+    await store.delete(itemId);
     deletedItems.push({
       id: metadata.id || itemId,
       title: metadata.title || itemId,
@@ -4347,7 +4645,7 @@ async function deleteRefreshSourceItems(sourceType) {
     if (!(await exists(metadataPath))) continue;
     const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
     if (!isRefreshSourceCapturedItem(source, jobUrls, metadata)) continue;
-    await fs.rm(path.join(itemsDir, itemId), { recursive: true, force: true });
+    await store.delete(itemId);
     deletedItems.push({
       id: metadata.id || itemId,
       title: metadata.title || itemId,
@@ -4373,7 +4671,7 @@ async function deleteRefreshSourceItems(sourceType) {
     ))
   };
   await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   await rebuildIndexes();
   return {
     sourceType: source,
@@ -4413,6 +4711,7 @@ async function fetchUrl(url, options = {}) {
       const apiResult = await fetchUrlFromSourceApi(url, adapter, options);
       if (apiResult) return apiResult;
     } catch (error) {
+      if (options.signal?.aborted || error?.name === "AbortError") throw error;
       console.warn(`Source API fallback for ${url}:`, error.message || error);
     }
   }
@@ -4433,54 +4732,47 @@ async function fetchUrl(url, options = {}) {
       headers,
       signal: controller.signal
     });
+    if (response.status === 304) {
+      return {
+        notModified: true,
+        url: response.url || url,
+        httpValidators: options.validators || {},
+        fetchMethod: "http-304"
+      };
+    }
+    if (!response.ok) {
+      throw new Error(`Could not fetch URL: ${response.status} ${response.statusText}`);
+    }
+
+    assertSafeFetchedResponse(response, url);
+    const raw = await readResponseBodyLimited(response, MAX_FETCH_BYTES, controller.signal);
+    const extracted = extractByAdapter(raw, url, adapter, options.pageKind || "auto");
+    const title = extracted.title || extractTitle(raw);
+    assertFetchedPageIsAuthenticated({
+      adapter,
+      requestedUrl: url,
+      finalUrl: response.url || url,
+      title,
+      raw
+    });
+    return {
+      raw,
+      title,
+      text: extracted.text,
+      comments: extracted.comments || [],
+      sourceUpdatedAt: extracted.sourceUpdatedAt || "",
+      url: response.url || url,
+      fetchMethod: "html",
+      httpValidators: responseValidators(response)
+    };
   } catch (error) {
-    if (error?.name === "AbortError") throw new Error(`Fetch timed out after ${Math.round((Number(options.timeoutMs || FETCH_TIMEOUT_MS)) / 1000)}s: ${url}`);
+    if (options.signal?.aborted) throw new DOMException("Capture canceled", "AbortError");
+    if (controller.signal.aborted) throw new Error(`Fetch timed out after ${Math.round(Number(options.timeoutMs || FETCH_TIMEOUT_MS) / 1000)}s: ${url}`);
     throw error;
   } finally {
     clearTimeout(timer);
     options.signal?.removeEventListener?.("abort", abortFromCaller);
   }
-
-  if (response.status === 304) {
-    return {
-      notModified: true,
-      url: response.url || url,
-      httpValidators: options.validators || {},
-      fetchMethod: "http-304"
-    };
-  }
-  if (!response.ok) {
-    throw new Error(`Could not fetch URL: ${response.status} ${response.statusText}`);
-  }
-
-  assertSafeFetchedResponse(response, url);
-
-  const raw = await response.text();
-  if (Buffer.byteLength(raw, "utf8") > MAX_FETCH_BYTES) {
-    throw new Error(`Fetched page is larger than ${Math.round(MAX_FETCH_BYTES / 1024 / 1024)} MB: ${url}`);
-  }
-  const extracted = extractByAdapter(raw, url, adapter, options.pageKind || "auto");
-  const title = extracted.title || extractTitle(raw);
-  assertFetchedPageIsAuthenticated({
-    adapter,
-    requestedUrl: url,
-    finalUrl: response.url || url,
-    title,
-    raw
-  });
-  return {
-    raw,
-    title,
-    text: extracted.text,
-    comments: extracted.comments || [],
-    sourceUpdatedAt: extracted.sourceUpdatedAt || "",
-    url: response.url || url,
-    fetchMethod: "html",
-    httpValidators: {
-      etag: cleanText(response.headers.get("etag") || ""),
-      lastModified: cleanText(response.headers.get("last-modified") || "")
-    }
-  };
 }
 
 function assertSafeFetchedResponse(response, url) {
@@ -4503,14 +4795,17 @@ function responseValidators(response) {
 
 async function fetchUrlFromSourceApi(url, adapter, options = {}) {
   if (adapter.sourceType === "jira") return fetchJiraFromApi(url, adapter, options);
-  if (adapter.sourceType === "confluence") return fetchConfluenceFromApi(url, adapter);
+  if (adapter.sourceType === "confluence") return fetchConfluenceFromApi(url, adapter, options);
   if (adapter.sourceType === "github") return fetchGithubFromApi(url, adapter, options);
-  if (adapter.sourceType === "teams") return fetchTeamsFromGraph(url, adapter);
+  if (adapter.sourceType === "teams") return fetchTeamsFromGraph(url, adapter, options);
   return null;
 }
 
 async function requestSourceJson(url, adapter, options = {}) {
   const controller = new AbortController();
+  const abortFromCaller = () => controller.abort();
+  if (options.signal?.aborted) controller.abort();
+  options.signal?.addEventListener?.("abort", abortFromCaller, { once: true });
   const timer = setTimeout(() => controller.abort(), Number(options.timeoutMs || FETCH_TIMEOUT_MS));
   try {
     const response = await fetch(url, {
@@ -4532,11 +4827,11 @@ async function requestSourceJson(url, adapter, options = {}) {
       return { data: null, raw: "", response, notModified: true };
     }
     if (!response.ok) throw new Error(`Source API request failed: ${response.status} ${response.statusText}`);
-    const raw = await response.text();
-    if (Buffer.byteLength(raw, "utf8") > MAX_FETCH_BYTES) throw new Error("Source API response is too large.");
+    const raw = await readResponseBodyLimited(response, MAX_FETCH_BYTES, controller.signal);
     return { data: JSON.parse(raw), raw, response };
   } finally {
     clearTimeout(timer);
+    options.signal?.removeEventListener?.("abort", abortFromCaller);
   }
 }
 
@@ -4546,7 +4841,7 @@ async function requestSourceCollection(url, adapter, options = {}) {
   let firstResponse = null;
   let pages = 0;
   while (nextUrl && pages < 20 && values.length < 1000) {
-    const result = await requestSourceJson(nextUrl, adapter, pages === 0 ? options : {});
+    const result = await requestSourceJson(nextUrl, adapter, options);
     if (result.notModified) return result;
     if (!firstResponse) firstResponse = result.response;
     const pageValues = Array.isArray(result.data) ? result.data : Array.isArray(result.data?.value) ? result.data.value : [];
@@ -4556,11 +4851,14 @@ async function requestSourceCollection(url, adapter, options = {}) {
     nextUrl = cleanText(result.data?.["@odata.nextLink"] || linkNext || "");
     pages += 1;
   }
+  const truncated = Boolean(nextUrl) || values.length > 1000;
   return {
     data: values.slice(0, 1000),
     raw: JSON.stringify(values.slice(0, 1000), null, 2),
     response: firstResponse,
-    pageCount: pages
+    pageCount: pages,
+    truncated,
+    nextUrl: truncated ? nextUrl : ""
   };
 }
 
@@ -4570,10 +4868,11 @@ async function fetchJiraFromApi(url, adapter, options = {}) {
   if (!key && !filterId) return null;
   const origin = `https://${adapter.hostname}`;
   if (filterId) {
-    const filter = await requestSourceJson(`${origin}/rest/api/2/filter/${encodeURIComponent(filterId)}`, adapter);
+    const filter = await requestSourceJson(`${origin}/rest/api/2/filter/${encodeURIComponent(filterId)}`, adapter, options);
     const jql = filter.data?.jql;
     if (!jql) return null;
     const search = await requestSourceJson(`${origin}/rest/api/2/search`, adapter, {
+      ...options,
       method: "POST",
       body: { jql, maxResults: Math.max(1, Number(options.maxItems || 100)), fields: ["summary", "status", "assignee", "updated"] }
     });
@@ -4585,11 +4884,26 @@ async function fetchJiraFromApi(url, adapter, options = {}) {
       assignee: cleanText(issue.fields?.assignee?.displayName || issue.fields?.assignee?.name || ""),
       updated: cleanText(issue.fields?.updated || "")
     }));
-    return renderJiraApiFilter(url, adapter, filter.data, issues, search.raw);
+    return {
+      ...renderJiraApiFilter(url, adapter, filter.data, issues, search.raw),
+      completeness: Number(search.data?.total || issues.length) > issues.length ? "partial" : "complete",
+      coverage: {
+        observedCount: issues.length,
+        expectedCount: Number(search.data?.total || issues.length),
+        maxItems: Math.max(1, Number(options.maxItems || 100))
+      }
+    };
   }
-  const result = await requestSourceJson(`${origin}/rest/api/2/issue/${encodeURIComponent(key)}?expand=renderedFields,changelog&fields=*all`, adapter);
-  const commentResult = await requestSourceJson(`${origin}/rest/api/2/issue/${encodeURIComponent(key)}/comment?maxResults=1000`, adapter);
-  return renderJiraApiIssue(url, adapter, result.data, JSON.stringify({ issue: result.data, comments: commentResult.data }, null, 2), commentResult.data?.comments || []);
+  const result = await requestSourceJson(`${origin}/rest/api/2/issue/${encodeURIComponent(key)}?expand=renderedFields,changelog&fields=*all`, adapter, options);
+  const commentResult = await requestSourceJson(`${origin}/rest/api/2/issue/${encodeURIComponent(key)}/comment?maxResults=1000`, adapter, options);
+  const comments = commentResult.data?.comments || [];
+  const commentsComplete = Number(commentResult.data?.total || comments.length) <= comments.length;
+  return {
+    ...renderJiraApiIssue(url, adapter, result.data, JSON.stringify({ issue: result.data, comments: commentResult.data }, null, 2), comments),
+    commentsComplete,
+    completeness: commentsComplete ? "complete" : "partial",
+    coverage: { observedCount: comments.length, expectedCount: Number(commentResult.data?.total || comments.length) }
+  };
 }
 
 function renderJiraApiFilter(url, adapter, filter, issues, raw) {
@@ -4601,7 +4915,10 @@ function renderJiraApiFilter(url, adapter, filter, issues, raw) {
     comments: [],
     sourceUpdatedAt: latestTimestampValue(issues.map((issue) => issue.updated)),
     url,
-    fetchMethod: "jira-rest"
+    fetchMethod: "jira-rest",
+    entries: issues,
+    completeness: "complete",
+    coverage: { observedCount: issues.length }
   };
 }
 
@@ -4633,7 +4950,7 @@ function renderJiraApiIssue(url, adapter, issue, raw, apiComments = []) {
   };
 }
 
-async function fetchConfluenceFromApi(url, adapter) {
+async function fetchConfluenceFromApi(url, adapter, options = {}) {
   const parsed = new URL(url);
   let pageId = parsed.searchParams.get("pageId") || "";
   const origin = `https://${adapter.hostname}`;
@@ -4647,12 +4964,20 @@ async function fetchConfluenceFromApi(url, adapter) {
     }
     if (!spaceKey || !title) return null;
     const query = new URLSearchParams({ type: "page", spaceKey, title, limit: "1" });
-    const lookup = await requestSourceJson(`${origin}/rest/api/content?${query}`, adapter);
+    const lookup = await requestSourceJson(`${origin}/rest/api/content?${query}`, adapter, options);
     pageId = lookup.data?.results?.[0]?.id || "";
   }
   if (!pageId) return null;
-  const result = await requestSourceJson(`${origin}/rest/api/content/${encodeURIComponent(pageId)}?expand=body.storage,version,space,metadata.labels`, adapter);
-  const commentResult = await requestSourceJson(`${origin}/rest/api/content/${encodeURIComponent(pageId)}/child/comment?limit=200&expand=body.storage,version`, adapter).catch(() => ({ data: { results: [] } }));
+  const result = await requestSourceJson(`${origin}/rest/api/content/${encodeURIComponent(pageId)}?expand=body.storage,version,space,metadata.labels`, adapter, options);
+  let commentResult;
+  let commentsFetchFailed = false;
+  try {
+    commentResult = await requestSourceJson(`${origin}/rest/api/content/${encodeURIComponent(pageId)}/child/comment?limit=200&expand=body.storage,version`, adapter, options);
+  } catch (error) {
+    if (options.signal?.aborted || error?.name === "AbortError") throw error;
+    commentsFetchFailed = true;
+    commentResult = { data: { results: [] } };
+  }
   const page = result.data || {};
   const bodyHtml = page.body?.storage?.value || "";
   const comments = (commentResult.data?.results || []).map((comment) => ({
@@ -4670,7 +4995,10 @@ async function fetchConfluenceFromApi(url, adapter) {
     sourceUpdatedAt: cleanText(page.version?.when || (page.version?.number ? `version:${page.version.number}` : "")),
     url,
     fetchMethod: "confluence-rest",
-    httpValidators: responseValidators(result.response)
+    httpValidators: responseValidators(result.response),
+    commentsComplete: !commentsFetchFailed && !commentResult.data?._links?.next,
+    completeness: commentsFetchFailed || commentResult.data?._links?.next ? "partial" : "complete",
+    coverage: { observedCount: comments.length, commentsFetchFailed, truncated: Boolean(commentResult.data?._links?.next) }
   };
 }
 
@@ -4684,6 +5012,7 @@ async function fetchGithubFromApi(url, adapter, options = {}) {
     apiUrl.searchParams.set("all", "true");
     apiUrl.searchParams.set("per_page", String(Math.max(1, Math.min(100, Number(options.maxItems || 50)))));
     const result = await requestSourceCollection(apiUrl, adapter, {
+      ...options,
       headers: {
         ...(options.validators?.etag ? { "If-None-Match": options.validators.etag } : {}),
         ...(options.validators?.lastModified ? { "If-Modified-Since": options.validators.lastModified } : {})
@@ -4697,32 +5026,38 @@ async function fetchGithubFromApi(url, adapter, options = {}) {
       repository: cleanText(item.repository?.full_name || ""), updatedAt: cleanText(item.updated_at || ""), status: item.unread ? "unread" : "read"
     }));
     const title = "GitHub Notifications";
-    return { raw: result.raw, title, text: [`# ${title}`, "", `Source: ${url}`, `Adapter: ${adapter.id}-api`, "", "## Notifications", "", ...notifications.map((item) => `- [${item.title}](${item.href}) ${[item.repository, item.status, item.updatedAt && `updated: ${item.updatedAt}`].filter(Boolean).join(" · ")}`)].join("\n"), comments: [], sourceUpdatedAt: latestTimestampValue(notifications.map((item) => item.updatedAt)), url, fetchMethod: "github-rest", httpValidators: responseValidators(result.response) };
+    return { raw: result.raw, title, text: [`# ${title}`, "", `Source: ${url}`, `Adapter: ${adapter.id}-api`, "", "## Notifications", "", ...notifications.map((item) => `- [${item.title}](${item.href}) ${[item.repository, item.status, item.updatedAt && `updated: ${item.updatedAt}`].filter(Boolean).join(" · ")}`)].join("\n"), comments: [], sourceUpdatedAt: latestTimestampValue(notifications.map((item) => item.updatedAt)), url, fetchMethod: "github-rest", httpValidators: responseValidators(result.response), entries: notifications, completeness: result.truncated ? "partial" : "complete", coverage: { observedCount: notifications.length, pageCount: result.pageCount, nextCursor: result.nextUrl || "" } };
   }
   const match = safePathname(url).match(/^\/([^/]+)\/([^/]+)\/(issues|pull|discussions)\/(\d+)/i);
   if (!match || match[3].toLowerCase() === "discussions") return null;
   const [, owner, repo, kind, number] = match;
   const resource = kind.toLowerCase() === "pull" ? "pulls" : "issues";
-  const issueResult = await requestSourceJson(`${origin}/api/v3/repos/${owner}/${repo}/${resource}/${number}`, adapter);
-  const commentsResult = await requestSourceCollection(`${origin}/api/v3/repos/${owner}/${repo}/issues/${number}/comments?per_page=100`, adapter);
+  const issueResult = await requestSourceJson(`${origin}/api/v3/repos/${owner}/${repo}/${resource}/${number}`, adapter, options);
+  const commentsResult = await requestSourceCollection(`${origin}/api/v3/repos/${owner}/${repo}/issues/${number}/comments?per_page=100`, adapter, options);
   const issue = issueResult.data || {};
   const comments = (commentsResult.data || []).map((comment) => ({ id: String(comment.id || ""), author: cleanText(comment.user?.login || ""), createdAt: cleanText(comment.created_at || ""), body: cleanText(comment.body || ""), url: cleanText(comment.html_url || "") }));
   const title = `${owner}/${repo}#${number} ${cleanText(issue.title || "")}`;
-  return { raw: JSON.stringify({ issue, comments: commentsResult.data }, null, 2), title, text: [`# ${title}`, "", `Source: ${url}`, `Adapter: ${adapter.id}-api`, "", "## Fields", "", `- State: ${issue.state || "unknown"}`, `- Author: ${issue.user?.login || ""}`, `- Updated: ${issue.updated_at || ""}`, `- Labels: ${(issue.labels || []).map((label) => label.name).join(", ")}`, "", "## Description", "", cleanText(issue.body || "") || "_No description captured._", "", "## Comments", "", ...(comments.length ? comments.map((comment) => `### ${comment.author} · ${comment.createdAt}\n\n${comment.body}`) : ["_No comments captured._"])].join("\n"), comments, sourceUpdatedAt: latestTimestampValue([issue.updated_at, ...comments.map((comment) => comment.createdAt)]), url: issue.html_url || url, fetchMethod: "github-rest", httpValidators: responseValidators(issueResult.response) };
+  const isPullRequest = resource === "pulls";
+  return { raw: JSON.stringify({ issue, comments: commentsResult.data }, null, 2), title, text: [`# ${title}`, "", `Source: ${url}`, `Adapter: ${adapter.id}-api`, "", "## Fields", "", `- State: ${issue.state || "unknown"}`, `- Author: ${issue.user?.login || ""}`, `- Updated: ${issue.updated_at || ""}`, `- Labels: ${(issue.labels || []).map((label) => label.name).join(", ")}`, "", "## Description", "", cleanText(issue.body || "") || "_No description captured._", "", "## Comments", "", ...(comments.length ? comments.map((comment) => `### ${comment.author} · ${comment.createdAt}\n\n${comment.body}`) : ["_No comments captured._"])].join("\n"), comments, sourceUpdatedAt: latestTimestampValue([issue.updated_at, ...comments.map((comment) => comment.createdAt)]), url: issue.html_url || url, fetchMethod: "github-rest", httpValidators: responseValidators(issueResult.response), commentsComplete: !commentsResult.truncated, completeness: isPullRequest || commentsResult.truncated ? "partial" : "complete", coverage: { observedCount: comments.length, truncated: commentsResult.truncated, missing: isPullRequest ? ["pull reviews", "review comments"] : [] } };
 }
 
-async function fetchTeamsFromGraph(url, adapter) {
+async function fetchTeamsFromGraph(url, adapter, options = {}) {
   const profile = settings.sources?.[adapter.hostname] || {};
   if (profile.authMode !== "bearer" || !profile.token) return null;
   const deepPath = extractTeamsDeepPath(url);
   const chatId = decodeURIComponent(deepPath.match(/^\/l\/chat\/([^/]+)/i)?.[1] || "");
   if (!chatId) return null;
   const graphAdapter = { ...adapter, hostname: "teams.microsoft.com" };
-  const chatResult = await requestSourceJson(`https://graph.microsoft.com/v1.0/chats/${encodeURIComponent(chatId)}`, graphAdapter, { headers: { Authorization: `Bearer ${profile.token}` } });
-  const result = await requestSourceCollection(`https://graph.microsoft.com/v1.0/chats/${encodeURIComponent(chatId)}/messages?$top=50`, graphAdapter, { headers: { Authorization: `Bearer ${profile.token}` } });
+  const chatResult = await requestSourceJson(`https://graph.microsoft.com/v1.0/chats/${encodeURIComponent(chatId)}`, graphAdapter, { ...options, headers: { Authorization: `Bearer ${profile.token}` } });
+  const result = await requestSourceCollection(`https://graph.microsoft.com/v1.0/chats/${encodeURIComponent(chatId)}/messages?$top=50`, graphAdapter, { ...options, headers: { Authorization: `Bearer ${profile.token}` } });
   const comments = (result.data || []).map((message) => ({ id: String(message.id || ""), author: cleanText(message.from?.user?.displayName || message.from?.application?.displayName || ""), createdAt: cleanText(message.createdDateTime || message.lastModifiedDateTime || ""), body: cleanText(htmlToText(message.body?.content || "")), url: cleanText(message.webUrl || url) })).filter((message) => message.body);
   const title = cleanText(chatResult.data?.topic || `Teams ${chatId.slice(0, 18)}`);
-  return { raw: result.raw, title, text: renderTeamsTextFromComments(title, url, adapter, comments), comments, sourceUpdatedAt: latestTimestampValue(comments.map((comment) => comment.createdAt)), url: canonicalizeMaterialUrl(url), fetchMethod: "microsoft-graph", conversationId: chatId };
+  return { raw: result.raw, title, text: renderTeamsTextFromComments(title, url, adapter, comments), comments, sourceUpdatedAt: latestTimestampValue(comments.map((comment) => comment.createdAt)), url: canonicalizeMaterialUrl(url), fetchMethod: "microsoft-graph", conversationId: chatId, completeness: result.truncated ? "partial" : "complete", coverage: { observedCount: comments.length, pageCount: result.pageCount, truncated: result.truncated }, identityEvidence: { method: "graph-chat-id", conversationId: chatId, verified: true } };
+}
+
+function hasTeamsGraphCredentials(adapter) {
+  const profile = settings.sources?.[adapter.hostname] || {};
+  return adapter.sourceType === "teams" && profile.authMode === "bearer" && Boolean(profile.token);
 }
 
 async function fetchUrlWithWebdriver(url, options = {}) {
@@ -4733,44 +5068,60 @@ async function fetchUrlWithWebdriver(url, options = {}) {
       const apiResult = await fetchUrlFromSourceApi(url, adapter, options);
       if (apiResult) return apiResult;
     } catch (error) {
+      if (options.signal?.aborted || error?.name === "AbortError") throw error;
       console.warn(`Source API fallback to WebDriver for ${url}:`, error.message || error);
     }
   }
+  const existingSession = options.session || webdriverSessions.get(adapter.hostname);
   const session = options.session || await ensureWebdriverSession(adapter.hostname, url, {
-    headed: Boolean(options.headed),
-    autoClose: options.keepSession !== true,
+    headed: adapter.sourceType === "teams" ? true : Boolean(options.headed),
+    manual: adapter.sourceType === "teams",
+    autoClose: adapter.sourceType === "teams" ? false : options.keepSession !== true,
     windowMode: adapter.sourceType === "teams" ? "normal" : undefined
   });
+  const ownsSession = !options.session && !existingSession;
+  session.activeOperations = Number(session.activeOperations || 0) + 1;
+  if (ownsSession && session.autoClose) session.closeWhenIdle = true;
+  // One persistent browser page represents a hostname. Serialize navigation
+  // across preview, direct refresh, and scheduled refresh callers.
+  try {
+    return await withWebdriverSessionQueue(session, () => fetchUrlWithWebdriverInSession(url, { ...options, session }));
+  } finally {
+    session.activeOperations = Math.max(0, Number(session.activeOperations || 1) - 1);
+    if (shouldCloseOwnedWebdriverSession(session, ownsSession)) await closeWebdriverSession(session);
+  }
+}
+
+async function fetchUrlWithWebdriverInSession(url, options = {}) {
+  const adapter = detectSourceAdapter(url);
+  const session = options.session;
   try {
     const page = options.page && !options.page.isClosed()
       ? options.page
       : await ensureSessionPage(session);
     session.page = page;
-    const navigationUrl = adapter.sourceType === "teams" ? normalizeTeamsNavigationUrl(url) : url;
-    if (adapter.sourceType === "teams") {
-      // Refresh batches reuse one page across multiple Teams conversations.
-      // Navigating between two `https://teams.microsoft.com/v2/#/l/chat/...` URLs
-      // is a same-document hash change, so the SPA switches conversations
-      // asynchronously while the previous conversation's header and messages
-      // linger in the DOM — causing titles and captured content to cross
-      // between jobs. Reset to a blank document first so the target loads as a
-      // fresh cross-document navigation, guaranteeing the header and messages
-      // belong to the requested conversation.
-      if (safeHostname(page.url()) === "teams.microsoft.com" || safeHostname(page.url()) === "teams.cloud.microsoft") {
-        try {
-          await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: 15000 });
-        } catch {
-          // Best-effort reset; the target navigation below still loads fresh.
-        }
-      }
-    } else if (adapter.sourceType === "github" && resolvePageKind(url, options.pageKind || "auto") === "content") {
+    if (adapter.sourceType === "teams" && !session.teamsUserConfirmedAt) {
+      await prepareTeamsRefreshGroup(page, adapter, options.run || null, session);
+    }
+    const navigationUrl = url;
+    if (adapter.sourceType === "github" && resolvePageKind(url, options.pageKind || "auto") === "content") {
       try {
         await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: 10000 });
       } catch {
         // Best-effort reset to avoid stale GitHub SPA state before the next issue/PR.
       }
     }
-    await navigateWebdriverPage(page, navigationUrl, adapter);
+    let teamsLocation = null;
+    if (adapter.sourceType === "teams") {
+      teamsLocation = await openTeamsConversationFromUi(page, {
+        title: options.teamsConversationTitle,
+        url,
+        run: options.run || null,
+        signal: options.signal
+      });
+    } else {
+      await navigateWebdriverPage(page, navigationUrl, adapter);
+    }
     await ensureWebdriverPageAuthenticated(page, navigationUrl, adapter);
     await waitForJiraIssueNavigator(page, adapter, options.pageKind || "auto");
     await expandGithubDynamicContent(page, adapter, options.pageKind || "auto", {
@@ -4778,7 +5129,12 @@ async function fetchUrlWithWebdriver(url, options = {}) {
       existingComments: options.existingGithubComments || []
     });
     if (adapter.sourceType === "teams") {
-      return await fetchTeamsWithWebdriver(page, url, adapter);
+      return await fetchTeamsWithWebdriver(page, url, adapter, {
+        signal: options.signal || options.run?.abortController?.signal,
+        expectedTitle: teamsLocation?.title || options.teamsConversationTitle,
+        locatedConversationId: teamsLocation?.conversationId || "",
+        identityVerifiedById: Boolean(teamsLocation?.identityVerifiedById)
+      });
     }
     const raw = await page.content();
     const currentUrl = page.url();
@@ -4801,11 +5157,7 @@ async function fetchUrlWithWebdriver(url, options = {}) {
       url: currentUrl,
       fetchMethod: "webdriver"
     };
-  } finally {
-    if (!options.session && session.autoClose) {
-      await closeWebdriverSession(session);
-    }
-  }
+  } finally {}
 }
 
 function assertFetchedPageIsAuthenticated({ adapter, requestedUrl, finalUrl, title, raw }) {
@@ -4932,30 +5284,280 @@ async function waitForRecoveredNavigation(page, navigationUrl, adapter, original
   }
 }
 
-async function fetchTeamsWithWebdriver(page, url, adapter) {
-  await resolveTeamsLauncher(page, url);
+async function fetchTeamsWithWebdriver(page, url, adapter, options = {}) {
+  if (options.signal?.aborted) throw new DOMException("Capture canceled", "AbortError");
   await waitForTeamsConversation(page);
   const stableUrl = canonicalizeMaterialUrl(url) || page.url() || url;
   const previousComments = await readExistingTeamsComments(stableUrl);
   const observedMessages = await scrollTeamsMessages(page, {
     maxScrolls: 18,
     previousMessages: previousComments,
-    minScrollsBeforeOverlapStop: 2
+    minScrollsBeforeOverlapStop: 2,
+    expectedTitle: options.expectedTitle,
+    signal: options.signal
   });
-  const raw = await page.content();
+  if (options.signal?.aborted) throw new DOMException("Capture canceled", "AbortError");
   const currentUrl = page.url();
+  const currentId = extractTeamsConversationId(currentUrl);
+  const expectedId = extractTeamsConversationId(stableUrl);
+  if (currentId && expectedId && currentId !== expectedId) throw new Error("Teams 当前群组与目标会话 ID 不一致，已停止抓取。");
   const finalUrl = stableUrl || currentUrl || url;
   const extracted = await extractTeamsFromPage(page, finalUrl, adapter, observedMessages);
+  if (options.expectedTitle && !areCaptureTitlesConsistent(options.expectedTitle, extracted.title || "")) {
+    throw new Error(`Teams 对话定位失败：目标“${options.expectedTitle}”，当前聊天“${extracted.title || "未知"}”。已阻止抓取。`);
+  }
   validateTeamsExtraction(extracted, finalUrl);
   return {
-    raw,
+    raw: JSON.stringify({ title: extracted.title, messages: extracted.comments, coverage: observedMessages.coverage || {} }, null, 2),
     title: extracted.title || await page.title(),
     text: extracted.text,
     comments: extracted.comments || [],
     sourceUpdatedAt: extracted.sourceUpdatedAt || "",
     url: finalUrl,
-    fetchMethod: "webdriver"
+    fetchMethod: "webdriver",
+    completeness: "partial",
+    coverage: { ...(observedMessages.coverage || {}), observedCount: extracted.comments?.length || 0 },
+    identityEvidence: { method: options.identityVerifiedById ? "conversation-list-id" : "title-only", conversationId: options.locatedConversationId || currentId, verified: Boolean(options.identityVerifiedById) },
+    conversationId: cleanText(options.locatedConversationId || currentId)
   };
+}
+
+function teamsConversationTitleForJob(job) {
+  const title = cleanText(job?.name || "").replace(/\s+refresh$/i, "").trim();
+  if (!title || /^Teams conversation$/i.test(title)) return "";
+  return title;
+}
+
+async function openTeamsConversationFromUi(page, options = {}) {
+  if (options.signal?.aborted || options.run?.abortController?.signal.aborted) throw new DOMException("Capture canceled", "AbortError");
+  const targetTitle = cleanText(options.title || "");
+  const conversationId = extractTeamsConversationId(options.url || "");
+  if (!targetTitle && !conversationId) {
+    throw new Error("Teams 任务缺少可用于页面定位的对话名称。请把订阅名称改为 Teams 中显示的聊天名称后重试。");
+  }
+
+  if (options.run) {
+    updateRefreshRun(options.run, {
+      status: "running",
+      currentJobName: `正在 Teams 中定位：${targetTitle}`
+    });
+  }
+
+  const currentTitle = await currentTeamsConversationTitle(page);
+  if (!conversationId && currentTitle && targetTitle && areCaptureTitlesConsistent(targetTitle, currentTitle)) {
+    return { title: currentTitle, conversationId: "", identityVerifiedById: false };
+  }
+
+  await activateTeamsChatArea(page);
+  const directIdMatch = conversationId ? await clickTeamsConversationById(page, conversationId) : null;
+  if (directIdMatch?.clicked) {
+    if (!await waitForTeamsConversationTitle(page, directIdMatch.title)) {
+      throw new Error(`Teams 会话 ID 已命中，但聊天标题未切换到“${directIdMatch.title}”。已停止抓取。`);
+    }
+    await waitForTeamsConversation(page);
+    await closeTeamsChatListFilter(page);
+    return {
+      title: await currentTeamsConversationTitle(page),
+      conversationId,
+      identityVerifiedById: true
+    };
+  }
+  if (!conversationId && await clickTeamsConversationCandidate(page, targetTitle)) {
+    if (await waitForTeamsConversationTitle(page, targetTitle)) {
+      return { title: targetTitle, conversationId: "", identityVerifiedById: false };
+    }
+  }
+
+  if (targetTitle && await filterTeamsChatList(page, targetTitle)) {
+    const filteredIdMatch = conversationId ? await clickTeamsConversationById(page, conversationId) : null;
+    if (filteredIdMatch?.clicked) {
+      if (!await waitForTeamsConversationTitle(page, filteredIdMatch.title)) {
+        throw new Error(`Teams 筛选结果命中会话 ID，但聊天标题未切换到“${filteredIdMatch.title}”。已停止抓取。`);
+      }
+      await waitForTeamsConversation(page);
+      await closeTeamsChatListFilter(page);
+      return {
+        title: await currentTeamsConversationTitle(page),
+        conversationId,
+        identityVerifiedById: true
+      };
+    }
+    if (!conversationId && await clickTeamsConversationCandidate(page, targetTitle)
+      && await waitForTeamsConversationTitle(page, targetTitle)) {
+      await closeTeamsChatListFilter(page);
+      return { title: targetTitle, conversationId: "", identityVerifiedById: false };
+    }
+  }
+
+  throw new Error([
+    `无法在 Teams 页面中定位目标对话“${targetTitle}”。`,
+    "已停止抓取且没有打开深链接或新窗口。",
+    "请确认订阅名称与 Teams 聊天列表中显示的名称一致。"
+  ].join(" "));
+}
+
+async function clickTeamsConversationById(page, conversationId) {
+  return page.evaluate((expectedId) => {
+    const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+    const candidates = [...document.querySelectorAll("[data-fui-tree-item-value]")]
+      .filter((element) => {
+        const value = String(element.getAttribute("data-fui-tree-item-value") || "");
+        return value === expectedId || (value.match(/19:[^\s"'<>/]+@(?:thread\.v2|thread\.tacv2|unq\.gbl\.spaces)(?=$|[\s"'<>/])/g) || []).includes(expectedId);
+      })
+      .filter((element) => element instanceof HTMLElement)
+      .filter((element) => {
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+      });
+    const target = candidates.length === 1 ? candidates[0] : null;
+    if (!target) return { clicked: false, title: "" };
+    const title = clean(target.innerText || target.textContent);
+    if (!title) return { clicked: false, title: "" };
+    target.scrollIntoView({ block: "center", inline: "nearest" });
+    target.click();
+    return { clicked: true, title };
+  }, conversationId).catch(() => ({ clicked: false, title: "" }));
+}
+
+async function activateTeamsChatArea(page) {
+  const selectors = [
+    "[data-tid='app-bar-item-chat']",
+    "[data-tid='app-bar-item-Chat']",
+    "[data-tid*='app-bar'][data-tid*='chat']",
+    "button[aria-label='Chat']",
+    "button[aria-label^='Chat ']",
+    "button[aria-label='聊天']",
+    "button[aria-label^='聊天 ']",
+    "a[aria-label='Chat']",
+    "a[aria-label='聊天']"
+  ];
+  for (const selector of selectors) {
+    try {
+      const target = page.locator(selector).first();
+      if (!await target.isVisible({ timeout: 500 })) continue;
+      const alreadySelected = await target.evaluate((element) => {
+        const selected = element.getAttribute("aria-pressed") === "true"
+          || element.getAttribute("aria-selected") === "true"
+          || element.getAttribute("data-is-selected") === "true"
+          || Boolean(element.querySelector("[aria-pressed='true'], [aria-selected='true']"));
+        return selected;
+      }).catch(() => false);
+      if (alreadySelected) return true;
+      await target.click({ timeout: 3000 });
+      await page.waitForTimeout(1200);
+      return true;
+    } catch {
+      // Teams changes app-bar attributes frequently; try the next stable label.
+    }
+  }
+  return false;
+}
+
+async function clickTeamsConversationCandidate(page, targetTitle) {
+  return page.evaluate((expected) => {
+    const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+    const normalized = clean(expected).toLocaleLowerCase();
+    const selectors = [
+      "[role='treeitem']",
+      "[role='option']",
+      "[role='row']",
+      "[data-tid*='chat-list-item']",
+      "[data-tid*='chat-item']",
+      "[data-tid*='conversation-list-item']",
+      "a[href*='/l/chat/']"
+    ].join(",");
+    const candidates = [...document.querySelectorAll(selectors)]
+      .filter((element) => element instanceof HTMLElement)
+      .filter((element) => {
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+      });
+    if (!normalized) return false;
+    const matches = candidates.filter((element) => clean(element.innerText || element.textContent).toLocaleLowerCase() === normalized);
+    const target = matches.length === 1 ? matches[0] : null;
+    if (!target) return false;
+    target.scrollIntoView({ block: "center", inline: "nearest" });
+    target.click();
+    return true;
+  }, targetTitle).catch(() => false);
+}
+
+async function filterTeamsChatList(page, targetTitle) {
+  const inputSelectors = [
+    "input[aria-label='Filter by person, chat or channel name']",
+    "input[placeholder='Filter by person, chat or channel name']"
+  ];
+  let filterInput = await firstVisibleTeamsLocator(page, inputSelectors);
+  if (!filterInput) {
+    const buttonSelectors = [
+      "button[aria-label^='Show filter text box']",
+      "button[title^='Show filter text box']"
+    ];
+    const filterButton = await firstVisibleTeamsLocator(page, buttonSelectors);
+    if (!filterButton) return false;
+    await filterButton.click({ timeout: 3000 });
+    await page.waitForTimeout(500);
+    filterInput = await firstVisibleTeamsLocator(page, inputSelectors);
+  }
+  if (!filterInput) return false;
+  await filterInput.fill(targetTitle, { timeout: 5000 });
+  await page.waitForTimeout(1000);
+  return true;
+}
+
+async function closeTeamsChatListFilter(page) {
+  const input = await firstVisibleTeamsLocator(page, [
+    "input[aria-label='Filter by person, chat or channel name']",
+    "input[placeholder='Filter by person, chat or channel name']"
+  ]);
+  if (input) await input.fill("").catch(() => {});
+  const closeButton = await firstVisibleTeamsLocator(page, [
+    "button[aria-label^='Close filter text box']",
+    "button[title^='Close filter text box']"
+  ]);
+  if (closeButton) await closeButton.click({ timeout: 2000 }).catch(() => {});
+}
+
+async function firstVisibleTeamsLocator(page, selectors) {
+  for (const selector of selectors) {
+    const locator = page.locator(selector).first();
+    if (await locator.isVisible({ timeout: 500 }).catch(() => false)) return locator;
+  }
+  return null;
+}
+
+async function waitForTeamsConversationTitle(page, expectedTitle) {
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    const actualTitle = await currentTeamsConversationTitle(page);
+    if (actualTitle && areCaptureTitlesConsistent(expectedTitle, actualTitle)) {
+      await waitForTeamsConversation(page);
+      return true;
+    }
+    await page.waitForTimeout(500);
+  }
+  return false;
+}
+
+async function currentTeamsConversationTitle(page) {
+  return page.evaluate(() => {
+    const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+    const selectors = [
+      "[data-tid='chat-title']",
+      "[data-tid='conversation-header-title']",
+      "[data-tid='channel-name']",
+      "[data-tid*='conversation-header'] [role='heading']",
+      "main [role='heading'][aria-level='1']",
+      "main h1"
+    ];
+    for (const selector of selectors) {
+      const title = clean(document.querySelector(selector)?.textContent);
+      if (title) return title;
+    }
+    return "";
+  }).catch(() => "");
 }
 
 async function readExistingTeamsComments(url) {
@@ -4985,51 +5587,8 @@ function validateTeamsExtraction(extracted, url) {
   }
 }
 
-async function resolveTeamsLauncher(page, originalUrl) {
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const current = page.url();
-    const launchUrl = extractTeamsLaunchTarget(current) || extractTeamsLaunchTarget(originalUrl);
-    if (launchUrl && safeHostname(current) !== "teams.microsoft.com") {
-      await page.goto(launchUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-      await page.waitForTimeout(1500);
-      continue;
-    }
-
-    const clicked = await clickTeamsLauncherButton(page);
-    if (!clicked) break;
-    await page.waitForTimeout(2500);
-  }
-}
-
-function extractTeamsLaunchTarget(url) {
-  try {
-    const parsed = new URL(url);
-    if (parsed.hostname === "teams.cloud.microsoft" && /^\/l\/(?:chat|channel)\//i.test(parsed.pathname)) {
-      return "";
-    }
-    const target = parsed.searchParams.get("url") || parsed.searchParams.get("deeplink");
-    if (!target) return "";
-    const decoded = decodeURIComponent(target);
-    if (/^\/_#\//.test(decoded) || /^\/l\/(?:chat|channel)\//i.test(decoded)) {
-      return `https://teams.cloud.microsoft${decoded}`;
-    }
-    if (/^_#\//.test(decoded)) {
-      return `https://teams.cloud.microsoft/${decoded}`;
-    }
-    if (/https:\/\/teams\.cloud\.microsoft\//i.test(decoded)) return decoded;
-    if (/https:\/\/teams\.microsoft\.com\//i.test(decoded)) {
-      return decoded.replace(/^https:\/\/teams\.microsoft\.com/i, "https://teams.cloud.microsoft");
-    }
-    return "";
-  } catch {
-    return "";
-  }
-}
-
-function normalizeTeamsNavigationUrl(url) {
-  const deepPath = extractTeamsDeepPath(url);
-  if (!deepPath) return url;
-  return `https://teams.microsoft.com/v2/#${deepPath}`;
+function extractTeamsConversationId(url) {
+  try { return decodeURIComponent(extractTeamsDeepPath(url).match(/^\/l\/chat\/([^/?#]+)/i)?.[1] || ""); } catch { return ""; }
 }
 
 function extractTeamsDeepPath(url) {
@@ -5061,34 +5620,6 @@ function extractTeamsDeepPath(url) {
   } catch {
     return "";
   }
-}
-
-async function clickTeamsLauncherButton(page) {
-  const labels = [
-    "继续此浏览器",
-    "在此浏览器中继续",
-    "使用 Web 应用",
-    "使用网页版",
-    "加入对话",
-    "打开 Teams",
-    "Continue on this browser",
-    "Use the web app",
-    "Join conversation",
-    "Open Teams",
-    "Launch it now"
-  ];
-  for (const label of labels) {
-    try {
-      const locator = page.getByText(label, { exact: false }).first();
-      if (await locator.count()) {
-        await locator.click({ timeout: 3000 });
-        return true;
-      }
-    } catch {
-      // Try the next possible launcher label.
-    }
-  }
-  return false;
 }
 
 async function openWebdriverSession(url, hostname) {
@@ -5141,7 +5672,7 @@ async function saveWebdriverCookies(url, hostname) {
     }
   };
   await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 
   return {
     hostname: adapter.hostname,
@@ -5162,7 +5693,7 @@ async function ensureWebdriverSession(hostname, url, options = {}) {
   const windowMode = normalizeWebdriverWindowMode(normalizedOptions.windowMode || profile.webdriverWindowMode);
   const existing = webdriverSessions.get(key);
   if (existing) {
-    if ((headed && existing.headless) || existing.windowMode !== windowMode) {
+    if ((headed && existing.headless) || (manual && !existing.manual) || existing.windowMode !== windowMode) {
       await existing.context.close();
     } else {
       return existing;
@@ -5458,122 +5989,16 @@ async function clickGithubLoadMore(page) {
 }
 
 async function waitForTeamsConversation(page) {
-  try {
-    await page.waitForLoadState("networkidle", { timeout: 15000 });
-  } catch {
-    // Teams often keeps background requests open.
-  }
-  try {
-    await page.waitForSelector([
-      "[data-tid*='message']",
-      "[role='main']",
-      "[data-tid='chat-pane-list']",
-      "[aria-label*='Message']",
-      "[aria-label*='消息']"
-    ].join(","), { timeout: 30000 });
-  } catch {
-    // Keep current DOM; extractor will produce a review note if no messages are visible.
-  }
+  // Teams keeps long-lived network requests open; wait for message DOM instead.
+  await page.waitForSelector("[data-mid], [data-tid='chat-pane-message'], [data-tid='message-container']", { state: "visible", timeout: 20000 });
 }
 
 async function readVisibleTeamsMessages(page) {
-  return page.evaluate(() => {
-    const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
-    const pickTitle = () => {
-      const selectors = [
-        "[data-tid='channel-name']",
-        "[data-tid='chat-title']",
-        "[data-tid='conversation-header-title']",
-        "h1",
-        "[role='heading']"
-      ];
-      for (const selector of selectors) {
-        const text = clean(document.querySelector(selector)?.textContent);
-        if (text) return text;
-      }
-      return clean(document.title) || "Microsoft Teams conversation";
-    };
-    const messageSelectors = [
-      "[data-tid='chat-pane-message']",
-      "[data-tid='chat-pane-item']",
-      "[data-tid='message-container']",
-      "[data-tid*='message-item']",
-      "[data-tid*='message'][role='listitem']",
-      "[data-mid]",
-      "[role='listitem'][aria-label*='message' i]",
-      "[role='listitem'][aria-label*='消息']"
-    ];
-    const candidates = [...document.querySelectorAll(messageSelectors.join(","))]
-      .filter((node) => node instanceof HTMLElement && clean(node.textContent).length > 8);
-    const nodes = candidates.filter((node, index, list) => (
-      list.findIndex((candidate) => candidate !== node && candidate.contains(node)) === -1
-        && list.findIndex((candidate) => candidate === node || node.contains(candidate)) === index
-    ));
-    const fallbackNodes = nodes.length ? nodes : [...document.querySelectorAll("[role='listitem'], [data-tid*='messageBody'], [data-tid*='message-body']")]
-      .filter((node) => node instanceof HTMLElement && clean(node.textContent).length > 12)
-      .slice(-120);
-    const messages = fallbackNodes.map((node, index) => {
-      const author = clean(node.querySelector([
-        "[data-tid*='author']",
-        "[data-tid*='sender']",
-        "[data-tid*='message-author']",
-        "[class*='author']",
-        "[class*='sender']"
-      ].join(","))?.textContent)
-        || clean(node.getAttribute("data-author"))
-        || "";
-      const time = node.querySelector("time")?.getAttribute("datetime")
-        || node.querySelector("[datetime]")?.getAttribute("datetime")
-        || clean(node.querySelector([
-          "[data-tid*='timestamp']",
-          "[class*='timestamp']",
-          "[aria-label*='sent']",
-          "[aria-label*='发送']"
-        ].join(","))?.textContent)
-        || "";
-      const bodyNode = node.querySelector([
-        "[data-tid='messageBodyContent']",
-        "[data-tid*='messageBody']",
-        "[data-tid*='message-body']",
-        "[data-tid*='content']",
-        "[class*='messageBody']",
-        "[class*='message-body']"
-      ].join(",")) || node;
-      const text = clean(bodyNode.innerText || bodyNode.textContent);
-      const links = [...node.querySelectorAll("a[href]")].map((link) => ({
-        text: clean(link.textContent),
-        href: link.href
-      })).filter((link) => link.href);
-      return {
-        id: node.id || node.getAttribute("data-mid") || node.getAttribute("data-tid") || `teams-message-${index + 1}`,
-        author,
-        createdAt: time,
-        body: text,
-        links
-      };
-    }).filter((message) => message.body);
-    return { title: pickTitle(), messages };
-  });
+  return page.evaluate(extractTeamsMessagesFromDocument);
 }
 
 function mergeTeamsMessages(messages) {
-  const byKey = new Map();
-  for (const message of messages) {
-    const body = cleanText(message?.body || "");
-    if (!body) continue;
-    const createdAt = cleanText(message.createdAt || "");
-    const key = `${createdAt}\n${body}`;
-    if (!byKey.has(key)) {
-      byKey.set(key, {
-        id: cleanText(message.id || `teams-message-${byKey.size + 1}`),
-        author: cleanText(message.author || ""),
-        createdAt,
-        body,
-        links: Array.isArray(message.links) ? message.links : []
-      });
-    }
-  }
-  return [...byKey.values()];
+  return mergeTeamsCaptureMessages(messages);
 }
 
 function mergeTeamsComments(comments) {
@@ -5610,70 +6035,51 @@ function renderTeamsTextFromComments(title, url, adapter, comments) {
 }
 
 async function scrollTeamsMessages(page, options = {}) {
-  const maxScrolls = Number(options.maxScrolls || 18);
-  const minScrollsBeforeOverlapStop = Number(options.minScrollsBeforeOverlapStop || 2);
-  const previousKeys = teamsMessageKeySet(options.previousMessages || []);
-  const observed = [];
-  const remember = async () => {
-    const visible = await readVisibleTeamsMessages(page);
-    observed.push(...(visible.messages || []));
-  };
-
-  await jumpTeamsToLatest(page);
-  await remember();
-  try {
-    const box = await page.locator("[data-tid='chat-pane-list'], [role='main'], main").first().boundingBox({ timeout: 3000 });
-    if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-  } catch {
-    // Keyboard/mouse focus is best-effort; direct scroll fallback below still applies.
-  }
-
-  let stableRounds = 0;
-  for (let index = 0; index < maxScrolls; index += 1) {
-    const beforeCount = mergeTeamsMessages(observed).length;
-    const moved = await page.evaluate(() => {
-      const candidates = [...document.querySelectorAll("[data-tid='chat-pane-list'], [role='main'], main, [data-tid*='chat'], [data-tid*='message'], div")]
-        .filter((el) => el instanceof HTMLElement)
-        .map((el) => ({
-          el,
-          score: (el.scrollHeight - el.clientHeight) * Math.max(1, el.getBoundingClientRect().height)
-        }))
-        .filter((entry) => entry.score > 0)
-        .sort((a, b) => b.score - a.score);
-      const target = candidates[0]?.el;
-      if (!target) return false;
-      const before = target.scrollTop;
-      target.scrollTop = Math.max(0, target.scrollTop - Math.max(420, Math.floor(target.clientHeight * 0.85)));
-      target.dispatchEvent(new Event("scroll", { bubbles: true }));
-      return target.scrollTop !== before;
-    });
-    try {
-      await page.mouse.wheel(0, -900);
-    } catch {
-      // Some environments do not allow wheel injection; direct scroll was already attempted.
+  const captured = await collectVirtualTeamsMessages({
+    maxScrolls: options.maxScrolls || 18,
+    minScrollsBeforeOverlapStop: options.minScrollsBeforeOverlapStop || 2,
+    previousMessages: options.previousMessages || [],
+    signal: options.signal,
+    jumpToLatest: () => jumpTeamsToLatest(page),
+    readVisible: async () => {
+      const visible = await readVisibleTeamsMessages(page);
+      if (options.expectedTitle && !areCaptureTitlesConsistent(options.expectedTitle, visible.title || "")) {
+        throw new Error(`Teams 会话在抓取期间发生变化：目标“${options.expectedTitle}”，当前“${visible.title || "未知"}”。已阻止写入。`);
+      }
+      return visible;
+    },
+    wait: () => page.waitForTimeout(1200),
+    returnToLatest: async () => {
+      await jumpTeamsToLatest(page);
+      await page.waitForTimeout(800);
+    },
+    scrollOlder: async () => {
+      const moved = await page.evaluate(() => {
+        const viewport = document.querySelector("[data-tid='message-pane-list-viewport']");
+        const candidates = (viewport ? [viewport] : [...document.querySelectorAll("[data-tid='chat-pane-list'], [role='main'], main, [data-tid*='chat'], [data-tid*='message'], div")]
+          .filter((el) => el instanceof HTMLElement)
+          .filter((el) => el.querySelector("[data-mid]") || el.matches("[data-mid]")))
+          .map((el) => ({ el, score: (el.scrollHeight - el.clientHeight) * Math.max(1, el.getBoundingClientRect().height) }))
+          .filter((entry) => entry.score > 0).sort((a, b) => b.score - a.score);
+        const target = candidates[0]?.el;
+        if (!target) return false;
+        const before = target.scrollTop;
+        target.scrollTop = Math.max(0, target.scrollTop - Math.max(420, Math.floor(target.clientHeight * 0.85)));
+        target.dispatchEvent(new Event("scroll", { bubbles: true }));
+        return target.scrollTop !== before;
+      });
+      if (!moved) {
+        try { await page.mouse.wheel(0, -900); } catch {}
+      }
+      return moved;
     }
-    await page.waitForTimeout(1200);
-    await remember();
-    const afterCount = mergeTeamsMessages(observed).length;
-    stableRounds = moved || afterCount > beforeCount ? 0 : stableRounds + 1;
-    if (
-      index + 1 >= minScrollsBeforeOverlapStop
-      && (index + 1) % minScrollsBeforeOverlapStop === 0
-      && hasTeamsMessageOverlap(observed, previousKeys)
-    ) {
-      break;
-    }
-    if (stableRounds >= 3) break;
-  }
-
-  try {
-    await page.mouse.wheel(0, 2400);
-  } catch {
-    // Returning near the latest messages is best-effort only.
-  }
-  await page.waitForTimeout(800);
-  await remember();
-  return mergeTeamsMessages(observed).slice(-240);
+  });
+  const messages = captured.messages;
+  Object.defineProperties(messages, {
+    completeness: { value: captured.completeness, enumerable: false },
+    coverage: { value: captured.coverage, enumerable: false }
+  });
+  return messages;
 }
 
 async function jumpTeamsToLatest(page) {
@@ -5698,7 +6104,7 @@ async function jumpTeamsToLatest(page) {
             && rect.width > 0
             && rect.height > 0;
         };
-        const candidates = [...document.querySelectorAll("button, [role='button'], [aria-label], [title]")]
+        const candidates = [...document.querySelectorAll("button, [role='button']")]
           .filter((node) => node instanceof HTMLElement && isVisible(node));
         const target = candidates.find((node) => {
           const text = clean([
@@ -5741,7 +6147,7 @@ async function settleTeamsAtBottom(page) {
             && rect.width > 0
             && rect.height > 0;
         };
-        const latestButtonVisible = [...document.querySelectorAll("button, [role='button'], [aria-label], [title]")]
+        const latestButtonVisible = [...document.querySelectorAll("button, [role='button']")]
           .filter((node) => node instanceof HTMLElement && isVisible(node))
           .some((node) => {
             const text = clean([
@@ -5751,16 +6157,18 @@ async function settleTeamsAtBottom(page) {
               node.getAttribute("title")
             ].filter(Boolean).join(" "));
             return labels.some((label) => text.toLowerCase().includes(label.toLowerCase()));
-          });
-        const candidates = [...document.querySelectorAll("[data-tid='chat-pane-list'], [role='main'], main, [data-tid*='chat'], [data-tid*='message'], div")]
+        });
+        const viewport = document.querySelector("[data-tid='message-pane-list-viewport']");
+        const candidates = (viewport ? [viewport] : [...document.querySelectorAll("[data-tid='chat-pane-list'], [role='main'], main, [data-tid*='chat'], [data-tid*='message'], div")]
           .filter((el) => el instanceof HTMLElement)
+          .filter((el) => el.querySelector("[data-mid]") || el.matches("[data-mid]")))
           .map((el) => ({
             el,
             score: (el.scrollHeight - el.clientHeight) * Math.max(1, el.getBoundingClientRect().height)
           }))
           .filter((entry) => entry.score > 0)
           .sort((a, b) => b.score - a.score);
-        const targets = candidates.slice(0, 5).map((entry) => entry.el);
+        const targets = candidates.slice(0, 1).map((entry) => entry.el);
         if (!targets.length) return { found: false, moved: false, atBottom: false, latestButtonVisible };
         let moved = false;
         for (const target of targets) {
@@ -5800,7 +6208,7 @@ async function settleTeamsAtBottom(page) {
         const rect = node.getBoundingClientRect();
         return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
       };
-      const latestButtonVisible = [...document.querySelectorAll("button, [role='button'], [aria-label], [title]")]
+      const latestButtonVisible = [...document.querySelectorAll("button, [role='button']")]
         .filter((node) => node instanceof HTMLElement && isVisible(node))
         .some((node) => {
           const text = clean([
@@ -5810,9 +6218,11 @@ async function settleTeamsAtBottom(page) {
             node.getAttribute("title")
           ].filter(Boolean).join(" "));
           return labels.some((label) => text.toLowerCase().includes(label.toLowerCase()));
-        });
-      const candidates = [...document.querySelectorAll("[data-tid='chat-pane-list'], [role='main'], main, [data-tid*='chat'], [data-tid*='message'], div")]
+      });
+      const viewport = document.querySelector("[data-tid='message-pane-list-viewport']");
+      const candidates = (viewport ? [viewport] : [...document.querySelectorAll("[data-tid='chat-pane-list'], [role='main'], main, [data-tid*='chat'], [data-tid*='message'], div")]
         .filter((el) => el instanceof HTMLElement)
+        .filter((el) => el.querySelector("[data-mid]") || el.matches("[data-mid]")))
         .map((el) => ({
           el,
           score: (el.scrollHeight - el.clientHeight) * Math.max(1, el.getBoundingClientRect().height)
@@ -5849,20 +6259,14 @@ function hasTeamsMessageOverlap(messages, previousKeys) {
 }
 
 function teamsMessageKeys(message) {
-  const body = cleanText(message?.body || "");
-  if (!body) return [];
-  const createdAt = cleanText(message?.createdAt || "");
-  const keys = [];
-  if (createdAt) keys.push(`time-body:${createdAt}\n${body}`);
-  keys.push(`body:${body.slice(0, 240)}`);
-  return keys;
+  return teamsCaptureMessageKeys(message);
 }
 
 async function extractTeamsFromPage(page, url, adapter, observedMessages = []) {
   const visible = await readVisibleTeamsMessages(page);
   const data = {
     title: visible.title,
-    messages: mergeTeamsMessages([...(observedMessages || []), ...(visible.messages || [])]).slice(-240)
+    messages: mergeTeamsMessages([...(observedMessages || []), ...(visible.messages || [])])
   };
 
   const comments = data.messages.map((message) => ({
@@ -5878,12 +6282,20 @@ async function extractTeamsFromPage(page, url, adapter, observedMessages = []) {
     title: data.title || "Microsoft Teams conversation",
     text: renderTeamsTextFromComments(data.title || "Microsoft Teams conversation", url, adapter, comments),
     comments,
-    sourceUpdatedAt
+    sourceUpdatedAt,
+    completeness: observedMessages?.completeness || "partial",
+    coverage: observedMessages?.coverage || { observedCount: comments.length, stoppedBy: "visible-window" }
   };
 }
 
 function detectSourceAdapter(url) {
   const hostname = safeHostname(url);
+  const configuredType = cleanText(settings.sources?.[hostname]?.sourceType || "").toLowerCase();
+  if (["jira", "confluence", "github", "teams"].includes(configuredType)) {
+    // A configured instance opts into the existing adapter protocol. This is
+    // intentionally not a claim that every cloud/API variant is supported.
+    return { id: `configured-${configuredType}`, sourceType: configuredType, hostname };
+  }
   if (hostname === "confluence.amlogic.com") return { id: "amlogic-confluence", sourceType: "confluence", hostname };
   if (hostname === "jira.amlogic.com") return { id: "amlogic-jira", sourceType: "jira", hostname };
   if (hostname === "roku.atlassian.net") return { id: "roku-jira", sourceType: "jira", hostname };
@@ -7097,12 +7509,24 @@ async function uniqueItemId(base) {
   let id = base;
   let counter = 2;
 
-  while (await exists(path.join(itemsDir, id))) {
+  while (pendingItemIds.has(id) || await exists(path.join(itemsDir, id))) {
     id = `${base}-${counter}`;
     counter += 1;
   }
-
+  pendingItemIds.add(id);
   return id;
+}
+
+async function reserveUniqueItemId(base) {
+  const previous = itemIdReservationQueue;
+  let release;
+  itemIdReservationQueue = new Promise((resolve) => { release = resolve; });
+  await previous.catch(() => {});
+  try {
+    return await uniqueItemId(base);
+  } finally {
+    release();
+  }
 }
 
 function extractTitle(html) {
@@ -7148,9 +7572,15 @@ function summarizeExcerpt(document) {
 
 async function readBody(req) {
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  const text = Buffer.concat(chunks).toString("utf8");
-  return text ? JSON.parse(text) : {};
+  let bytes = 0;
+  const maxBytes = req.url?.startsWith("/api/import/data") ? 128 * 1024 * 1024 : 16 * 1024 * 1024;
+  for await (const chunk of req) {
+    bytes += chunk.length;
+    if (bytes > maxBytes) { const error = new Error("请求内容超过大小限制。"); error.statusCode = 413; throw error; }
+    chunks.push(chunk);
+  }
+  try { const text = Buffer.concat(chunks).toString("utf8"); return text ? JSON.parse(text) : {}; }
+  catch { const error = new Error("请求不是有效的 JSON。"); error.statusCode = 400; throw error; }
 }
 
 function sendJson(res, status, payload) {
@@ -7428,7 +7858,7 @@ async function suggestSupplementalContext(existingEntries = []) {
     throw new Error("请先在设置页配置 AI 接口后再分析补充资料。");
   }
   const existing = normalizeSupplementalEntries(existingEntries.length ? existingEntries : await readSupplementalEntries());
-  const corpus = await buildSupplementalAnalysisCorpus();
+  const { text: corpus, materials } = await buildSupplementalAnalysisCorpus();
   if (!corpus.trim()) throw new Error("当前资料库没有足够内容可分析。");
 
   const payload = await ai.chatPayload([
@@ -7450,7 +7880,7 @@ async function suggestSupplementalContext(existingEntries = []) {
         corpus
       ].join("\n")
     }
-  ], { temperature: 0.2 });
+  ], { materials, temperature: 0.2 });
 
   const parsed = parseJsonObjectFromText(payload.choices?.[0]?.message?.content || "");
   const existingTerms = new Set(existing.map((entry) => entry.term.toLowerCase()).filter(Boolean));
@@ -7461,30 +7891,24 @@ async function suggestSupplementalContext(existingEntries = []) {
 }
 
 async function buildSupplementalAnalysisCorpus() {
-  const dirs = await safeReaddir(itemsDir);
   const chunks = [];
-  for (const id of dirs.slice(0, 80)) {
-    const metadataPath = path.join(itemsDir, id, "metadata.json");
-    const documentPath = path.join(itemsDir, id, "document.md");
-    if (!(await exists(metadataPath)) || !(await exists(documentPath))) continue;
-    const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
-    if (metadata.pageKind === "list") continue;
-    const document = await fs.readFile(documentPath, "utf8");
-    chunks.push([
-      `# ${metadata.title}`,
-      `Source: ${metadata.sourceType}`,
-      extractBodyFromDocument(document).slice(0, 1800)
-    ].join("\n"));
-    if (chunks.join("\n\n---\n\n").length > 60000) break;
+  const materials = [];
+  for (const id of (await safeReaddir(itemsDir)).slice(0, 80)) {
+    const material = await readMaterialForSearch(id);
+    if (!material || material.metadata.pageKind === "list" || !canUseMaterial(material.metadata, settings)) continue;
+    const { metadata, document } = material;
+    chunks.push([`# ${metadata.title}`, `Source: ${metadata.sourceType}`, extractBodyFromDocument(document).slice(0, 1800)].join("\n"));
+    materials.push(metadata);
+    if (chunks.join("\n\n").length > 60000) break;
   }
-  return chunks.join("\n\n---\n\n");
+  return { text: chunks.join("\n\n---\n\n"), materials };
 }
 
 async function loadSettings() {
   const defaults = defaultSettings();
   if (!(await exists(settingsPath))) {
     await fs.mkdir(configDir, { recursive: true });
-    await fs.writeFile(settingsPath, `${JSON.stringify(defaults, null, 2)}\n`, "utf8");
+    await atomicWriteFile(settingsPath, `${JSON.stringify(defaults, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
     await fs.chmod(settingsPath, 0o600).catch(() => {});
     return defaults;
   }
@@ -7506,21 +7930,14 @@ async function importSettingsBundle(payload) {
   }
   const next = mergeSettings(defaultSettings(), imported);
   await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(settingsPath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+  await atomicWriteFile(settingsPath, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   return next;
 }
 
 async function exportDataBundle() {
   await ensureKnowledgeBase();
-  const files = await collectDataFiles(kbDir);
-  return {
-    type: "material-organizer-data",
-    version: 1,
-    exportedAt: new Date().toISOString(),
-    documentRootName: path.basename(kbDir),
-    fileCount: files.length,
-    files
-  };
+  const bundle = await store.runExclusive(() => exportBundle(kbDir));
+  return { ...bundle, documentRootName: path.basename(kbDir), fileCount: bundle.files.length };
 }
 
 async function collectDataFiles(baseDir, relativeDir = "") {
@@ -7597,37 +8014,22 @@ async function cleanupOldSnapshots() {
 }
 
 async function importDataBundle(bundle, options = {}) {
-  if (!bundle || bundle.type !== "material-organizer-data" || !Array.isArray(bundle.files)) {
-    throw new Error("数据导入文件格式不正确。");
+  if (refreshRuntime.running.size || refreshRuntime.queued.size || activeApiOperations > 1 || embeddingBuilds.size) {
+    const error = new Error("请等待当前操作完成或取消同步后再导入资料库。"); error.statusCode = 409; throw error;
   }
-
-  const mode = options.mode === "replace" ? "replace" : "merge";
-  await fs.mkdir(path.dirname(kbDir), { recursive: true });
-  let backupPath = "";
-  if (mode === "replace" && await exists(kbDir)) {
-    backupPath = `${kbDir}.backup-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-    await fs.rename(kbDir, backupPath);
-  }
-  await fs.mkdir(kbDir, { recursive: true });
-
-  let writtenFileCount = 0;
-  for (const file of bundle.files) {
-    const relativePath = validateDataBundlePath(file.path);
-    const targetPath = path.join(kbDir, relativePath);
-    await fs.mkdir(path.dirname(targetPath), { recursive: true });
-    const content = Buffer.from(String(file.content || ""), file.encoding === "utf8" ? "utf8" : "base64");
-    await fs.writeFile(targetPath, content);
-    writtenFileCount += 1;
-  }
-
-  await ensureKnowledgeBase();
-  await rebuildIndexes();
-  return {
-    ok: true,
-    mode,
-    backupPath,
-    writtenFileCount
-  };
+  libraryMaintenance = true;
+  try {
+    const result = await store.runExclusive(() => importBundle(kbDir, bundle, {
+      mode: options.mode === "replace" ? "replace" : "merge",
+      validateStage: async (root) => {
+        const stagedStore = createItemStore(() => ({itemsDir: path.join(root, "items"), tagsDir: path.join(root, "tags"), indexesDir: path.join(root, "indexes")}));
+        await fs.mkdir(path.join(root, "items"), { recursive: true });
+        await stagedStore.rebuildIndexes();
+      }
+    }));
+    await ensureKnowledgeBase();
+    return result;
+  } finally { libraryMaintenance = false; }
 }
 
 function validateDataBundlePath(value) {
@@ -7643,6 +8045,16 @@ function validateDataBundlePath(value) {
 }
 
 async function saveSettings(input) {
+  const operation = settingsWriteQueue.then(async () => {
+    const next = await saveSettingsNow(input);
+    settings = next;
+    return next;
+  });
+  settingsWriteQueue = operation.catch(() => {});
+  return operation;
+}
+
+async function saveSettingsNow(input) {
   const next = mergeSettings(settings, {
     ai: {
       baseUrl: cleanText(input.ai?.baseUrl ?? input.baseUrl ?? settings.ai.baseUrl),
@@ -7670,7 +8082,7 @@ async function saveSettings(input) {
   });
 
   await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(settingsPath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+  await atomicWriteFile(settingsPath, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   return next;
 }
 
@@ -7704,9 +8116,7 @@ function defaultSettings() {
       "github.ecodesamsung.com": defaultSourceProfile("github.ecodesamsung.com", "github"),
       "teams.microsoft.com": defaultSourceProfile("teams.microsoft.com", "teams")
     },
-    refreshJobs: [
-      defaultRefreshJob("jira-amlogic-filter-50724", "Amlogic Jira Filter 50724", "https://jira.amlogic.com/issues/?filter=50724")
-    ]
+    refreshJobs: []
   };
 }
 
@@ -8001,14 +8411,7 @@ function mergeSourceProfiles(base = {}, patch = {}) {
 }
 
 function isRemoteAiAllowed(metadata) {
-  let remote = false;
-  try {
-    const host = new URL(settings.ai?.baseUrl || "").hostname;
-    remote = Boolean(host && !["localhost", "127.0.0.1", "::1"].includes(host));
-  } catch {}
-  if (!remote) return true;
-  const hostname = safeHostname(metadata.url || "");
-  return settings.sources?.[hostname]?.allowRemoteAi !== false;
+  return canUseMaterial(metadata, settings);
 }
 
 function publicSourceProfiles() {
@@ -8116,4 +8519,26 @@ async function exists(filePath) {
   } catch {
     return false;
   }
+}
+
+async function loadCaptureToken() {
+  const tokenPath = path.join(configDir, "capture-token");
+  await fs.mkdir(configDir, { recursive: true });
+  try { return (await fs.readFile(tokenPath, "utf8")).trim(); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  const token = randomBytes(32).toString("hex");
+  await fs.writeFile(tokenPath, token, { mode: 0o600 });
+  return token;
+}
+
+async function modelVisibleTags() {
+  const items = await listItems();
+  return uniqueValues([...(await readManualTags()), ...items.filter(item => canUseMaterial(item, settings)).flatMap(item => item.tags || [])]);
+}
+
+async function withResponseCancellation(res, operation) {
+  const controller = new AbortController();
+  const abort = () => { if (!res.writableEnded) controller.abort(); };
+  res.on("close", abort);
+  try { return await operation(controller.signal); }
+  finally { res.removeListener("close", abort); }
 }

@@ -11,6 +11,8 @@ const serverHost = "127.0.0.1";
 
 let mainWindow;
 let serverProcess;
+let serverBaseUrl = "";
+let isQuitting = false;
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
@@ -25,8 +27,9 @@ app.on("second-instance", () => {
 
 app.whenReady().then(async () => {
   try {
-    const port = await findFreePort();
+    const port = await findPreferredPort();
     const baseUrl = `http://${serverHost}:${port}`;
+    serverBaseUrl = baseUrl;
     startServer(port);
     await waitForServer(baseUrl, 30000);
     createWindow(baseUrl);
@@ -46,12 +49,13 @@ app.on("window-all-closed", () => {
 });
 
 app.on("activate", () => {
-  if (BrowserWindow.getAllWindows().length === 0 && mainWindow) {
-    mainWindow.show();
+  if (BrowserWindow.getAllWindows().length === 0 && serverBaseUrl) {
+    createWindow(serverBaseUrl);
   }
 });
 
 app.on("before-quit", () => {
+  isQuitting = true;
   stopServer();
 });
 
@@ -84,7 +88,7 @@ function startServer(port) {
     console.log(`[server] ${chunk.toString().trimEnd()}`);
   });
   serverProcess.on("exit", (code) => {
-    if (code !== 0 && !app.isQuitting) {
+    if (code !== 0 && !isQuitting) {
       dialog.showErrorBox("服务已退出", `本地服务异常退出，退出码：${code}`);
     }
   });
@@ -106,8 +110,12 @@ function createWindow(baseUrl) {
   });
 
   mainWindow.once("ready-to-show", () => mainWindow.show());
+  mainWindow.on("closed", () => { mainWindow = undefined; });
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (!url.startsWith(baseUrl)) shell.openExternal(url);
+    let destination;
+    try { destination = new URL(url); } catch { return { action: "deny" }; }
+    const isAppPage = destination.origin === baseUrl;
+    if (!isAppPage && ["https:", "http:"].includes(destination.protocol)) shell.openExternal(destination.toString());
     return { action: "deny" };
   });
   mainWindow.loadURL(baseUrl);
@@ -120,15 +128,26 @@ function stopServer() {
   child.kill();
 }
 
-function findFreePort() {
+function findFreePort(port = 0) {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
     server.once("error", reject);
-    server.listen(0, serverHost, () => {
+    server.listen(port, serverHost, () => {
       const address = server.address();
       server.close(() => resolve(address.port));
     });
   });
+}
+
+async function findPreferredPort() {
+  try {
+    // We only test whether 8020 is bindable; we never attach to a service already
+    // listening there, so a different local application cannot become this app's UI.
+    return await findFreePort(8020);
+  } catch (error) {
+    if (error?.code !== "EADDRINUSE") throw error;
+    return findFreePort(0);
+  }
 }
 
 async function waitForServer(baseUrl, timeoutMs) {

@@ -4,6 +4,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { createItemStore, renderDocument, extractBodyFromDocument, extractSummaryFromDocument } from "../src/item-store.js";
+import { importBundle } from "../src/bundle-store.js";
 
 let tmpDirs = [];
 
@@ -49,6 +50,161 @@ describe("item-store", () => {
     const rawPath = path.join(itemDir, "raw.html");
     const raw = await fs.readFile(rawPath, "utf8");
     assert.ok(raw.includes("raw"));
+  });
+
+  it("commits a complete revision without exposing partial item files", async () => {
+    const store = await makeTempStore();
+    const id = "atomic-revision";
+    const metadata = { id, title: "Before", sourceType: "text", tags: [], createdAt: now(), updatedAt: now() };
+    await store.commit(id, { metadata, body: "before", comments: [{ body: "old" }] });
+    const next = { ...metadata, title: "After", updatedAt: now() };
+    await store.commit(id, { metadata: next, body: "after", summary: "new summary", comments: [{ body: "new" }], processedDocument: "processed" });
+    const item = await store.read(id);
+    assert.equal(item.metadata.title, "After");
+    assert.ok(item.document.includes("after"));
+    assert.ok(item.document.includes("new summary"));
+    assert.equal(item.comments[0].body, "new");
+    assert.equal(item.processedDocument, "processed");
+  });
+
+  it("serializes concurrent commits and readers", async () => {
+    const store = await makeTempStore();
+    const id = "concurrent-revision";
+    const metadata = { id, title: "Concurrent", sourceType: "text", tags: [], createdAt: now(), updatedAt: now() };
+    await store.commit(id, { metadata, body: "base" });
+    const updateBody = store.commit(id, { body: "new body" });
+    const readDuringUpdate = store.read(id);
+    const updateProcessed = store.commit(id, { processedDocument: "derived" });
+    const [during] = await Promise.all([readDuringUpdate, updateBody, updateProcessed]);
+    assert.ok(during.document.includes("base") || during.document.includes("new body"));
+    const final = await store.read(id);
+    assert.ok(final.document.includes("new body"));
+    assert.equal(final.processedDocument, "derived");
+  });
+
+  it("serializes index rebuilding with commits and refreshes metadata headers", async () => {
+    const store = await makeTempStore();
+    const id = "index-race";
+    const metadata = { id, title: "Before index", sourceType: "text", tags: [], createdAt: now(), updatedAt: now() };
+    await store.commit(id, { metadata, body: "base" });
+    const next = { ...metadata, title: "After index", updatedAt: now() };
+    await Promise.all([store.commit(id, { metadata: next }), store.rebuildIndexes()]);
+    const item = await store.read(id);
+    assert.ok(item.document.startsWith("# After index"));
+    const result = await store.search("after index");
+    assert.equal(result[0].item.id, id);
+  });
+
+  it("recovers an interrupted staged commit before reading", async () => {
+    const store = await makeTempStore();
+    const id = "recovered-item";
+    const metadata = { id, title: "Recovered", sourceType: "text", tags: [], createdAt: now(), updatedAt: now() };
+    const itemRoot = path.dirname(await store.itemDir(id));
+    const transaction = path.join(itemRoot, ".transactions", "interrupted");
+    const staged = path.join(transaction, "item");
+    await fs.mkdir(staged, { recursive: true });
+    await fs.writeFile(path.join(transaction, "manifest.json"), JSON.stringify({ id }));
+    await fs.writeFile(path.join(staged, "metadata.json"), JSON.stringify(metadata));
+    await fs.writeFile(path.join(staged, "document.md"), renderDocument(metadata, "recovered"));
+    const item = await store.read(id);
+    assert.equal(item.metadata.title, "Recovered");
+    assert.ok(item.document.includes("recovered"));
+  });
+
+  it("skips corrupt entries and reports them while listing healthy entries", async () => {
+    const store = await makeTempStore();
+    const id = "healthy-item";
+    const metadata = { id, title: "Healthy", sourceType: "text", tags: [], createdAt: now(), updatedAt: now() };
+    await store.commit(id, { metadata, body: "safe" });
+    const corrupt = path.join(path.dirname(await store.itemDir(id)), "corrupt-item");
+    await fs.mkdir(corrupt);
+    await fs.writeFile(path.join(corrupt, "metadata.json"), "not json");
+    const observed = [];
+    const items = await store.list({ onCorrupt: (issue) => observed.push(issue) });
+    assert.deepEqual(items.map((item) => item.id), [id]);
+    assert.equal(observed[0].id, "corrupt-item");
+    assert.equal(store.getDiagnostics().at(-1).id, "corrupt-item");
+    await store.list();
+    assert.equal(store.getDiagnostics().filter((issue) => issue.id === "corrupt-item").length, 1);
+    assert.equal(store.getDiagnostics().at(-1).count, 2);
+  });
+
+  it("coordinates raw content with the current metadata alias", async () => {
+    const store = await makeTempStore();
+    const id = "raw-alias";
+    const metadata = { id, title: "Raw", sourceType: "text", tags: [], createdAt: now(), updatedAt: now() };
+    await store.writeMetadata(id, metadata);
+    await store.writeRawContent(id, "{\"ok\":true}", "application/json", "raw.json");
+    const saved = JSON.parse(await fs.readFile(path.join(await store.itemDir(id), "metadata.json"), "utf8"));
+    assert.equal(saved.rawFileName, "raw.json");
+  });
+
+  it("rejects item ids that are unsafe on another platform", async () => {
+    const store = await makeTempStore();
+    for (const id of ["../escape", "name/child", "name\\child", "con", "trailing.", "trailing "]) {
+      await assert.rejects(() => store.writeMetadata(id, {}), /Invalid item id/);
+    }
+  });
+
+  it("validates a whole bundle before replacing its destination", async () => {
+    const root = path.join(os.tmpdir(), `bundle-store-test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    tmpDirs.push(root);
+    await fs.mkdir(root, { recursive: true });
+    await fs.writeFile(path.join(root, "keep.txt"), "keep");
+    await assert.rejects(() => importBundle(root, {
+      type: "material-organizer-data",
+      files: [{ path: "new.txt", encoding: "utf8", content: "new" }, { path: "../escape", encoding: "utf8", content: "bad" }]
+    }, { mode: "replace" }), /非法数据文件路径/);
+    assert.equal(await fs.readFile(path.join(root, "keep.txt"), "utf8"), "keep");
+  });
+
+  it("rolls back a bundle whose staged item metadata is malformed", async () => {
+    const root = path.join(os.tmpdir(), `bundle-store-malformed-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    tmpDirs.push(root);
+    await fs.mkdir(root, { recursive: true });
+    await fs.writeFile(path.join(root, "keep.txt"), "keep");
+    await assert.rejects(() => importBundle(root, {
+      type: "material-organizer-data",
+      files: [
+        { path: "items/bad/metadata.json", encoding: "utf8", content: "not-json" },
+        { path: "items/bad/document.md", encoding: "utf8", content: "# document" }
+      ]
+    }, { mode: "replace" }), /metadata/);
+    assert.equal(await fs.readFile(path.join(root, "keep.txt"), "utf8"), "keep");
+  });
+
+  it("rejects staged metadata whose identity or shape is unsafe", async () => {
+    const root = path.join(os.tmpdir(), `bundle-store-shape-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    tmpDirs.push(root);
+    await fs.mkdir(root, { recursive: true });
+    await fs.writeFile(path.join(root, "keep.txt"), "keep");
+    await assert.rejects(() => importBundle(root, {
+      type: "material-organizer-data",
+      files: [
+        { path: "items/item-a/metadata.json", encoding: "utf8", content: JSON.stringify({ id: "other", tags: "wrong", rawFileName: "../raw.txt" }) },
+        { path: "items/item-a/document.md", encoding: "utf8", content: "# document" }
+      ]
+    }, { mode: "replace" }), /ID 不匹配/);
+    assert.equal(await fs.readFile(path.join(root, "keep.txt"), "utf8"), "keep");
+  });
+
+  it("exposes an exclusive whole-store operation", async () => {
+    const store = await makeTempStore();
+    let entered = false;
+    await store.runExclusive(async () => { entered = true; });
+    assert.equal(entered, true);
+  });
+
+  it("runs an optional staged-bundle validator before committing", async () => {
+    const root = path.join(os.tmpdir(), `bundle-store-hook-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    tmpDirs.push(root);
+    let stagedPath = "";
+    await importBundle(root, { type: "material-organizer-data", files: [{ path: "note.txt", encoding: "utf8", content: "ok" }] }, {
+      mode: "replace",
+      validateStage: async (stage) => { stagedPath = stage; await fs.writeFile(path.join(stage, "validated.txt"), "yes"); }
+    });
+    assert.ok(stagedPath);
+    assert.equal(await fs.readFile(path.join(root, "validated.txt"), "utf8"), "yes");
   });
 
   it("lists items with filters", async () => {

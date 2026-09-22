@@ -12,17 +12,14 @@
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { slugify } from "./utils.js";
+import { atomicWriteFile, atomicWriteJson, pathExists, replaceDirectory } from "./atomic-files.js";
 
 // ---- Path helpers ----
 
 async function exists(filePath) {
-  try {
-    await fs.access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
+  return pathExists(filePath);
 }
 
 async function safeReaddir(dir) {
@@ -91,14 +88,77 @@ export function createItemStore(getDirs) {
   function itemsDir() { return getDirs().itemsDir; }
   function tagsDir() { return getDirs().tagsDir; }
   function indexesDir() { return getDirs().indexesDir; }
+  let rebuildTail = Promise.resolve();
+  let operationTail = Promise.resolve();
+  const diagnostics = [];
+  const MAX_DIAGNOSTICS = 100;
+
+  function withStoreLock(operation) {
+    const next = operationTail.catch(() => {}).then(operation);
+    operationTail = next.catch(() => {});
+    return next;
+  }
+
+  function withRecoveredStoreLock(operation) {
+    return withStoreLock(async () => {
+      await recoverPendingCommits();
+      return operation();
+    });
+  }
+
+  // For callers that need to atomically inspect or replace the whole knowledge-base
+  // directory (for example a staged bundle import). The operation must not call this
+  // store's public read/write methods while it owns the lock.
+  function runExclusive(operation) {
+    if (typeof operation !== "function") throw new TypeError("runExclusive requires an operation.");
+    return withRecoveredStoreLock(operation);
+  }
+
+  function recordDiagnostic(issue) {
+    const existing = diagnostics.find((entry) => entry.id === issue.id && entry.error === issue.error);
+    if (existing) {
+      existing.observedAt = issue.observedAt;
+      existing.count = (existing.count || 1) + 1;
+      return existing;
+    }
+    diagnostics.push({ ...issue, count: 1 });
+    if (diagnostics.length > MAX_DIAGNOSTICS) diagnostics.splice(0, diagnostics.length - MAX_DIAGNOSTICS);
+    return diagnostics.at(-1);
+  }
+
+  function validateItemId(id) {
+    const value = String(id || "");
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)
+      || /[. ]$/.test(value)
+      || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(value)) {
+      throw new Error("Invalid item id.");
+    }
+    return value;
+  }
+
+  async function recoverPendingCommits() {
+    const root = path.join(itemsDir(), ".transactions");
+    for (const name of await safeReaddir(root)) {
+      const transaction = path.join(root, name);
+      let manifest;
+      try { manifest = JSON.parse(await fs.readFile(path.join(transaction, "manifest.json"), "utf8")); } catch { continue; }
+      let id;
+      try { id = validateItemId(manifest.id); } catch { continue; }
+      const target = path.join(itemsDir(), id);
+      const staged = path.join(transaction, "item");
+      const previous = path.join(transaction, "previous");
+      // A staged revision is complete before it can replace the live directory. Prefer it
+      // during recovery; the former revision remains available until this point succeeds.
+      if (!(await exists(target)) && await exists(staged)) await fs.rename(staged, target);
+      if (!(await exists(target)) && await exists(previous)) await fs.rename(previous, target);
+      if (await exists(target)) await fs.rm(transaction, { recursive: true, force: true });
+    }
+  }
 
   // ---- Item CRUD ----
 
-  async function read(id) {
-    if (!id || id.includes("..") || id.includes("/")) {
-      throw new Error("Invalid item id.");
-    }
-
+  async function readNow(id) {
+    id = validateItemId(id);
     const itemDir = path.join(itemsDir(), id);
     const metadata = JSON.parse(await fs.readFile(path.join(itemDir, "metadata.json"), "utf8"));
     const document = await fs.readFile(path.join(itemDir, "document.md"), "utf8");
@@ -109,17 +169,32 @@ export function createItemStore(getDirs) {
     return { metadata, document, processedDocument, comments };
   }
 
-  async function list(filters = {}) {
+  function read(id) {
+    return withRecoveredStoreLock(async () => {
+      return readNow(id);
+    });
+  }
+
+  async function listNow(filters = {}) {
     const dirs = await safeReaddir(itemsDir());
     const items = [];
 
     for (const id of dirs) {
-      const metadataPath = path.join(itemsDir(), id, "metadata.json");
-      if (!(await exists(metadataPath))) continue;
-      const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
-      const document = await fs.readFile(path.join(itemsDir(), id, "document.md"), "utf8");
-      const processedPath = path.join(itemsDir(), id, "processed.md");
-      const processedDocument = await exists(processedPath) ? await fs.readFile(processedPath, "utf8") : "";
+      if (id.startsWith(".")) continue;
+      let metadata; let document; let processedDocument;
+      try {
+        validateItemId(id);
+        const metadataPath = path.join(itemsDir(), id, "metadata.json");
+        if (!(await exists(metadataPath))) continue;
+        metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
+        document = await fs.readFile(path.join(itemsDir(), id, "document.md"), "utf8");
+        const processedPath = path.join(itemsDir(), id, "processed.md");
+        processedDocument = await exists(processedPath) ? await fs.readFile(processedPath, "utf8") : "";
+      } catch (error) {
+        const issue = recordDiagnostic({ id, error: error.message || String(error), observedAt: new Date().toISOString() });
+        filters.onCorrupt?.(issue);
+        continue;
+      }
       const searchText = `${metadata.title} ${(metadata.tags || []).join(" ")} ${processedDocument} ${document}`.toLowerCase();
 
       // Filter hooks — callers can override via filter functions passed in options.
@@ -150,6 +225,12 @@ export function createItemStore(getDirs) {
     });
   }
 
+  function list(filters = {}) {
+    return withRecoveredStoreLock(async () => {
+      return listNow(filters);
+    });
+  }
+
   async function search(query) {
     if (!query.trim()) return [];
     const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
@@ -173,75 +254,133 @@ export function createItemStore(getDirs) {
   }
 
   async function deleteItem(id) {
-    if (!id || id.includes("..") || id.includes("/")) {
-      throw new Error("Invalid item id.");
-    }
-
-    const itemDir = path.join(itemsDir(), id);
-    if (!(await exists(itemDir))) {
-      throw new Error("Item not found.");
-    }
-
-    await fs.rm(itemDir, { recursive: true, force: true });
+    id = validateItemId(id);
+    await withStoreLock(async () => {
+      await recoverPendingCommits();
+      const itemDir = path.join(itemsDir(), id);
+      if (!(await exists(itemDir))) throw new Error("Item not found.");
+      await fs.rm(itemDir, { recursive: true, force: true });
+    });
     await rebuildIndexes();
   }
 
   // ---- Metadata mutation (low-level, no index rebuild) ----
 
   async function writeMetadata(id, metadata) {
-    const dir = path.join(itemsDir(), id);
-    await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(
-      path.join(dir, "metadata.json"),
-      `${JSON.stringify(metadata, null, 2)}\n`,
-      "utf8"
-    );
+    id = validateItemId(id);
+    if (metadata?.id !== id) throw new Error("Metadata id must match item id.");
+    if (metadata?.rawFileName !== undefined && !/^raw\.[a-z0-9._-]+$/i.test(String(metadata.rawFileName))) throw new Error("Invalid raw file name.");
+    return withRecoveredStoreLock(async () => {
+      const dir = path.join(itemsDir(), id);
+      await fs.mkdir(dir, { recursive: true });
+      await atomicWriteJson(path.join(dir, "metadata.json"), metadata);
+    });
   }
 
   async function writeDocument(id, metadata, body, summary = "") {
-    const dir = path.join(itemsDir(), id);
-    await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(
-      path.join(dir, "document.md"),
-      renderDocument(metadata, body, summary),
-      "utf8"
-    );
+    id = validateItemId(id);
+    return withRecoveredStoreLock(async () => {
+      const dir = path.join(itemsDir(), id);
+      await fs.mkdir(dir, { recursive: true });
+      await atomicWriteFile(path.join(dir, "document.md"), renderDocument(metadata, body, summary), "utf8");
+    });
   }
 
   async function writeProcessedDocument(id, content) {
-    const dir = path.join(itemsDir(), id);
-    await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "processed.md"), content, "utf8");
+    id = validateItemId(id);
+    return withRecoveredStoreLock(async () => {
+      const dir = path.join(itemsDir(), id);
+      await fs.mkdir(dir, { recursive: true });
+      await atomicWriteFile(path.join(dir, "processed.md"), content, "utf8");
+    });
   }
 
   async function writeComments(id, lines) {
-    const dir = path.join(itemsDir(), id);
-    await fs.mkdir(dir, { recursive: true });
-    const text = (lines || []).map((obj) => JSON.stringify(obj)).join("\n") + (lines.length ? "\n" : "");
-    await fs.writeFile(path.join(dir, "comments.jsonl"), text, "utf8");
+    id = validateItemId(id);
+    return withRecoveredStoreLock(async () => {
+      const dir = path.join(itemsDir(), id);
+      await fs.mkdir(dir, { recursive: true });
+      const text = (lines || []).map((obj) => JSON.stringify(obj)).join("\n") + (lines.length ? "\n" : "");
+      await atomicWriteFile(path.join(dir, "comments.jsonl"), text, "utf8");
+    });
   }
 
   async function writeRawContent(id, content, contentType = "", fileName = "") {
-    const dir = path.join(itemsDir(), id);
-    await fs.mkdir(dir, { recursive: true });
-    const isHtml = /text\/html|application\/xhtml\+xml/.test(contentType);
-    const safeName = /^raw\.[a-z0-9._-]+$/i.test(fileName) ? fileName : isHtml ? "raw.html" : "raw.txt";
-    await fs.writeFile(path.join(dir, safeName), content, "utf8");
+    id = validateItemId(id);
+    return withRecoveredStoreLock(async () => {
+      const dir = path.join(itemsDir(), id);
+      await fs.mkdir(dir, { recursive: true });
+      const isHtml = /text\/html|application\/xhtml\+xml/.test(contentType);
+      const safeName = /^raw\.[a-z0-9._-]+$/i.test(fileName) ? fileName : isHtml ? "raw.html" : "raw.txt";
+      await atomicWriteFile(path.join(dir, safeName), content, "utf8");
+      const metadataPath = path.join(dir, "metadata.json");
+      if (await exists(metadataPath)) {
+        const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
+        await atomicWriteJson(metadataPath, { ...metadata, rawFileName: safeName });
+      }
+      return safeName;
+    });
+  }
+
+  async function commit(id, payload = {}) {
+    id = validateItemId(id);
+    return withStoreLock(async () => {
+      await recoverPendingCommits();
+      const root = path.join(itemsDir(), ".transactions");
+      const transaction = path.join(root, `${id}-${crypto.randomUUID()}`);
+      const staged = path.join(transaction, "item");
+      const target = path.join(itemsDir(), id);
+      await fs.mkdir(staged, { recursive: true });
+      try {
+      if (await exists(target)) await fs.cp(target, staged, { recursive: true, force: true });
+      let metadata = payload.metadata === undefined ? undefined : { ...payload.metadata };
+      if (metadata?.id !== undefined && metadata.id !== id) throw new Error("Metadata id must match item id.");
+      if (metadata?.rawFileName !== undefined && !/^raw\.[a-z0-9._-]+$/i.test(String(metadata.rawFileName))) throw new Error("Invalid raw file name.");
+      if (metadata !== undefined) await atomicWriteJson(path.join(staged, "metadata.json"), metadata);
+      // Metadata is rendered into document.md, so a metadata-only commit must refresh
+      // that header as well instead of leaving two visible revisions out of sync.
+      if (payload.document !== undefined || payload.body !== undefined || payload.summary !== undefined || metadata !== undefined) {
+        const nextMetadata = metadata === undefined ? JSON.parse(await fs.readFile(path.join(staged, "metadata.json"), "utf8")) : metadata;
+        const existingDocument = await exists(path.join(staged, "document.md")) ? await fs.readFile(path.join(staged, "document.md"), "utf8") : "";
+        const body = payload.body === undefined ? extractBodyFromDocument(existingDocument) : payload.body;
+        const summary = payload.summary === undefined ? extractSummaryFromDocument(existingDocument) : payload.summary;
+        await atomicWriteFile(path.join(staged, "document.md"), payload.document === undefined ? renderDocument(nextMetadata, body, summary) : payload.document, "utf8");
+      }
+      if (payload.processedDocument !== undefined) await atomicWriteFile(path.join(staged, "processed.md"), payload.processedDocument, "utf8");
+      if (payload.comments !== undefined) await atomicWriteFile(path.join(staged, "comments.jsonl"), (payload.comments || []).map((line) => JSON.stringify(line)).join("\n") + (payload.comments?.length ? "\n" : ""), "utf8");
+      if (payload.raw !== undefined) {
+        const name = /^raw\.[a-z0-9._-]+$/i.test(payload.rawFileName || "") ? payload.rawFileName : /text\/html|application\/xhtml\+xml/.test(payload.rawContentType || "") ? "raw.html" : "raw.txt";
+        await atomicWriteFile(path.join(staged, name), payload.raw, "utf8");
+        metadata ||= JSON.parse(await fs.readFile(path.join(staged, "metadata.json"), "utf8"));
+        metadata = { ...metadata, rawFileName: name };
+        await atomicWriteJson(path.join(staged, "metadata.json"), metadata);
+      }
+      if (!(await exists(path.join(staged, "metadata.json"))) || !(await exists(path.join(staged, "document.md")))) throw new Error("A committed item requires metadata and document.");
+      await atomicWriteJson(path.join(transaction, "manifest.json"), { id, createdAt: new Date().toISOString() });
+      if (await exists(target)) await fs.rename(target, path.join(transaction, "previous"));
+      await fs.rename(staged, target);
+      await fs.rm(transaction, { recursive: true, force: true });
+        return readNow(id);
+      } catch (error) {
+        await recoverPendingCommits().catch(() => {});
+        throw error;
+      }
+    });
   }
 
   // ---- Item directory ----
 
   async function itemDir(id) {
-    return path.join(itemsDir(), id);
+    return path.join(itemsDir(), validateItemId(id));
   }
 
   // ---- Indexes ----
 
-  async function rebuildIndexes() {
+  async function rebuildIndexesNow() {
     await fs.mkdir(tagsDir(), { recursive: true });
     await fs.mkdir(indexesDir(), { recursive: true });
 
-    const allItems = await list();
+    const allItems = await listNow();
     const byTag = {};
     const bySource = {};
     const searchIndex = [];
@@ -268,33 +407,49 @@ export function createItemStore(getDirs) {
       });
     }
 
-    await fs.writeFile(path.join(indexesDir(), "by-tag.json"), `${JSON.stringify(byTag, null, 2)}\n`, "utf8");
-    await fs.writeFile(path.join(indexesDir(), "by-source.json"), `${JSON.stringify(bySource, null, 2)}\n`, "utf8");
-    await fs.writeFile(path.join(indexesDir(), "by-updated.json"), `${JSON.stringify(allItems.map((item) => item.id), null, 2)}\n`, "utf8");
-    await fs.writeFile(path.join(indexesDir(), "search.json"), `${JSON.stringify({ version: 1, generatedAt: new Date().toISOString(), items: searchIndex }, null, 2)}\n`, "utf8");
-
-    const existingTagFiles = await safeReaddir(tagsDir());
-    for (const file of existingTagFiles) {
-      if (file.endsWith(".json")) await fs.unlink(path.join(tagsDir(), file));
-    }
+    await Promise.all([
+      atomicWriteJson(path.join(indexesDir(), "by-tag.json"), byTag),
+      atomicWriteJson(path.join(indexesDir(), "by-source.json"), bySource),
+      atomicWriteJson(path.join(indexesDir(), "by-updated.json"), allItems.map((item) => item.id)),
+      atomicWriteJson(path.join(indexesDir(), "search.json"), { version: 1, generatedAt: new Date().toISOString(), items: searchIndex })
+    ]);
+    const stagedTags = `${tagsDir()}.staged-${crypto.randomUUID()}`;
+    await fs.mkdir(stagedTags, { recursive: true });
     for (const [tag, ids] of Object.entries(byTag)) {
-      await fs.writeFile(path.join(tagsDir(), `${slugify(tag)}.json`), `${JSON.stringify({ tag, items: ids }, null, 2)}\n`, "utf8");
+      await atomicWriteJson(path.join(stagedTags, `${slugify(tag)}.json`), { tag, items: ids });
     }
+    await replaceDirectory(stagedTags, tagsDir());
+  }
+
+  function rebuildIndexes() {
+    // Index construction reads every item, so it uses the same store lock as commits.
+    // listNow deliberately avoids nesting that lock.
+    const run = () => withRecoveredStoreLock(rebuildIndexesNow);
+    const next = rebuildTail.then(run, run);
+    rebuildTail = next.catch(() => {});
+    return next;
   }
 
   // ---- Snapshots ----
 
   async function listSnapshots(id) {
-    const snapDir = path.join(itemsDir(), id, "snapshots");
-    const files = await safeReaddir(snapDir);
-    return files.sort().reverse();
+    id = validateItemId(id);
+    return withRecoveredStoreLock(async () => {
+      const snapDir = path.join(itemsDir(), id, "snapshots");
+      const files = await safeReaddir(snapDir);
+      return files.sort().reverse();
+    });
   }
 
   async function writeSnapshot(id, snapshotId, metadata, document) {
-    const snapDir = path.join(itemsDir(), id, "snapshots", snapshotId);
-    await fs.mkdir(snapDir, { recursive: true });
-    await fs.writeFile(path.join(snapDir, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
-    await fs.writeFile(path.join(snapDir, "document.md"), document, "utf8");
+    id = validateItemId(id);
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(String(snapshotId || ""))) throw new Error("Invalid snapshot id.");
+    return withRecoveredStoreLock(async () => {
+      const snapDir = path.join(itemsDir(), id, "snapshots", snapshotId);
+      await fs.mkdir(snapDir, { recursive: true });
+      await atomicWriteJson(path.join(snapDir, "metadata.json"), metadata);
+      await atomicWriteFile(path.join(snapDir, "document.md"), document, "utf8");
+    });
   }
 
   return {
@@ -307,10 +462,14 @@ export function createItemStore(getDirs) {
     writeProcessedDocument,
     writeComments,
     writeRawContent,
+    commit,
     writeSnapshot,
     listSnapshots,
     itemDir,
     rebuildIndexes,
+    runExclusive,
+    getDiagnostics: () => diagnostics.slice(),
+    validateItemId,
     // Re-export utility for callers that need it directly
     exists
   };

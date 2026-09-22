@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>工作助理</title>
-    <link rel="stylesheet" href="/styles.css?v=4" />
+    <link rel="stylesheet" href="/styles.css?v=20260922-verified" />
   </head>
   <body>
     <div class="app-shell">
@@ -25,20 +25,16 @@
         <nav class="nav-block">
           <button class="nav-item is-active" data-view="home">
             <span class="nav-icon" aria-hidden="true">⌂</span>
-            <span>首页</span>
+            <span>工作台</span>
           </button>
           <button class="nav-item" data-view="chat">
             <span class="nav-icon" aria-hidden="true">◉</span>
-            <span>AI 对话</span>
+            <span>问答</span>
           </button>
           <button class="nav-item" data-view="materials">
             <span class="nav-icon" aria-hidden="true">□</span>
-            <span>资料整理</span>
+            <span>资料库</span>
             <span id="materialsNewBadge" class="new-badge" hidden>NEW!</span>
-          </button>
-          <button class="nav-item" data-view="import">
-            <span class="nav-icon" aria-hidden="true">＋</span>
-            <span>新增资料</span>
           </button>
           <button class="nav-item" data-view="supplemental">
             <span class="nav-icon" aria-hidden="true">◇</span>
@@ -46,13 +42,14 @@
           </button>
           <button class="nav-item" data-view="subscriptions">
             <span class="nav-icon" aria-hidden="true">◷</span>
-            <span>订阅管理</span>
+            <span>关注来源</span>
           </button>
           <button class="nav-item" data-view="settings">
             <span class="nav-icon" aria-hidden="true">⚙</span>
             <span>设置</span>
           </button>
         </nav>
+        <button id="globalAddButton" class="global-add-button" type="button"><span aria-hidden="true">＋</span> 添加资料</button>
 
         <div id="materialSidebar" class="material-sidebar" hidden>
           <div class="filter-tabs" role="tablist" aria-label="资料筛选">
@@ -82,22 +79,29 @@
       <main class="workspace">
         <section id="homeView" class="home-view">
           <div class="view-heading">
-            <h2>首页</h2>
-            <p>查看资料更新、订阅刷新和 AI 检索状态。</p>
+            <h2>工作台</h2>
+            <p>优先处理变化、异常和最近阅读。</p>
           </div>
 
           <section class="home-overview" aria-label="首页概览">
             <div class="overview-hero">
               <div>
-                <span class="section-kicker">首页</span>
-                <h3>本地知识库工作台</h3>
-                <p>查看资料更新、订阅刷新和 AI 检索状态，然后直接在下方继续提问。</p>
+                <span class="section-kicker">工作台</span>
+                <h3 id="homeHeroTitle">准备好收集你的第一条资料</h3>
+                <p id="homeHeroDescription">粘贴链接或文本，保存后即可在这里跟踪变化、阅读资料和提问。</p>
               </div>
               <div class="overview-status-row">
                 <span id="homeAiMode" class="status-pill is-local">AI 状态载入中</span>
-                <span class="status-pill is-search">混合检索</span>
-                <span class="status-pill is-online">联网资料</span>
               </div>
+            </div>
+
+            <div class="workbench-entry">
+              <form id="workbenchSearchForm" class="workbench-search-form">
+                <input id="workbenchSearchInput" type="search" placeholder="搜索资料，或直接提出问题" />
+                <button class="primary-button" type="submit">搜索资料</button>
+                <button id="workbenchAskButton" type="button">去问答</button>
+              </form>
+              <button id="homeFirstImportButton" class="primary-button" type="button">添加第一条资料</button>
             </div>
 
             <div class="overview-metrics">
@@ -122,6 +126,11 @@
                 <small>可用于问答过滤和整理</small>
               </article>
             </div>
+
+            <section class="recent-updates-panel" aria-label="最近未读更新">
+              <div class="overview-panel-header"><h4>最近未读更新</h4><button type="button" data-view-shortcut="materials">查看全部</button></div>
+              <div id="homeRecentUpdates" class="recent-updates-list"></div>
+            </section>
 
             <div class="overview-lower">
               <section class="overview-panel">
@@ -160,15 +169,14 @@
             </div>
           </section>
 
-          <section class="home-task-panel" aria-label="数据源状态">
+          <section class="home-task-panel" aria-label="需要处理">
             <div class="home-task-header">
               <div>
-                <h3>数据源状态</h3>
-                <p>按来源汇总刷新健康度，具体任务可在订阅管理里查看。</p>
+                <h3>需要你处理</h3>
+                <p>只显示需要操作的关注来源和资料变化。</p>
               </div>
               <div class="home-task-actions">
-                <button type="button" data-view-shortcut="subscriptions">管理订阅</button>
-                <button type="button" data-view-shortcut="subscriptions" aria-label="刷新状态">↻</button>
+                <button type="button" data-view-shortcut="subscriptions">管理关注</button>
               </div>
             </div>
             <div class="home-task-table-wrap">
@@ -176,32 +184,29 @@
                 <thead>
                   <tr>
                     <th>数据源</th>
-                    <th>任务</th>
-                    <th>状态</th>
-                    <th>最近刷新</th>
-                    <th>最近成功</th>
-                    <th>进度</th>
-                    <th>新增/变更</th>
+                    <th>来源</th>
+                    <th>需要处理</th>
+                    <th>最近活动</th>
                     <th>操作</th>
                   </tr>
                 </thead>
                 <tbody id="homeRefreshTaskRows">
                   <tr>
-                    <td colspan="8">正在载入数据源状态。</td>
+                    <td colspan="4">正在载入需要处理的内容。</td>
                   </tr>
                 </tbody>
               </table>
             </div>
             <div class="home-task-footer">
-              <span id="homeRefreshTaskCount">共 0 个数据源</span>
-              <button type="button" data-view-shortcut="subscriptions">查看任务明细</button>
+              <span id="homeRefreshTaskCount">暂无需要处理的内容</span>
+              <button type="button" data-view-shortcut="materials">查看资料库</button>
             </div>
           </section>
         </section>
 
         <section id="chatView" class="chat-view" hidden>
           <div class="view-heading">
-            <h2>AI 对话</h2>
+            <h2>问答</h2>
             <p>从资料库里查找、总结和回到原文。</p>
           </div>
 
@@ -222,6 +227,7 @@
                 <div>
                   <h3 id="chatSessionTitle">资料库助手</h3>
                   <p>后端会读取本地知识库，检索相关资料，再用设置里的 AI 接口回答。</p>
+                  <p id="chatSessionStatus" class="chat-session-status" hidden></p>
                 </div>
                 <div class="root-pill">
                   <span>知识库</span>
@@ -231,7 +237,8 @@
               <div id="chatMessages" class="chat-messages" aria-live="polite"></div>
               <form id="chatForm" class="chat-form">
                 <input id="chatInput" placeholder="例如：auth 相关 Jira 最近有什么进展？" />
-                <button class="primary-button">发送</button>
+                <button id="chatSubmitButton" class="primary-button">发送</button>
+                <button id="stopChatButton" type="button" hidden>停止生成</button>
               </form>
             </section>
           </section>
@@ -276,7 +283,9 @@
                 <textarea id="importContent" name="content" rows="12" placeholder="粘贴文本、网页链接、Jira 页面内容或 GitHub discussion 内容"></textarea>
               </label>
 
-              <div class="form-grid">
+              <details class="import-advanced">
+                <summary>高级选项</summary>
+                <div class="form-grid">
                 <label>
                   类型
                   <select id="importSourceType" name="sourceType">
@@ -299,25 +308,26 @@
                   <option value="paste">使用粘贴内容</option>
                 </select>
               </label>
-              </div>
+                </div>
 
-              <label>
+                <label>
                 页面类型
                 <select id="importPageKind" name="pageKind">
                   <option value="auto">自动识别</option>
                   <option value="list">过滤页/列表页</option>
                   <option value="content">内容页</option>
                 </select>
-              </label>
+                </label>
 
-              <label>
+                <label>
                 URL
                 <input id="importUrl" name="url" placeholder="可留空，会从输入内容里识别 URL" />
-              </label>
+                </label>
+              </details>
 
               <div class="import-actions">
                 <button type="button" id="clearImportButton">清空</button>
-                <button type="submit" class="primary-button">解析预览</button>
+                <button id="previewImportButton" type="submit" class="primary-button">解析预览</button>
               </div>
             </form>
 
@@ -341,10 +351,13 @@
                 </label>
               </div>
 
-              <label>
-                过滤后的内容
-                <textarea id="previewContent" rows="16" placeholder="解析后会显示可确认的正文"></textarea>
-              </label>
+              <section>
+                <div id="previewReadableContent" class="preview-readable markdown-body">解析后会显示可阅读的正文。</div>
+                <details class="import-advanced">
+                  <summary>查看和编辑提取文本</summary>
+                  <label>提取后的内容<textarea id="previewContent" rows="16" placeholder="解析后会显示正文"></textarea></label>
+                </details>
+              </section>
 
               <section class="summary-box">
                 <div class="preview-header">
@@ -359,7 +372,8 @@
 
               <div class="import-actions">
                 <button type="button" id="copyPreviewButton">复制预览</button>
-                <button type="button" id="confirmImportButton" class="primary-button" disabled>确认导入</button>
+                <button type="button" id="confirmImportButton" class="primary-button" disabled>一次保存</button>
+                <button type="button" id="subscribeImportButton" disabled>持续关注</button>
               </div>
             </section>
           </section>
@@ -393,6 +407,7 @@
             <div class="subscription-toolbar">
               <div id="subscriptionTabs" class="subscription-tabs" role="tablist" aria-label="订阅来源"></div>
               <div class="subscription-toolbar-actions">
+                <button id="subscriptionConnectionSettingsButton" type="button">连接设置</button>
                 <button id="runAllSubscriptionsButton" type="button">刷新所有</button>
                 <button id="saveSubscriptionsButton" type="button" class="primary-button">保存订阅设置</button>
               </div>
@@ -555,7 +570,19 @@
             <section class="settings-section" data-settings-panel="capture" hidden>
               <h3>页面来源认证</h3>
               <p>抓取会优先调用 Jira、Confluence、GitHub 或 Microsoft Graph API，API 不可用时再回退到 HTML/WebDriver。Token、Cookie 或 Basic 认证仅保存在本机。</p>
+              <form id="addSourceProfileForm" class="source-profile-add">
+                <input id="newSourceHostname" placeholder="来源域名，例如 jira.example.com" />
+                <select id="newSourceType"><option value="web">网页</option><option value="jira">Jira</option><option value="confluence">Confluence</option><option value="github">GitHub</option><option value="teams">Teams</option></select>
+                <button type="submit">添加来源实例</button>
+              </form>
               <div id="sourceProfiles" class="source-profiles"></div>
+            </section>
+
+            <section class="settings-section" data-settings-panel="capture" hidden>
+              <h3>浏览器捕获配对</h3>
+              <p>复制配对信息后，在 Teams 用户脚本菜单中粘贴。配对令牌不会默认显示或保存到页面。</p>
+              <div class="webdriver-actions"><button id="copyCapturePairingButton" type="button">复制配对信息</button></div>
+              <p id="capturePairingStatus" class="status-message">尚未复制配对信息。</p>
             </section>
 
             <section class="settings-section" data-settings-panel="capture" hidden>
@@ -793,10 +820,29 @@
       </form>
     </dialog>
 
+    <dialog id="teamsReadyDialog" class="teams-ready-dialog">
+      <form method="dialog">
+        <div class="dialog-header">
+          <div>
+            <h3>确认 Teams 已就绪</h3>
+            <p>刷新正在等待你完成 Teams Web 登录。</p>
+          </div>
+        </div>
+        <div class="teams-ready-note">
+          请在 WebDriver 窗口中完成登录，选择“使用 Web 应用”，并进入能看到聊天列表和聊天内容的页面。确认后，应用会在当前页面内依次查找目标对话，不会打开对话深链接或新窗口。
+        </div>
+        <p id="teamsReadyStatus" class="status-message">确认聊天列表和聊天窗口可见后再继续。</p>
+        <div class="dialog-actions">
+          <button type="button" id="cancelTeamsRefreshButton">取消此次刷新</button>
+          <button type="button" id="confirmTeamsReadyButton" class="primary-button">聊天窗口已就绪，开始抓取</button>
+        </div>
+      </form>
+    </dialog>
+
     <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
 
     <script src="/vendor/purify.min.js"></script>
     <script src="/vendor/marked.umd.js"></script>
-    <script type="module" src="/app.js?v=4"></script>
+    <script type="module" src="/app.js?v=20260922-verified"></script>
   </body>
 </html>

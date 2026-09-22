@@ -1,158 +1,77 @@
-// OpenAI-compatible API client — eliminates ~200 lines of repeated fetch boilerplate.
-// Reads settings lazily via a getter so it always uses the latest config.
-//
-// Usage:
-//   import { createAiClient } from "./ai-client.js";
-//   const ai = createAiClient(() => settings);
-//   const answer = await ai.chat([{ role: "user", content: "..." }]);
-//   const vectors = await ai.createEmbeddings(["text to embed"]);
-
-export function createAiClient(getSettings) {
-  function aiConfig() {
-    const s = getSettings();
-    if (!s.ai?.baseUrl || !s.ai?.apiKey || !s.ai?.model) {
-      throw new Error("请先在设置页配置 AI 接口（Base URL、API Key、Model）。");
-    }
-    const baseUrl = s.ai.baseUrl.replace(/\/+$/, "");
-    return {
-      baseUrl,
-      apiKey: s.ai.apiKey,
-      model: s.ai.model,
-      endpoint: `${baseUrl}/chat/completions`
-    };
+// Model transport: policy is checked immediately before sending any content.
+export function createAiClient(getSettings, { authorize = () => {} } = {}) {
+  function config(purpose) {
+    const value = getSettings()[purpose === 'embedding' ? 'embedding' : 'ai'];
+    if (!value?.baseUrl || !value?.apiKey || !value?.model) throw new Error('请先在设置中配置模型接口、API Key 和模型名称。');
+    const baseUrl = value.baseUrl.replace(/\/+$/, '');
+    if (!/^https?:\/\//i.test(baseUrl)) throw new Error('模型接口必须是 HTTP 或 HTTPS 地址。');
+    return { ...value, baseUrl };
   }
 
-  function embeddingConfig() {
-    const s = getSettings();
-    if (!s.embedding?.baseUrl || !s.embedding?.apiKey || !s.embedding?.model) {
-      throw new Error("请先在设置页配置 Embedding 接口。");
-    }
-    const baseUrl = s.embedding.baseUrl.replace(/\/+$/, "");
-    return {
-      baseUrl,
-      apiKey: s.embedding.apiKey,
-      model: s.embedding.model,
-      dimensions: Number(s.embedding.dimensions || 0)
-    };
+  async function request(purpose, body, opts = {}) {
+    authorize(opts.materials, purpose);
+    const c = config(purpose);
+    const controller = new AbortController();
+    const abort = () => controller.abort(opts.signal?.reason);
+    if (opts.signal?.aborted) abort();
+    opts.signal?.addEventListener('abort', abort, { once: true });
+    const timer = setTimeout(() => controller.abort(new Error('模型请求超时，请重试。')), opts.timeoutMs || 120000);
+    const cleanup = () => { clearTimeout(timer); opts.signal?.removeEventListener('abort', abort); };
+    try {
+      const response = await fetch(`${c.baseUrl}/${purpose === 'embedding' ? 'embeddings' : 'chat/completions'}`, {
+        method: 'POST', redirect: 'error', signal: controller.signal,
+        headers: { Authorization: `Bearer ${c.apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...body, model: c.model, ...(purpose === 'embedding' && Number(c.dimensions) > 0 ? {dimensions: Number(c.dimensions)} : {}) })
+      });
+      if (!response.ok) {
+        await response.body?.cancel();
+        throw new Error(`模型请求失败（HTTP ${response.status}），请检查接口和授权。`);
+      }
+      if (!response.body) throw new Error('模型接口未返回内容。');
+      const reader = response.body.getReader();
+      let bytes = 0;
+      const stream = new ReadableStream({
+        async pull(target) {
+          try {
+            const result = await reader.read();
+            if (result.done) { cleanup(); target.close(); return; }
+            bytes += result.value.byteLength;
+            if (bytes > 32 * 1024 * 1024) throw new Error('模型响应超过大小限制。');
+            target.enqueue(result.value);
+          } catch (error) { cleanup(); controller.abort(); target.error(error); }
+        },
+        async cancel(reason) { cleanup(); controller.abort(); await reader.cancel(reason).catch(() => {}); }
+      });
+      return new Response(stream, {status: response.status, headers: response.headers});
+    } catch (error) { cleanup(); throw error; }
   }
 
-  // ---- Chat completions (non-streaming) ----
-
-  async function chatRaw(messages, opts = {}) {
-    const { endpoint, apiKey, model } = aiConfig();
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model,
-        temperature: opts.temperature ?? 0.2,
-        ...(opts.extraBody || {}),
-        messages
-      })
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`AI 请求失败：${response.status} ${text.slice(0, 300)}`);
-    }
-
+  async function chatPayload(messages, opts = {}) {
+    const response = await request('ai', {temperature: opts.temperature ?? 0.2, ...opts.extraBody, messages}, opts);
     return response.json();
   }
-
-  // Convenience: chat and return just the content text.
   async function chat(messages, opts = {}) {
-    const payload = await chatRaw(messages, opts);
+    const payload = await chatPayload(messages, opts);
     const text = payload.choices?.[0]?.message?.content?.trim();
-    if (!text) {
-      throw new Error("AI 接口没有返回可用内容。");
-    }
+    if (!text) throw new Error('AI 接口没有返回可用内容。');
     return text;
   }
-
-  // Return the full parsed JSON payload (for callers that need more than text).
-  async function chatPayload(messages, opts = {}) {
-    return chatRaw(messages, opts);
-  }
-
-  // ---- Chat completions (streaming) ----
-
   async function chatStreamResponse(messages, opts = {}) {
-    const { endpoint, apiKey, model } = aiConfig();
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model,
-        temperature: opts.temperature ?? 0.2,
-        stream: true,
-        messages
-      })
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`AI 请求失败：${response.status} ${text.slice(0, 300)}`);
-    }
-
-    if (!response.body) {
-      throw new Error("AI 接口没有返回可读取的流。");
-    }
-
-    return response;
+    return request('ai', {temperature: opts.temperature ?? 0.2, stream: true, messages}, opts);
   }
-
-  // ---- Embeddings ----
-
-  async function createEmbeddings(inputs) {
+  async function createEmbeddings(inputs, opts = {}) {
     if (!inputs.length) return [];
-    const { baseUrl, apiKey, model, dimensions } = embeddingConfig();
-
-    const response = await fetch(`${baseUrl}/embeddings`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model,
-        input: inputs,
-        ...(dimensions > 0 ? { dimensions } : {})
-      })
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Embedding 生成失败：${response.status} ${text.slice(0, 300)}`);
-    }
-
+    const response = await request('embedding', {input: inputs}, opts);
     const payload = await response.json();
-    const data = Array.isArray(payload.data) ? payload.data : [];
-    return data
-      .sort((a, b) => Number(a.index || 0) - Number(b.index || 0))
-      .map((item) => Array.isArray(item.embedding) ? item.embedding.map(Number) : []);
-  }
-
-  // Convenience: single embedding.
-  async function createEmbedding(text) {
-    const vectors = await createEmbeddings([text]);
-    return vectors[0] || [];
-  }
-
-  return {
-    chat,
-    chatPayload,
-    chatStreamResponse,
-    createEmbedding,
-    createEmbeddings,
-    // Exposed for callers that need to check endpoint hostname for trace messages.
-    get endpointHost() {
-      try { return new URL(aiConfig().baseUrl).hostname; } catch { return ""; }
+    const values = Array.isArray(payload.data) ? payload.data.slice().sort((a,b) => a.index - b.index) : [];
+    if (values.length !== inputs.length || values.some((value, index) => value.index !== index || !Array.isArray(value.embedding) || !value.embedding.length || value.embedding.some(n => !Number.isFinite(n)))) {
+      throw new Error('Embedding 接口返回了不完整或无效的向量。');
     }
-  };
+    const dimension = values[0].embedding.length;
+    if (values.some(value => value.embedding.length !== dimension)) throw new Error('Embedding 向量维度不一致。');
+    return values.map(value => value.embedding);
+  }
+  async function createEmbedding(text, opts = {}) { return (await createEmbeddings([text], opts))[0]; }
+  return {chat, chatPayload, chatStreamResponse, createEmbedding, createEmbeddings,
+    get endpointHost() { try { return new URL(config('ai').baseUrl).hostname; } catch { return ''; } }};
 }
