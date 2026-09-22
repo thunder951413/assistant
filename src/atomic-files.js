@@ -13,7 +13,8 @@ export async function atomicWriteFile(target, content, options = {}) {
   try {
     await fs.writeFile(temporary, content, options);
     // Syncing the file makes a successful rename durable on platforms that support it.
-    const handle = await fs.open(temporary, "r");
+    // Windows FlushFileBuffers requires a handle opened with write access.
+    const handle = await fs.open(temporary, "r+");
     try { await handle.sync(); } finally { await handle.close(); }
     await fs.rename(temporary, target);
     // Best effort: directory fsync is unsupported on some platforms.

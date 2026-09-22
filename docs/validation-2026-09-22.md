@@ -29,3 +29,7 @@ This change improves material import, source subscriptions, reading, persistent 
 ## Boundaries
 
 Virtualized Teams capture is explicitly partial, not an assertion that all historical messages were retrieved. Images retain available descriptions/placeholders without OCR. The authenticated browser test does not cover the desktop application's separate first-login flow, Graph API, or team channels. Full provider pagination and cross-process file locking remain outside this change.
+
+## Cross-platform build correction
+
+The first GitHub Windows run exposed an EPERM error when syncing a temporary file opened read-only. Atomic writes now flush through a writable handle. CI runs the full suite on Linux, Windows, and macOS so this platform-specific path is checked on every push.
