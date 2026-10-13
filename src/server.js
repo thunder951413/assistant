@@ -27,6 +27,8 @@ import { areCaptureTitlesConsistent, isSupportedCaptureContentType, paginate } f
 import { collectVirtualTeamsMessages, extractTeamsMessagesFromDocument, mergeTeamsCaptureMessages, mergeTeamsCommentsByIdentity, nextDueCaptureSlot, normalizeCaptureCompleteness, prepareListCapture, readResponseBodyLimited, shouldCloseOwnedWebdriverSession, teamsCaptureMessageKeys, withWebdriverSessionQueue } from "./capture-policy.js";
 import { createItemStore, renderDocument, extractBodyFromDocument, extractSummaryFromDocument } from "./item-store.js";
 import { computeSourceHealth, createRunHistory, lineDiff } from "./reliability.js";
+import { collectConfluenceComments, normalizeConfluenceComment } from "./sources/confluence-comments.js";
+import { collectPullRequestDiscussion, renderGithubDiscussionEntry } from "./sources/github-pull.js";
 import { BROWSER_DISK_CACHE_BYTES, browserCacheSize, cleanupBrowserCaches, directorySize, maintainSnapshots, trimBrowserProfileIfLarge, writeItemSnapshot } from "./storage-maintenance.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -4842,7 +4844,11 @@ async function requestSourceJson(url, adapter, options = {}) {
     if (response.status === 304) {
       return { data: null, raw: "", response, notModified: true };
     }
-    if (!response.ok) throw new Error(`Source API request failed: ${response.status} ${response.statusText}`);
+    if (!response.ok) {
+      const error = new Error(`Source API request failed: ${response.status} ${response.statusText}`);
+      error.status = response.status;
+      throw error;
+    }
     const raw = await readResponseBodyLimited(response, MAX_FETCH_BYTES, controller.signal);
     return { data: JSON.parse(raw), raw, response };
   } finally {
@@ -4988,19 +4994,15 @@ async function fetchConfluenceFromApi(url, adapter, options = {}) {
   let commentResult;
   let commentsFetchFailed = false;
   try {
-    commentResult = await requestSourceJson(`${origin}/rest/api/content/${encodeURIComponent(pageId)}/child/comment?limit=200&expand=body.storage,version`, adapter, options);
+    commentResult = await collectConfluenceComments(origin, pageId, (commentUrl) => requestSourceJson(commentUrl, adapter, options));
   } catch (error) {
     if (options.signal?.aborted || error?.name === "AbortError") throw error;
     commentsFetchFailed = true;
-    commentResult = { data: { results: [] } };
+    commentResult = { results: [], truncated: false, pageCount: 0, repliesIncluded: false };
   }
   const page = result.data || {};
   const bodyHtml = page.body?.storage?.value || "";
-  const comments = (commentResult.data?.results || []).map((comment) => ({
-    id: String(comment.id || ""), author: cleanText(comment.version?.by?.displayName || ""),
-    createdAt: cleanText(comment.version?.when || ""), body: confluenceHtmlToMarkdown(comment.body?.storage?.value || "", url),
-    url: `${url}#comment-${comment.id}`
-  }));
+  const comments = commentResult.results.map((comment) => normalizeConfluenceComment(comment, url, confluenceHtmlToMarkdown));
   const title = cleanText(page.title || url);
   const labels = (page.metadata?.labels?.results || []).map((label) => label.name).filter(Boolean);
   return {
@@ -5012,9 +5014,9 @@ async function fetchConfluenceFromApi(url, adapter, options = {}) {
     url,
     fetchMethod: "confluence-rest",
     httpValidators: responseValidators(result.response),
-    commentsComplete: !commentsFetchFailed && !commentResult.data?._links?.next,
-    completeness: commentsFetchFailed || commentResult.data?._links?.next ? "partial" : "complete",
-    coverage: { observedCount: comments.length, commentsFetchFailed, truncated: Boolean(commentResult.data?._links?.next) }
+    commentsComplete: !commentsFetchFailed && !commentResult.truncated,
+    completeness: commentsFetchFailed || commentResult.truncated ? "partial" : "complete",
+    coverage: { observedCount: comments.length, commentsFetchFailed, truncated: commentResult.truncated, pageCount: commentResult.pageCount, repliesIncluded: commentResult.repliesIncluded }
   };
 }
 
@@ -5048,13 +5050,27 @@ async function fetchGithubFromApi(url, adapter, options = {}) {
   if (!match || match[3].toLowerCase() === "discussions") return null;
   const [, owner, repo, kind, number] = match;
   const resource = kind.toLowerCase() === "pull" ? "pulls" : "issues";
-  const issueResult = await requestSourceJson(`${origin}/api/v3/repos/${owner}/${repo}/${resource}/${number}`, adapter, options);
-  const commentsResult = await requestSourceCollection(`${origin}/api/v3/repos/${owner}/${repo}/issues/${number}/comments?per_page=100`, adapter, options);
-  const issue = issueResult.data || {};
-  const comments = (commentsResult.data || []).map((comment) => ({ id: String(comment.id || ""), author: cleanText(comment.user?.login || ""), createdAt: cleanText(comment.created_at || ""), body: cleanText(comment.body || ""), url: cleanText(comment.html_url || "") }));
-  const title = `${owner}/${repo}#${number} ${cleanText(issue.title || "")}`;
+  const apiBase = `${origin}/api/v3/repos/${owner}/${repo}`;
+  const issueResult = await requestSourceJson(`${apiBase}/${resource}/${number}`, adapter, options);
   const isPullRequest = resource === "pulls";
-  return { raw: JSON.stringify({ issue, comments: commentsResult.data }, null, 2), title, text: [`# ${title}`, "", `Source: ${url}`, `Adapter: ${adapter.id}-api`, "", "## Fields", "", `- State: ${issue.state || "unknown"}`, `- Author: ${issue.user?.login || ""}`, `- Updated: ${issue.updated_at || ""}`, `- Labels: ${(issue.labels || []).map((label) => label.name).join(", ")}`, "", "## Description", "", cleanText(issue.body || "") || "_No description captured._", "", "## Comments", "", ...(comments.length ? comments.map((comment) => `### ${comment.author} · ${comment.createdAt}\n\n${comment.body}`) : ["_No comments captured._"])].join("\n"), comments, sourceUpdatedAt: latestTimestampValue([issue.updated_at, ...comments.map((comment) => comment.createdAt)]), url: issue.html_url || url, fetchMethod: "github-rest", httpValidators: responseValidators(issueResult.response), commentsComplete: !commentsResult.truncated, completeness: isPullRequest || commentsResult.truncated ? "partial" : "complete", coverage: { observedCount: comments.length, truncated: commentsResult.truncated, missing: isPullRequest ? ["pull reviews", "review comments"] : [] } };
+  const requestCollection = (collectionUrl) => requestSourceCollection(collectionUrl, adapter, options);
+  let discussion;
+  if (isPullRequest) {
+    discussion = await collectPullRequestDiscussion(apiBase, number, requestCollection);
+  } else {
+    const commentsResult = await requestCollection(`${apiBase}/issues/${number}/comments?per_page=100`);
+    discussion = {
+      comments: (commentsResult.data || []).map((comment) => ({ id: String(comment.id || ""), author: cleanText(comment.user?.login || ""), createdAt: cleanText(comment.created_at || ""), body: cleanText(comment.body || ""), url: cleanText(comment.html_url || "") })),
+      raw: { comments: commentsResult.data },
+      truncated: commentsResult.truncated,
+      missing: []
+    };
+  }
+  const issue = issueResult.data || {};
+  const comments = discussion.comments;
+  const title = `${owner}/${repo}#${number} ${cleanText(issue.title || "")}`;
+  const partial = discussion.truncated || discussion.missing.length > 0;
+  return { raw: JSON.stringify({ issue, ...discussion.raw }, null, 2), title, text: [`# ${title}`, "", `Source: ${url}`, `Adapter: ${adapter.id}-api`, "", "## Fields", "", `- State: ${issue.state || "unknown"}`, `- Author: ${issue.user?.login || ""}`, `- Updated: ${issue.updated_at || ""}`, `- Labels: ${(issue.labels || []).map((label) => label.name).join(", ")}`, "", "## Description", "", cleanText(issue.body || "") || "_No description captured._", "", "## Comments", "", ...(comments.length ? comments.map(renderGithubDiscussionEntry) : ["_No comments captured._"])].join("\n"), comments, sourceUpdatedAt: latestTimestampValue([issue.updated_at, ...comments.map((comment) => comment.createdAt)]), url: issue.html_url || url, fetchMethod: "github-rest", httpValidators: responseValidators(issueResult.response), commentsComplete: !partial, completeness: partial ? "partial" : "complete", coverage: { observedCount: comments.length, truncated: discussion.truncated, missing: discussion.missing } };
 }
 
 async function fetchTeamsFromGraph(url, adapter, options = {}) {
