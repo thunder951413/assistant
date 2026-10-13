@@ -37,6 +37,34 @@ async function readJsonLines(filePath) {
     .map((line) => JSON.parse(line));
 }
 
+// Recreates a directory tree with hard links instead of copying file contents.
+// Snapshot files are immutable once written, so sharing inodes between the live
+// item directory and a staged revision is safe and avoids copying megabytes of
+// history on every commit. Falls back to a copy where links are unsupported.
+async function linkTree(source, target) {
+  await fs.mkdir(target, { recursive: true });
+  for (const entry of await fs.readdir(source, { withFileTypes: true })) {
+    const from = path.join(source, entry.name);
+    const to = path.join(target, entry.name);
+    if (entry.isDirectory()) await linkTree(from, to);
+    else if (entry.isFile()) {
+      try { await fs.link(from, to); } catch { await fs.copyFile(from, to); }
+    }
+  }
+}
+
+async function fileStamp(filePath) {
+  try {
+    const stat = await fs.stat(filePath);
+    return `${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+  } catch (error) {
+    if (error.code === "ENOENT") return "-";
+    throw error;
+  }
+}
+
+const CACHED_ITEM_FILES = ["metadata.json", "document.md", "processed.md", "comments.jsonl"];
+
 // ---- Document formatting ----
 
 export function renderDocument(metadata, body, summary = "") {
@@ -89,6 +117,10 @@ export function createItemStore(getDirs) {
   function tagsDir() { return getDirs().tagsDir; }
   function indexesDir() { return getDirs().indexesDir; }
   let rebuildTail = Promise.resolve();
+  // Parsed item files keyed by id, validated against file inode/size/mtime so that
+  // edits made outside the store (an editor, a sync tool) are still picked up.
+  const readCache = new Map();
+  const derivedCache = new WeakMap();
   let operationTail = Promise.resolve();
   const diagnostics = [];
   const MAX_DIAGNOSTICS = 100;
@@ -175,27 +207,71 @@ export function createItemStore(getDirs) {
     });
   }
 
-  async function listNow(filters = {}) {
-    const dirs = await safeReaddir(itemsDir());
-    const items = [];
+  // Returns a shared, read-only view of one item. Callers must not mutate it.
+  async function readCachedNow(id) {
+    const dir = path.join(itemsDir(), id);
+    const stamps = await Promise.all(CACHED_ITEM_FILES.map((file) => fileStamp(path.join(dir, file))));
+    if (stamps[0] === "-") {
+      readCache.delete(id);
+      return null;
+    }
+    const stamp = `${dir}|${stamps.join("|")}`;
+    const cached = readCache.get(id);
+    if (cached?.stamp === stamp) return cached.entry;
+    const raw = await readNow(id);
+    const entry = Object.freeze({
+      id,
+      ...raw,
+      commentsText: raw.comments.map((comment) => JSON.stringify(comment)).join("\n")
+    });
+    readCache.set(id, { stamp, entry });
+    return entry;
+  }
 
-    for (const id of dirs) {
+  async function readAllNow({ onCorrupt } = {}) {
+    const entries = [];
+    const seen = new Set();
+    for (const id of await safeReaddir(itemsDir())) {
       if (id.startsWith(".")) continue;
-      let metadata; let document; let processedDocument;
       try {
         validateItemId(id);
-        const metadataPath = path.join(itemsDir(), id, "metadata.json");
-        if (!(await exists(metadataPath))) continue;
-        metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
-        document = await fs.readFile(path.join(itemsDir(), id, "document.md"), "utf8");
-        const processedPath = path.join(itemsDir(), id, "processed.md");
-        processedDocument = await exists(processedPath) ? await fs.readFile(processedPath, "utf8") : "";
+        const entry = await readCachedNow(id);
+        if (!entry) continue;
+        entries.push(entry);
+        seen.add(id);
       } catch (error) {
+        readCache.delete(id);
         const issue = recordDiagnostic({ id, error: error.message || String(error), observedAt: new Date().toISOString() });
-        filters.onCorrupt?.(issue);
-        continue;
+        onCorrupt?.(issue);
       }
-      const searchText = `${metadata.title} ${(metadata.tags || []).join(" ")} ${processedDocument} ${document}`.toLowerCase();
+    }
+    for (const id of readCache.keys()) if (!seen.has(id)) readCache.delete(id);
+    return entries;
+  }
+
+  // One lock acquisition for the whole scan instead of one per item, so a search
+  // never interleaves with (or queues behind) dozens of separate writes.
+  function readAll(options) {
+    return withRecoveredStoreLock(() => readAllNow(options));
+  }
+
+  // Memoizes derived values (search text, hashes) for an immutable cached entry.
+  function derived(entry, key, compute) {
+    let values = derivedCache.get(entry);
+    if (!values) {
+      values = new Map();
+      derivedCache.set(entry, values);
+    }
+    if (!values.has(key)) values.set(key, compute(entry));
+    return values.get(key);
+  }
+
+  async function listNow(filters = {}) {
+    const items = [];
+
+    for (const entry of await readAllNow({ onCorrupt: filters.onCorrupt })) {
+      const { metadata, document, processedDocument } = entry;
+      const searchText = () => derived(entry, "listSearchText", () => `${metadata.title} ${(metadata.tags || []).join(" ")} ${processedDocument} ${document}`.toLowerCase());
 
       // Filter hooks — callers can override via filter functions passed in options.
       if (filters.tag && !(metadata.tags || []).includes(filters.tag)) continue;
@@ -203,16 +279,16 @@ export function createItemStore(getDirs) {
       if (filters.integrityStatus && metadata.integrityStatus !== filters.integrityStatus) continue;
       if (filters.dateFrom && String(metadata.updatedAt || "") < String(filters.dateFrom)) continue;
       if (filters.dateTo && String(metadata.updatedAt || "") > String(filters.dateTo)) continue;
-      if (filters.query && !searchText.includes(filters.query.toLowerCase())) continue;
+      if (filters.query && !searchText().includes(filters.query.toLowerCase())) continue;
 
       // Optional predicate filter — allows server.js to apply its own business-logic filters
       // (e.g. includeLists, includeInvalidTeamsRoot, updates-only).
-      if (typeof filters.predicate === "function" && !filters.predicate(metadata, { processedDocument, searchText })) continue;
+      if (typeof filters.predicate === "function" && !filters.predicate(metadata, { processedDocument, get searchText() { return searchText(); } })) continue;
 
       items.push({
         ...metadata,
         hasProcessed: Boolean(processedDocument),
-        excerpt: summarizeExcerpt(processedDocument || document)
+        excerpt: derived(entry, "excerpt", () => summarizeExcerpt(processedDocument || document))
       });
     }
 
@@ -332,7 +408,10 @@ export function createItemStore(getDirs) {
       const target = path.join(itemsDir(), id);
       await fs.mkdir(staged, { recursive: true });
       try {
-      if (await exists(target)) await fs.cp(target, staged, { recursive: true, force: true });
+      if (await exists(target)) {
+        await fs.cp(target, staged, { recursive: true, force: true, filter: (source) => source !== path.join(target, "snapshots") });
+        if (await exists(path.join(target, "snapshots"))) await linkTree(path.join(target, "snapshots"), path.join(staged, "snapshots"));
+      }
       let metadata = payload.metadata === undefined ? undefined : { ...payload.metadata };
       if (metadata?.id !== undefined && metadata.id !== id) throw new Error("Metadata id must match item id.");
       if (metadata?.rawFileName !== undefined && !/^raw\.[a-z0-9._-]+$/i.test(String(metadata.rawFileName))) throw new Error("Invalid raw file name.");
@@ -454,6 +533,8 @@ export function createItemStore(getDirs) {
 
   return {
     read,
+    readAll,
+    derived,
     list,
     search,
     delete: deleteItem,

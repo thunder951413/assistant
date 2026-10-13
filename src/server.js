@@ -5,7 +5,7 @@ import { atomicWriteFile } from "./atomic-files.js";
 import { exportBundle, importBundle } from "./bundle-store.js";
 import { assertModelMaterials, canUseMaterial, matchesMaterialFilters, normalizeChatHistory } from "./ai-policy.js";
 import { createChatSessionStore } from "./chat-session-store.js";
-import { promises as fs } from "node:fs";
+import { promises as fs, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
@@ -30,6 +30,9 @@ import { computeSourceHealth, createRunHistory, lineDiff } from "./reliability.j
 import { BROWSER_DISK_CACHE_BYTES, browserCacheSize, cleanupBrowserCaches, directorySize, maintainSnapshots, trimBrowserProfileIfLarge, writeItemSnapshot } from "./storage-maintenance.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const APP_VERSION = (() => {
+  try { return JSON.parse(readFileSync(path.join(__dirname, "..", "package.json"), "utf8")).version || "unknown"; } catch { return "unknown"; }
+})();
 const rootDir = path.resolve(__dirname, "..");
 const publicDir = path.join(rootDir, "public");
 const configDir = resolveWritableDir(process.env.ASSISTANT_CONFIG_DIR, path.join(rootDir, ".config"));
@@ -2324,8 +2327,15 @@ async function listItems(filters = {}) {
   });
 }
 
-async function searchItems(query) {
-  return store.search(query);
+// The lightweight /api/search endpoint and the Codex ask-context helper share the
+// same ranking as chat, so all entry points agree on what is relevant.
+async function searchItems(query, limit = 10) {
+  if (!cleanText(query)) return [];
+  const results = await searchKnowledgeBase(query, limit);
+  return results.map(({ score, item }) => {
+    const { paths, ...metadata } = item;
+    return { score, item: metadata };
+  });
 }
 
 async function buildAskContext(question) {
@@ -2607,73 +2617,59 @@ function parseOpenAIStreamPayloads(chunk) {
 async function searchKnowledgeBase(query, limit = 8, filters = {}) {
   const terms = tokenizeQuery(query);
   const desiredLimit = Math.min(100, Math.max(1, Number(limit) || 8));
-  const embeddingEnabled = isEmbeddingEnabled();
-  const dirs = await safeReaddir(itemsDir);
+  const materials = await readAllMaterialsForSearch();
   const results = [];
 
-  for (const id of dirs) {
-    const material = await readMaterialForSearch(id);
-    if (!material) continue;
-    const { metadata, document, processedDocument, commentsText, paths } = material;
+  for (const material of materials.values()) {
+    const { metadata } = material;
     if (!matchesMaterialFilters(metadata, filters, settings)) continue;
-    if (filters.remoteAiOnly && !isRemoteAiAllowed(metadata)) continue;
-    if (filters.sourceType && metadata.sourceType !== filters.sourceType) continue;
-    if (filters.tag && !(metadata.tags || []).includes(filters.tag)) continue;
-    if (filters.dateFrom && String(metadata.updatedAt || "") < String(filters.dateFrom)) continue;
-    if (filters.dateTo && String(metadata.updatedAt || "") > String(filters.dateTo)) continue;
-    const haystack = `${metadata.title}\n${(metadata.tags || []).join(" ")}\n${metadata.sourceType}\n${metadata.url || ""}\n${processedDocument}\n${document}\n${commentsText}`.toLowerCase();
-    const score = scoreKnowledgeMatch(haystack, terms, metadata);
-
+    const score = scoreKnowledgeMatch(material.haystack, terms, metadata);
     if (score > 0 || !terms.length) {
-      results.push({
-        score,
-        keywordScore: score,
-        vectorScore: 0,
-        item: {
-          ...metadata,
-          paths
-        },
-        context: buildKnowledgeContext(processedDocument || document, commentsText, terms)
-      });
+      results.push({ score, keywordScore: score, vectorScore: 0, item: { ...metadata, paths: material.paths }, material });
     }
   }
 
-  if (!embeddingEnabled) {
-    const sorted = results
-      .sort((a, b) => b.score - a.score || String(b.item.updatedAt).localeCompare(String(a.item.updatedAt)));
-    return diversifyKnowledgeResults(sorted, desiredLimit, terms);
+  let ranked;
+  if (isEmbeddingEnabled()) {
+    try {
+      const vectorResults = await searchKnowledgeBaseByEmbedding(query, desiredLimit * 2, filters, materials);
+      ranked = mergeKnowledgeResults(results, vectorResults);
+    } catch (error) {
+      console.error("Embedding search failed, falling back to keyword search:", error);
+    }
   }
+  ranked ||= results.sort((a, b) => b.score - a.score || String(b.item.updatedAt).localeCompare(String(a.item.updatedAt)));
 
-  try {
-    const vectorResults = await searchKnowledgeBaseByEmbedding(query, terms, desiredLimit * 2, filters);
-    const merged = mergeKnowledgeResults(results, vectorResults).filter(result => matchesMaterialFilters(result.item, filters, settings));
-    return diversifyKnowledgeResults(merged, desiredLimit, terms);
-  } catch (error) {
-    console.error("Embedding search failed, falling back to keyword search:", error);
-    const sorted = results
-      .sort((a, b) => b.score - a.score || String(b.item.updatedAt).localeCompare(String(a.item.updatedAt)));
-    return diversifyKnowledgeResults(sorted, desiredLimit, terms);
-  }
+  // Context snippets are only built for the results actually returned.
+  return diversifyKnowledgeResults(ranked, desiredLimit, terms).map(({ material, bestChunk, ...result }) => ({
+    ...result,
+    context: bestChunk
+      ? buildVectorKnowledgeContext(bestChunk, material.processedDocument || material.document, material.commentsText, terms)
+      : buildKnowledgeContext(material.processedDocument || material.document, material.commentsText, terms)
+  }));
 }
 
-async function readMaterialForSearch(id) {
-  try {
-    const item = await store.read(id);
-    const itemDir = path.join(itemsDir, id);
-    const processedDocument = item.metadata.processedStale ? "" : item.processedDocument;
+function toSearchMaterial(entry) {
+  return store.derived(entry, "searchMaterial", () => {
+    const itemDir = path.join(itemsDir, entry.id);
+    const { metadata, document } = entry;
+    const processedDocument = metadata.processedStale ? "" : entry.processedDocument;
     return {
-      ...item, processedDocument,
-      commentsText: item.comments.map(comment => JSON.stringify(comment)).join("\n"),
+      metadata, document, processedDocument,
+      commentsText: entry.commentsText,
+      haystack: `${metadata.title}\n${(metadata.tags || []).join(" ")}\n${metadata.sourceType}\n${metadata.url || ""}\n${processedDocument}\n${document}\n${entry.commentsText}`.toLowerCase(),
       paths: {
         metadata: path.join(itemDir, "metadata.json"), document: path.join(itemDir, "document.md"),
         processed: processedDocument ? path.join(itemDir, "processed.md") : "",
-        comments: path.join(itemDir, "comments.jsonl"), raw: path.join(itemDir, item.metadata.rawFileName || "raw.txt")
+        comments: path.join(itemDir, "comments.jsonl"), raw: path.join(itemDir, metadata.rawFileName || "raw.txt")
       }
     };
-  } catch (error) {
-    if (!id.startsWith(".")) console.warn(`Skipping unreadable material ${id}: ${error.message}`);
-    return null;
-  }
+  });
+}
+
+async function readAllMaterialsForSearch() {
+  const entries = await store.readAll({ onCorrupt: (issue) => console.warn(`Skipping unreadable material ${issue.id}: ${issue.error}`) });
+  return new Map(entries.map((entry) => [entry.id, toSearchMaterial(entry)]));
 }
 
 function diversifyKnowledgeResults(results, limit, terms) {
@@ -2707,11 +2703,12 @@ function diversifyKnowledgeResults(results, limit, terms) {
   return selected.sort((a, b) => b.score - a.score || String(b.item.updatedAt).localeCompare(String(a.item.updatedAt)));
 }
 
-async function searchKnowledgeBaseByEmbedding(query, terms, limit, filters = {}) {
+async function searchKnowledgeBaseByEmbedding(query, limit, filters = {}, materials = null) {
   const cleanQuery = cleanText(query);
   if (!cleanQuery) return [];
-  const index = await ensureEmbeddingIndex();
-  if (!index.records.length) return [];
+  materials ||= await readAllMaterialsForSearch();
+  const index = await embeddingIndexForQuery(materials);
+  if (!index?.records?.length) return [];
 
   const queryVector = await createEmbedding(cleanQuery);
   const bestByItem = new Map();
@@ -2726,26 +2723,25 @@ async function searchKnowledgeBaseByEmbedding(query, terms, limit, filters = {})
 
   const candidates = [...bestByItem.values()]
     .filter((candidate) => candidate.vectorScore > 0.2)
-    .sort((a, b) => b.vectorScore - a.vectorScore)
-;
+    .sort((a, b) => b.vectorScore - a.vectorScore);
 
   const results = [];
   for (const candidate of candidates) {
-    const material = await readMaterialForSearch(candidate.record.itemId);
+    // Policy is re-checked against current metadata: a stale index may still hold
+    // records for items that were since deleted, quarantined or restricted.
+    const material = materials.get(candidate.record.itemId);
     if (!material || !matchesMaterialFilters(material.metadata, filters, settings) || !canUseMaterial(material.metadata, settings, "embedding")) continue;
-    const { metadata, document, processedDocument, commentsText, paths } = material;
     results.push({
       score: candidate.vectorScore * 20,
       keywordScore: 0,
       vectorScore: candidate.vectorScore,
-      item: {
-        ...metadata,
-        paths
-      },
-      context: buildVectorKnowledgeContext(candidate.record.text, processedDocument || document, commentsText, terms)
+      item: { ...material.metadata, paths: material.paths },
+      material,
+      bestChunk: candidate.record.text
     });
+    if (results.length >= Math.max(1, limit)) break;
   }
-  return results.slice(0, Math.max(1, limit));
+  return results;
 }
 
 function mergeKnowledgeResults(keywordResults, vectorResults) {
@@ -2764,7 +2760,7 @@ function mergeKnowledgeResults(keywordResults, vectorResults) {
       keywordScore,
       vectorScore,
       score: keywordScore + vectorScore * 20,
-      context: result.vectorScore > (previous.vectorScore || 0) ? result.context : previous.context
+      bestChunk: result.vectorScore > (previous.vectorScore || 0) ? result.bestChunk : previous.bestChunk
     });
   }
   return [...merged.values()]
@@ -2792,48 +2788,98 @@ function embeddingConfigKey() {
   ].join("|");
 }
 
-async function ensureEmbeddingIndex() {
+const EMBEDDING_QUERY_WAIT_MS = 2500;
+const embeddingIndexState = { status: "idle", error: "", updatedAt: "", records: 0 };
+let embeddingIndexMemo = null;
+
+// Uses the freshest index available without making a question wait for a full
+// (re)build: an up-to-date index is used directly; otherwise the build runs in the
+// background and the query waits at most EMBEDDING_QUERY_WAIT_MS before falling back
+// to the previous index (or to keyword-only results when none exists yet).
+async function embeddingIndexForQuery(materials) {
+  const build = ensureEmbeddingIndex(materials);
+  build.catch((error) => {
+    embeddingIndexState.status = "failed";
+    embeddingIndexState.error = error.message || String(error);
+    console.error("Embedding index build failed:", error);
+  });
+  const timeout = new Promise((resolve) => setTimeout(() => resolve(null), EMBEDDING_QUERY_WAIT_MS).unref?.());
+  const ready = await Promise.race([build.catch(() => null), timeout]);
+  if (ready) return ready;
+  return readSavedEmbeddingIndex();
+}
+
+async function readSavedEmbeddingIndex() {
+  const filePath = embeddingIndexPath();
+  const configKey = embeddingConfigKey();
+  if (embeddingIndexMemo?.filePath === filePath && embeddingIndexMemo.index.configKey === configKey) return embeddingIndexMemo.index;
+  try {
+    const saved = JSON.parse(await fs.readFile(filePath, "utf8"));
+    if (saved?.version === 2 && saved.configKey === configKey) {
+      embeddingIndexMemo = { filePath, index: saved };
+      return saved;
+    }
+  } catch {}
+  return null;
+}
+
+function ensureEmbeddingIndex(materials = null) {
   const filePath = embeddingIndexPath();
   const configKey = embeddingConfigKey();
   const key = `${filePath}|${configKey}`;
   if (embeddingBuilds.has(key)) return embeddingBuilds.get(key);
   const build = (async () => {
     await fs.mkdir(path.dirname(filePath), { recursive: true });
-    const manifest = await buildEmbeddingManifest();
-    let saved = null;
-    try { saved = JSON.parse(await fs.readFile(filePath, "utf8")); } catch {}
-    if (saved?.version !== 2 || saved.configKey !== configKey) saved = null;
+    materials ||= await readAllMaterialsForSearch();
+    const manifest = buildEmbeddingManifest(materials);
+    const saved = await readSavedEmbeddingIndex();
     if (saved && JSON.stringify(saved.manifest) === JSON.stringify(manifest)) return saved;
-    const rebuilt = await rebuildEmbeddingIndex(manifest, saved);
+    embeddingIndexState.status = "building";
+    embeddingIndexState.error = "";
+    const rebuilt = await rebuildEmbeddingIndex(manifest, saved, materials);
     if (filePath !== embeddingIndexPath() || configKey !== embeddingConfigKey()) throw new Error("索引配置已变更，请重新检索。");
     const temp = `${filePath}.tmp`;
     await fs.writeFile(temp, JSON.stringify(rebuilt), { encoding: "utf8", mode: 0o600 });
     await fs.rename(temp, filePath);
+    embeddingIndexMemo = { filePath, index: rebuilt };
+    Object.assign(embeddingIndexState, { status: "ready", error: "", updatedAt: rebuilt.generatedAt, records: rebuilt.records.length });
     return rebuilt;
   })();
   embeddingBuilds.set(key, build);
-  try { return await build; } finally { embeddingBuilds.delete(key); }
+  build.finally(() => embeddingBuilds.delete(key)).catch(() => {});
+  return build;
 }
 
-async function buildEmbeddingManifest() {
+function buildEmbeddingManifest(materials) {
   const manifest = [];
-  for (const id of await safeReaddir(itemsDir)) {
-    const material = await readMaterialForSearch(id);
-    if (!material || material.metadata.pageKind === "list" || !canUseMaterial(material.metadata, settings, "embedding")) continue;
-    const contentHash = createHash("sha256").update(JSON.stringify(chunkMaterialForEmbedding(material))).digest("hex");
-    manifest.push({ id, contentHash });
+  for (const [id, material] of materials) {
+    if (material.metadata.pageKind === "list" || !canUseMaterial(material.metadata, settings, "embedding")) continue;
+    manifest.push({ id, contentHash: embeddingContentHash(material) });
   }
   return manifest.sort((a, b) => a.id.localeCompare(b.id));
 }
 
-async function rebuildEmbeddingIndex(manifest, previous = null) {
+const embeddingHashes = new WeakMap();
+function embeddingContentHash(material) {
+  if (!embeddingHashes.has(material)) {
+    embeddingHashes.set(material, createHash("sha256").update(JSON.stringify(chunkMaterialForEmbedding(material))).digest("hex"));
+  }
+  return embeddingHashes.get(material);
+}
+
+async function rebuildEmbeddingIndex(manifest, previous = null, materials) {
   const records = [];
   const hashes = new Map((previous?.manifest || []).map(entry => [entry.id, entry.contentHash]));
+  const previousRecords = new Map();
+  for (const record of previous?.records || []) {
+    if (!previousRecords.has(record.itemId)) previousRecords.set(record.itemId, []);
+    previousRecords.get(record.itemId).push(record);
+  }
   for (const entry of manifest) {
-    const material = await readMaterialForSearch(entry.id);
+    const material = materials.get(entry.id);
     if (!material || !canUseMaterial(material.metadata, settings, "embedding")) continue;
     if (hashes.get(entry.id) === entry.contentHash) {
-      records.push(...(previous.records || []).filter(record => record.itemId === entry.id));
+      records.push(...(previousRecords.get(entry.id) || []));
       continue;
     }
     const chunks = chunkMaterialForEmbedding(material);
@@ -2892,35 +2938,6 @@ function buildVectorKnowledgeContext(bestChunk, document, commentsText, terms) {
   ].filter(Boolean).join("\n").slice(0, 6000);
 }
 
-async function readKnowledgeSearchResult(id, score, terms) {
-  const itemDir = path.join(itemsDir, id);
-  const metadataPath = path.join(itemDir, "metadata.json");
-  const documentPath = path.join(itemDir, "document.md");
-  if (!(await exists(metadataPath)) || !(await exists(documentPath))) return null;
-
-  const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
-  const document = await fs.readFile(documentPath, "utf8");
-  const processedPath = path.join(itemDir, "processed.md");
-  const processedDocument = await exists(processedPath) ? await fs.readFile(processedPath, "utf8") : "";
-  const commentsPath = path.join(itemDir, "comments.jsonl");
-  const comments = await readJsonLines(commentsPath);
-  const commentsText = comments.map((comment) => JSON.stringify(comment)).join("\n");
-  return {
-    score,
-    item: {
-      ...metadata,
-      paths: {
-        metadata: metadataPath,
-        document: documentPath,
-        processed: processedDocument ? processedPath : "",
-        comments: commentsPath,
-        raw: path.join(itemDir, metadata.rawFileName || "raw.txt")
-      }
-    },
-    context: buildKnowledgeContext(processedDocument || document, commentsText, terms)
-  };
-}
-
 function buildKnowledgeContext(document, commentsText, terms) {
   const body = extractBodyFromDocument(document);
   const summary = extractSummaryFromDocument(document);
@@ -2971,13 +2988,18 @@ function scoreKnowledgeMatch(haystack, terms, metadata) {
   let score = 0;
   for (const term of terms) {
     if (!term) continue;
-    const occurrences = haystack.split(term).length - 1;
-    score += Math.min(occurrences, 6);
+    score += countOccurrences(haystack, term, 6);
     if (String(metadata.title || "").toLowerCase().includes(term)) score += 6;
     if ((metadata.tags || []).some((tag) => tag.includes(term))) score += 4;
     if (String(metadata.sourceType || "").toLowerCase().includes(term)) score += 2;
   }
   return score;
+}
+
+function countOccurrences(text, term, cap) {
+  let count = 0;
+  for (let index = text.indexOf(term); index !== -1 && count < cap; index = text.indexOf(term, index + term.length)) count += 1;
+  return count;
 }
 
 function tokenizeQuery(query) {
@@ -7692,11 +7714,12 @@ async function serviceHealth() {
   const jobs = publicRefreshJobs();
   return {
     ok: true,
-    version: "0.1.0",
+    version: APP_VERSION,
     uptimeSeconds: Math.round(process.uptime()),
     timestamp: new Date().toISOString(),
     knowledgeBase: { root: kbDir, itemCount: items.length, quarantinedCount: items.filter((item) => item.integrityStatus === "quarantined").length },
     refresh: { jobCount: jobs.length, runningCount: jobs.filter((job) => job.running).length, failedCount: jobs.filter((job) => job.enabled && ["failed", "unreachable"].includes(job.status)).length, circuitOpenCount: jobs.filter((job) => job.enabled && job.circuitOpen).length },
+    embeddingIndex: isEmbeddingEnabled() ? { ...embeddingIndexState } : { status: "disabled" },
     disk
   };
 }
@@ -7889,9 +7912,8 @@ async function suggestSupplementalContext(existingEntries = []) {
 async function buildSupplementalAnalysisCorpus() {
   const chunks = [];
   const materials = [];
-  for (const id of (await safeReaddir(itemsDir)).slice(0, 80)) {
-    const material = await readMaterialForSearch(id);
-    if (!material || material.metadata.pageKind === "list" || !canUseMaterial(material.metadata, settings)) continue;
+  for (const material of [...(await readAllMaterialsForSearch()).values()].slice(0, 80)) {
+    if (material.metadata.pageKind === "list" || !canUseMaterial(material.metadata, settings)) continue;
     const { metadata, document } = material;
     chunks.push([`# ${metadata.title}`, `Source: ${metadata.sourceType}`, extractBodyFromDocument(document).slice(0, 1800)].join("\n"));
     materials.push(metadata);

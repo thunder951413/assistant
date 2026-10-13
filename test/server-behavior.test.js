@@ -116,6 +116,19 @@ describe('isolated HTTP application behavior',()=>{
     assert.equal(sent.filter(m=>m.role==='system').length,1);
     await request('/api/settings',{ai:{baseUrl:'',apiKey:'',model:''}},'PATCH');
   });
+  it('uses one ranking for /api/search, chat retrieval and date filters',async()=>{
+    await create('机顶盒编译指南',{content:'下载代码后执行 make 完成编译',tags:['构建']});
+    const search=await request('/api/search',{query:'编译步骤是什么'});
+    assert.equal(search.status,200);
+    assert.equal(search.results[0].item.title,'机顶盒编译指南');
+    assert.equal(search.results[0].item.paths,undefined);
+    const today=new Date().toISOString().slice(0,10);
+    const sameDay=await request('/api/knowledge-search',{query:'编译',filters:{dateTo:today}});
+    assert.ok(sameDay.results.some(r=>r.item.title==='机顶盒编译指南'),'items updated today match an end-of-day dateTo');
+    assert.match(sameDay.results.find(r=>r.item.title==='机顶盒编译指南').context,/make/);
+    const health=await request('/api/health',undefined,'GET');
+    assert.match(health.version,/^\d+\.\d+\.\d+/);
+  });
   it('keeps the current library if a replacement bundle is invalid',async()=>{
     const before=await request('/api/items',undefined,'GET');
     const invalid=await request('/api/import/data',{mode:'replace',bundle:{type:'material-organizer-data',files:[{path:'items/bad/metadata.json',encoding:'utf8',content:'{broken'},{path:'items/bad/document.md',encoding:'utf8',content:'body'}]}});

@@ -443,6 +443,43 @@ body
     const doc = `# Title\n\n## Content\n\nbody\n`;
     assert.equal(extractSummaryFromDocument(doc), "");
   });
+
+  it("serves cached reads but notices edits made outside the store", async () => {
+    const store = await makeTempStore();
+    const id = "cache-check";
+    const metadata = { id, title: "Cached", sourceType: "text", url: null, tags: [], createdAt: now(), updatedAt: now() };
+    await store.commit(id, { metadata, body: "first body" });
+    const first = await store.readAll();
+    const second = await store.readAll();
+    assert.equal(first.length, 1);
+    assert.strictEqual(first[0], second[0], "unchanged items are served from cache");
+    const documentPath = path.join(await store.itemDir(id), "document.md");
+    await fs.writeFile(documentPath, renderDocument(metadata, "edited outside", ""), "utf8");
+    const third = await store.readAll();
+    assert.notStrictEqual(third[0], first[0]);
+    assert.match(third[0].document, /edited outside/);
+    assert.equal(store.derived(third[0], "k", () => 1), 1);
+    assert.equal(store.derived(third[0], "k", () => 2), 1, "derived values are memoized per entry");
+    await fs.rm(await store.itemDir(id), { recursive: true });
+    assert.deepEqual(await store.readAll(), []);
+  });
+
+  it("keeps snapshot history across commits without copying it", async () => {
+    const store = await makeTempStore();
+    const id = "snapshot-carry";
+    const metadata = { id, title: "Snap", sourceType: "text", url: null, tags: [], createdAt: now(), updatedAt: now() };
+    await store.commit(id, { metadata, body: "v1" });
+    const dir = await store.itemDir(id);
+    const snapshotFile = path.join(dir, "snapshots", "2026-10-01T00-00-00-000Z", "raw.html.gz");
+    await fs.mkdir(path.dirname(snapshotFile), { recursive: true });
+    await fs.writeFile(snapshotFile, "history");
+    const before = await fs.stat(snapshotFile);
+    await store.commit(id, { metadata: { ...metadata, title: "Snap 2" }, body: "v2" });
+    const after = await fs.stat(snapshotFile);
+    assert.equal(await fs.readFile(snapshotFile, "utf8"), "history");
+    assert.equal(after.ino, before.ino, "snapshot files are hard-linked into the new revision");
+    assert.match((await store.read(id)).document, /v2/);
+  });
 });
 
 function now() {
