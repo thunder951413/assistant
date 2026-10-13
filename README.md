@@ -20,7 +20,8 @@
 - 导入导出：支持设置导入导出、知识库数据导入导出。
 - Embedding 配置：可启用 OpenAI 兼容 embedding 接口作为检索增强配置。
 - 数据完整性保护：Teams 会话标题校验、评论/消息数量防退化、异常资料隔离。
-- 存储治理：内容真正变化后才保存快照，每条资料最多保留最近 20 个版本。
+- 存储治理：内容真正变化后才保存快照，每条资料最多保留最近 20 个版本；快照中的原始抓取内容 gzip 压缩存储，提交新版本时历史快照以硬链接复用、不重复拷贝。
+- 浏览器缓存治理：WebDriver 浏览器磁盘缓存上限 100 MB，启动前自动修剪超过 512 MB 的缓存；设置页可一键清理缓存且保留 Cookie、本地存储等登录状态。
 
 ## 技术栈
 
@@ -35,8 +36,22 @@
 ```text
 .
 ├── src/
-│   ├── server.js        # HTTP 服务、API、知识库读写、AI 调用、抓取与刷新逻辑
-│   └── utils.js         # 文本、URL、标签和 slug 工具函数
+│   ├── server.js            # HTTP 服务入口、API 路由、抓取/刷新编排、AI 调用与设置管理
+│   ├── item-store.js        # 资料读写、事务提交、带缓存的批量读取、索引重建
+│   ├── retrieval.js         # 检索分词、关键词打分、结果多样化、向量与上下文片段
+│   ├── storage-maintenance.js # 快照压缩与裁剪、WebDriver 浏览器缓存清理
+│   ├── settings-schema.js   # 设置、刷新任务、来源配置的默认值与规范化
+│   ├── ai-client.js / ai-policy.js / ai-local.js  # 模型请求、出站策略、无模型时的本地兜底
+│   ├── capture-policy.js / capture-utils.js        # 抓取完整性、Teams 合并、调度时间窗
+│   ├── atomic-files.js / bundle-store.js           # 原子写入、数据导入导出
+│   ├── api-security.js / router.js / http-utils.js # 本机接口校验、路由、响应工具
+│   ├── text-helpers.js / fs-helpers.js / utils.js  # 通用文本与文件工具
+│   └── sources/
+│       ├── html-extractors.js    # Jira、Confluence、GitHub、通用网页的 HTML 解析
+│       ├── confluence-comments.js # Confluence 评论分页与回复
+│       ├── github-pull.js        # GitHub PR 评论、review、行内 review 评论
+│       ├── github-page.js        # GitHub 页面展开（WebDriver）
+│       └── teams-page.js         # Teams 网页会话定位、滚动与消息提取（WebDriver）
 ├── public/
 │   ├── index.html       # 前端页面
 │   ├── app.js           # 前端交互逻辑
@@ -46,8 +61,8 @@
 ├── scripts/
 │   ├── service.js       # 后台服务启停脚本
 │   └── install-playwright-browsers.js
-├── test/
-│   └── utils.test.js    # 工具函数测试
+├── test/                # node:test 测试：工具函数、存储、检索、抓取适配、HTTP 行为、UI 流程
+├── test-support/        # 测试专用预加载脚本
 ├── docs/
 │   └── mvp-plan.md      # MVP 设计记录
 ├── knowledge-base/      # 开发模式默认知识库目录，已被 git 忽略
@@ -271,7 +286,10 @@ node scripts/report-teams-title-mismatches.js
 node scripts/report-teams-title-mismatches.js --quarantine
 ```
 
-设置页“存储”中会显示知识库、历史快照和 WebDriver 登录数据的占用，并可清理超过最近 20 个版本的旧快照。
+设置页“存储”中会显示知识库、历史快照和 WebDriver 登录数据的占用（含可清理的浏览器缓存），并可：
+
+- 清理并压缩旧快照：删除超过最近 20 个版本的快照，并压缩旧版本遗留的未压缩原始文件。
+- 清理浏览器缓存（保留登录）：删除各站点浏览器的页面缓存、脚本缓存、Service Worker 缓存和着色器缓存；Cookie、Local Storage、IndexedDB 保留，正在使用的浏览器会跳过。
 
 ## 订阅刷新
 
@@ -376,7 +394,7 @@ npm run check
 npm test
 ```
 
-当前测试覆盖 `src/utils.js` 中的文本清理、URL 解析、标签规范化和 slug 生成。
+测试覆盖工具函数、资料存储事务与缓存、快照与浏览器缓存清理、检索排序与过滤、Confluence/GitHub 抓取适配、Teams 合并与会话识别，以及在临时目录中启动真实服务的 HTTP 行为测试（含模拟模型服务）。
 
 ## 注意事项
 
