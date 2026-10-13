@@ -183,6 +183,7 @@ const settingDocumentRoot = document.querySelector("#settingDocumentRoot");
 const activeDocumentRoot = document.querySelector("#activeDocumentRoot");
 const storageStatsElement = document.querySelector("#storageStats");
 const cleanupSnapshotsButton = document.querySelector("#cleanupSnapshotsButton");
+const cleanupBrowserCacheButton = document.querySelector("#cleanupBrowserCacheButton");
 const storageCleanupStatus = document.querySelector("#storageCleanupStatus");
 const settingsStatus = document.querySelector("#settingsStatus");
 const exportSettingsButton = document.querySelector("#exportSettingsButton");
@@ -298,6 +299,7 @@ exportDataButton.addEventListener("click", () => downloadExport("/api/export/dat
 importSettingsButton.addEventListener("click", () => settingsImportFile.click());
 importDataButton.addEventListener("click", () => dataImportFile.click());
 cleanupSnapshotsButton?.addEventListener("click", cleanupSnapshots);
+cleanupBrowserCacheButton?.addEventListener("click", cleanupBrowserCache);
 settingsImportFile.addEventListener("change", importSettingsFile);
 dataImportFile.addEventListener("change", importDataFile);
 saveSubscriptionsButton.addEventListener("click", saveSubscriptions);
@@ -2330,26 +2332,48 @@ async function loadStorageStats() {
   if (!storageStatsElement) return;
   try {
     const { stats } = await api("/api/storage-stats");
-    storageStatsElement.textContent = `知识库 ${formatBytes(stats.knowledgeBytes)} · 历史快照 ${formatBytes(stats.snapshotBytes)} · WebDriver 登录数据 ${formatBytes(stats.webdriverBytes)}`;
+    storageStatsElement.textContent = formatStorageStats(stats);
   } catch (error) {
     storageStatsElement.textContent = `无法读取存储占用：${error.message}`;
   }
 }
 
+function formatStorageStats(stats = {}) {
+  return `知识库 ${formatBytes(stats.knowledgeBytes)} · 历史快照 ${formatBytes(stats.snapshotBytes)} · WebDriver 登录数据 ${formatBytes(stats.webdriverBytes)}（其中可清理缓存 ${formatBytes(stats.browserCacheBytes)}）`;
+}
+
 async function cleanupSnapshots() {
   if (!cleanupSnapshotsButton) return;
-  const confirmed = window.confirm("将删除每条资料超过最近 20 个版本的旧快照。当前资料和最近 20 个版本不会删除。是否继续？");
+  const confirmed = window.confirm("将删除每条资料超过最近 20 个版本的旧快照，并压缩历史快照中的原始抓取内容。当前资料和最近 20 个版本的正文、评论不受影响。是否继续？");
   if (!confirmed) return;
   cleanupSnapshotsButton.disabled = true;
-  storageCleanupStatus.textContent = "正在清理旧快照...";
+  storageCleanupStatus.textContent = "正在清理并压缩旧快照...";
   try {
     const { result, stats } = await api("/api/storage-cleanup", { method: "POST" });
-    storageCleanupStatus.textContent = `已删除 ${result.removedSnapshots} 个旧快照，释放 ${formatBytes(result.reclaimedBytes)}。`;
-    storageStatsElement.textContent = `知识库 ${formatBytes(stats.knowledgeBytes)} · 历史快照 ${formatBytes(stats.snapshotBytes)} · WebDriver 登录数据 ${formatBytes(stats.webdriverBytes)}`;
+    storageCleanupStatus.textContent = `已删除 ${result.removedSnapshots} 个旧快照，压缩 ${result.compressedFiles || 0} 个原始文件，释放 ${formatBytes(result.reclaimedBytes)}。`;
+    storageStatsElement.textContent = formatStorageStats(stats);
   } catch (error) {
     storageCleanupStatus.textContent = error.message;
   } finally {
     cleanupSnapshotsButton.disabled = false;
+  }
+}
+
+async function cleanupBrowserCache() {
+  if (!cleanupBrowserCacheButton) return;
+  const confirmed = window.confirm("将清理 WebDriver 浏览器的页面缓存、脚本缓存和 Service Worker 缓存。Cookie、登录状态和本地存储会保留；正在使用的浏览器窗口会跳过。是否继续？");
+  if (!confirmed) return;
+  cleanupBrowserCacheButton.disabled = true;
+  storageCleanupStatus.textContent = "正在清理浏览器缓存...";
+  try {
+    const { result, stats } = await api("/api/storage-cleanup-browser", { method: "POST" });
+    const skipped = (result.profiles || []).filter((profile) => profile.skipped).map((profile) => profile.profile);
+    storageCleanupStatus.textContent = `已释放 ${formatBytes(result.reclaimedBytes)}。${skipped.length ? `正在使用中已跳过：${skipped.join("、")}。` : ""}`;
+    storageStatsElement.textContent = formatStorageStats(stats);
+  } catch (error) {
+    storageCleanupStatus.textContent = error.message;
+  } finally {
+    cleanupBrowserCacheButton.disabled = false;
   }
 }
 

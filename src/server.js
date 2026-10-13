@@ -27,6 +27,7 @@ import { areCaptureTitlesConsistent, isSupportedCaptureContentType, paginate } f
 import { collectVirtualTeamsMessages, extractTeamsMessagesFromDocument, mergeTeamsCaptureMessages, mergeTeamsCommentsByIdentity, nextDueCaptureSlot, normalizeCaptureCompleteness, prepareListCapture, readResponseBodyLimited, shouldCloseOwnedWebdriverSession, teamsCaptureMessageKeys, withWebdriverSessionQueue } from "./capture-policy.js";
 import { createItemStore, renderDocument, extractBodyFromDocument, extractSummaryFromDocument } from "./item-store.js";
 import { computeSourceHealth, createRunHistory, lineDiff } from "./reliability.js";
+import { BROWSER_DISK_CACHE_BYTES, browserCacheSize, cleanupBrowserCaches, directorySize, maintainSnapshots, trimBrowserProfileIfLarge, writeItemSnapshot } from "./storage-maintenance.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -396,6 +397,11 @@ api.get("/api/source-health", async ({ res }) => {
 
 api.post("/api/storage-cleanup", async ({ res }) => {
   const result = await cleanupOldSnapshots();
+  sendJson(res, 200, { result, stats: await storageStats() });
+});
+
+api.post("/api/storage-cleanup-browser", async ({ res }) => {
+  const result = await cleanupWebdriverCaches();
   sendJson(res, 200, { result, stats: await storageStats() });
 });
 
@@ -1172,19 +1178,7 @@ function renderCapturedText({ title, url, sourceType, comments, content }) {
 }
 
 async function saveItemSnapshot(itemDir, metadata, timestamp) {
-  const snapshotsRoot = path.join(itemDir, "snapshots");
-  const snapshotDir = path.join(snapshotsRoot, timestamp.replace(/[:.]/g, "-"));
-  await fs.mkdir(snapshotDir, { recursive: true });
-  for (const file of ["document.md", "metadata.json", "comments.jsonl", metadata.rawFileName || "raw.html"]) {
-    const sourcePath = path.join(itemDir, file);
-    if (await exists(sourcePath)) {
-      await fs.copyFile(sourcePath, path.join(snapshotDir, file));
-    }
-  }
-  const snapshots = (await safeReaddir(snapshotsRoot)).sort().reverse();
-  for (const stale of snapshots.slice(SNAPSHOT_RETENTION_COUNT)) {
-    await fs.rm(path.join(snapshotsRoot, stale), { recursive: true, force: true });
-  }
+  await writeItemSnapshot(itemDir, metadata, timestamp, { retention: SNAPSHOT_RETENTION_COUNT });
 }
 
 function validateFetchedItemNotRegressed(item, input) {
@@ -5705,12 +5699,14 @@ async function ensureWebdriverSession(hostname, url, options = {}) {
   const userDataDir = path.join(webdriverRoot, slugify(key));
   await fs.mkdir(userDataDir, { recursive: true });
   await fs.chmod(userDataDir, 0o700).catch(() => {});
+  await trimBrowserProfileIfLarge(userDataDir).catch((error) => console.warn(`Browser cache trim skipped for ${key}: ${error.message}`));
   const windowPlacement = webdriverWindowPlacement(windowMode, manual);
   const context = await chromium.launchPersistentContext(userDataDir, {
     headless,
     viewport: windowPlacement.size,
     args: [
       "--disable-blink-features=AutomationControlled",
+      `--disk-cache-size=${BROWSER_DISK_CACHE_BYTES}`,
       `--window-size=${windowPlacement.size.width},${windowPlacement.size.height}`,
       `--window-position=${windowPlacement.position.x},${windowPlacement.position.y}`,
       ...windowPlacement.args
@@ -7965,28 +7961,19 @@ async function collectDataFiles(baseDir, relativeDir = "") {
 }
 
 async function storageStats() {
-  const [knowledgeBytes, snapshotBytes, webdriverBytes] = await Promise.all([
+  const [knowledgeBytes, snapshotBytes, webdriverBytes, browserCacheBytes] = await Promise.all([
     directorySize(kbDir),
     snapshotStorageSize(),
-    directorySize(webdriverRoot)
+    directorySize(webdriverRoot),
+    browserCacheSize(webdriverRoot)
   ]);
   return {
     knowledgeBytes,
     snapshotBytes,
     webdriverBytes,
+    browserCacheBytes,
     retentionCount: SNAPSHOT_RETENTION_COUNT
   };
-}
-
-async function directorySize(dir) {
-  if (!(await exists(dir))) return 0;
-  let total = 0;
-  for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
-    const target = path.join(dir, entry.name);
-    if (entry.isDirectory()) total += await directorySize(target);
-    else if (entry.isFile()) total += (await fs.stat(target)).size;
-  }
-  return total;
 }
 
 async function snapshotStorageSize() {
@@ -7997,20 +7984,15 @@ async function snapshotStorageSize() {
   return total;
 }
 
+// Prunes snapshots beyond the retention count and gzips raw captures written by
+// older versions. Runs under the store lock so it never races an item commit.
 async function cleanupOldSnapshots() {
-  let removedSnapshots = 0;
-  let reclaimedBytes = 0;
-  for (const id of await safeReaddir(itemsDir)) {
-    const root = path.join(itemsDir, id, "snapshots");
-    const snapshots = (await safeReaddir(root)).sort().reverse();
-    for (const stale of snapshots.slice(SNAPSHOT_RETENTION_COUNT)) {
-      const target = path.join(root, stale);
-      reclaimedBytes += await directorySize(target);
-      await fs.rm(target, { recursive: true, force: true });
-      removedSnapshots += 1;
-    }
-  }
-  return { removedSnapshots, reclaimedBytes, retentionCount: SNAPSHOT_RETENTION_COUNT };
+  return store.runExclusive(() => maintainSnapshots(itemsDir, { retention: SNAPSHOT_RETENTION_COUNT }));
+}
+
+async function cleanupWebdriverCaches() {
+  const activeProfileDirs = [...webdriverSessions.values()].map((session) => session.userDataDir).filter(Boolean);
+  return cleanupBrowserCaches(webdriverRoot, { activeProfileDirs });
 }
 
 async function importDataBundle(bundle, options = {}) {

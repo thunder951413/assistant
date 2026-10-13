@@ -636,9 +636,10 @@
               </div>
               <div class="storage-stats" id="storageStats">正在计算存储占用...</div>
               <div class="settings-grid">
-                <button id="cleanupSnapshotsButton" type="button">清理旧快照</button>
+                <button id="cleanupSnapshotsButton" type="button">清理并压缩旧快照</button>
+                <button id="cleanupBrowserCacheButton" type="button">清理浏览器缓存（保留登录）</button>
               </div>
-              <p id="storageCleanupStatus" class="status-message">每条资料最多保留最近 20 个历史版本。</p>
+              <p id="storageCleanupStatus" class="status-message">每条资料最多保留最近 20 个历史版本，原始抓取内容压缩存储。浏览器缓存清理不影响各站点登录状态。</p>
             </section>
 
             <section class="settings-section" data-settings-panel="storage" hidden>
