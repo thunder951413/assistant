@@ -19,7 +19,7 @@ async function create(title, extra={}) {
 }
 before(async()=>{
   root = await fs.mkdtemp(path.join(os.tmpdir(),'assistant-behavior-'));
-  child = spawn(process.execPath,['src/server.js'],{cwd:process.cwd(),env:{...process.env,PORT:'0',HOST:'127.0.0.1',ASSISTANT_CONFIG_DIR:path.join(root,'config'),ASSISTANT_DOCUMENT_ROOT:path.join(root,'kb')},stdio:['ignore','pipe','pipe']});
+  child = spawn(process.execPath,['--import',new URL('../test-support/resolve-localhost-dot.mjs',import.meta.url).href,'src/server.js'],{cwd:process.cwd(),env:{...process.env,PORT:'0',HOST:'127.0.0.1',ASSISTANT_CONFIG_DIR:path.join(root,'config'),ASSISTANT_DOCUMENT_ROOT:path.join(root,'kb')},stdio:['ignore','pipe','pipe']});
   base = await new Promise((resolve,reject)=>{
     const timeout=setTimeout(()=>reject(Error('Server startup timeout')),15000);let log='';
     child.stderr.on('data',chunk=>{log+=chunk;});
