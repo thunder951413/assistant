@@ -6,15 +6,26 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+// Server behaviour is split across src/*.js and src/sources/*.js; guards read all of it.
+async function readServerSource() {
+  const files = [];
+  for (const dir of ["src", path.join("src", "sources")]) {
+    for (const name of (await fs.readdir(path.join(root, dir))).sort()) {
+      if (name.endsWith(".js")) files.push(path.join(root, dir, name));
+    }
+  }
+  return (await Promise.all(files.map((file) => fs.readFile(file, "utf8")))).join("\n");
+}
+
 describe("server regression guards", () => {
   it("does not destructure phantom response arguments in promise and Teams callbacks", async () => {
-    const source = await fs.readFile(path.join(root, "src", "server.js"), "utf8");
+    const source = await readServerSource();
     assert.doesNotMatch(source, /\.then\(async\s*\(\{\s*res\s*\}\)/);
     assert.doesNotMatch(source, /const remember = async\s*\(\{\s*res\s*\}\)/);
   });
 
   it("keeps Teams webdriver sessions warm across refresh batches", async () => {
-    const source = await fs.readFile(path.join(root, "src", "server.js"), "utf8");
+    const source = await readServerSource();
     assert.match(source, /closeWhenDone:\s*group\.sourceType === "teams" \? false : !session\.manual/);
     assert.match(source, /autoClose:\s*adapter\.sourceType === "teams" \? false : options\.keepSession !== true/);
     assert.match(source, /session\.teamsUserConfirmedAt = confirmedAt/);
@@ -22,7 +33,7 @@ describe("server regression guards", () => {
 
   it("waits for explicit Teams confirmation and locates conversations inside the current page", async () => {
     const [serverSource, appSource] = await Promise.all([
-      fs.readFile(path.join(root, "src", "server.js"), "utf8"),
+      readServerSource(),
       fs.readFile(path.join(root, "public", "app.js"), "utf8")
     ]);
     assert.match(serverSource, /status:\s*"waiting_for_teams_confirmation"/);

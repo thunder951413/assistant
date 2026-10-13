@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import vm from 'node:vm';
 import {JSDOM} from 'jsdom';
-const source=await readFile(new URL('../src/server.js',import.meta.url),'utf8');
-function functionSource(name){const start=source.search(new RegExp(`(?:async )?function ${name}\\(`));const end=source.slice(start+1).search(/\n(?:async )?function /);return source.slice(start,end<0?undefined:start+1+end);}
+// Teams helpers live in server.js (orchestration) and sources/teams-page.js (page automation).
+const source=(await Promise.all(['../src/server.js','../src/sources/teams-page.js'].map(file=>readFile(new URL(file,import.meta.url),'utf8')))).join('\n');
+function functionSource(name){const start=source.search(new RegExp(`(?:async )?function ${name}\\(`));const end=source.slice(start+1).search(/\n(?:export )?(?:async )?function /);return source.slice(start,end<0?undefined:start+1+end);}
 function load(name,dependencies={}){return vm.runInNewContext(`(${functionSource(name)})`,dependencies);}
 const cleanText=v=>String(v||'').trim();
 const extractDeep=load('extractTeamsDeepPath',{URL});
