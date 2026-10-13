@@ -76,13 +76,27 @@ describe('browser profile cache cleanup', () => {
     assert.equal(await exists(path.join(idle, 'Default/Cache')), false);
     assert.equal(await exists(path.join(idle, 'Default/Service Worker')), true);
     assert.equal(await exists(path.join(idle, 'Default/Service Worker/CacheStorage')), false);
-    assert.equal(await exists(path.join(idle, 'Default/Service Worker/Database')), false);
+    assert.equal(await exists(path.join(idle, 'Default/Service Worker/Database')), true, 'registrations are kept');
+    assert.equal(await exists(path.join(idle, 'Default/Service Worker/ScriptCache/y')), true, 'worker scripts are kept');
     assert.equal(await exists(path.join(idle, 'GrShaderCache')), false);
     for (const kept of ['Default/Cookies', 'Default/Local Storage/leveldb/000003.log', 'Default/IndexedDB/https_teams/0.ldb']) {
       assert.equal(await exists(path.join(idle, kept)), true, kept);
     }
     assert.equal(await exists(path.join(busy, 'Default/Cache/Cache_Data/blob')), true);
     assert.deepEqual(result.profiles.find((entry) => entry.profile === 'jira-example-com').skipped, 'in-use');
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it('skips profiles Chromium has locked, even when the lock is a dangling symlink', async () => {
+    const root = await tmp();
+    const dir = await profile(root, 'launching');
+    await fs.symlink('host-12345', path.join(dir, 'SingletonLock'));
+    const result = await cleanupBrowserCaches(root);
+    assert.equal(result.profiles[0].skipped, 'in-use');
+    assert.equal(await exists(path.join(dir, 'Default/Cache/Cache_Data/blob')), true);
+    const trim = await trimBrowserProfileIfLarge(dir, { maxCacheBytes: 1 });
+    assert.equal(trim.locked, true);
+    assert.equal(await exists(path.join(dir, 'Default/Cache/Cache_Data/blob')), true);
     await fs.rm(root, { recursive: true, force: true });
   });
 

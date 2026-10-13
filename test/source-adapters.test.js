@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { collectConfluenceComments, normalizeConfluenceComment } from '../src/sources/confluence-comments.js';
+import { collectConfluenceComments, normalizeConfluenceComment, resolveNext } from '../src/sources/confluence-comments.js';
 import { collectPullRequestDiscussion, renderGithubDiscussionEntry } from '../src/sources/github-pull.js';
 
 const origin = 'https://confluence.example.com';
@@ -36,6 +36,17 @@ describe('Confluence comments', () => {
     assert.doesNotMatch(requested[1], /depth=all/);
   });
 
+  it('never follows next links to another host and rebuilds the context path instead', async () => {
+    const next = '/rest/api/content/9/child/comment?start=100';
+    assert.equal(resolveNext(origin, { _links: { next, base: 'http://confluence-internal:8090/confluence', context: '/confluence' } }), `${origin}/confluence${next}`);
+    assert.equal(resolveNext(origin, { _links: { next: 'http://confluence-internal:8090/x' } }), null);
+    const requested = [];
+    const result = await collectConfluenceComments(origin, '9', async (url) => { requested.push(url); return { data: { results: [{ id: '1' }], _links: { next: 'http://evil.example/rest/x' } } }; });
+    assert.equal(requested.length, 1);
+    assert.equal(result.truncated, true);
+    assert.equal(result.offOriginNext, true);
+  });
+
   it('propagates non-400 failures so callers can mark the capture partial', async () => {
     await assert.rejects(collectConfluenceComments(origin, '9', async () => { const error = new Error('down'); error.status = 503; throw error; }), /down/);
   });
@@ -59,6 +70,12 @@ describe('GitHub pull request discussion', () => {
     assert.match(result.comments[0].body, /`src\/a\.c:L42`/);
     assert.equal(result.comments[0].reviewId, 'review-22');
     assert.match(renderGithubDiscussionEntry(result.comments[1]), /review: requested changes/);
+  });
+
+  it('does not present a diff position as a file line', async () => {
+    const result = await collectPullRequestDiscussion(api, 5, async (url) => ({ data: url.includes('/pulls/5/comments') ? [{ id: 1, path: 'a.c', position: 7, line: null, original_line: null, body: 'x', created_at: 't' }] : [], truncated: false }));
+    assert.equal(result.comments[0].line, undefined);
+    assert.match(result.comments[0].body, /^`a\.c`/);
   });
 
   it('marks unavailable parts as missing instead of failing the capture', async () => {

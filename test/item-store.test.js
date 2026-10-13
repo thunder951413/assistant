@@ -480,6 +480,18 @@ body
     assert.equal(after.ino, before.ino, "snapshot files are hard-linked into the new revision");
     assert.match((await store.read(id)).document, /v2/);
   });
+
+  it("keeps an item listed when one comment line is damaged, but direct reads stay strict", async () => {
+    const store = await makeTempStore();
+    const id = "bad-comment";
+    const metadata = { id, title: "Damaged", sourceType: "text", url: null, tags: [], createdAt: now(), updatedAt: now() };
+    await store.commit(id, { metadata, body: "body", comments: [{ body: "ok" }] });
+    await fs.appendFile(path.join(await store.itemDir(id), "comments.jsonl"), "{truncated\n", "utf8");
+    assert.deepEqual((await store.list()).map((item) => item.id), [id]);
+    const [entry] = await store.readAll();
+    assert.deepEqual(entry.comments, [{ body: "ok" }]);
+    await assert.rejects(store.read(id));
+  });
 });
 
 function now() {

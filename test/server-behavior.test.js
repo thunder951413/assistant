@@ -122,6 +122,7 @@ describe('isolated HTTP application behavior',()=>{
     assert.equal(search.status,200);
     assert.equal(search.results[0].item.title,'机顶盒编译指南');
     assert.equal(search.results[0].item.paths,undefined);
+    assert.match(search.results[0].item.excerpt,/make/);
     const today=new Date().toISOString().slice(0,10);
     const sameDay=await request('/api/knowledge-search',{query:'编译',filters:{dateTo:today}});
     assert.ok(sameDay.results.some(r=>r.item.title==='机顶盒编译指南'),'items updated today match an end-of-day dateTo');

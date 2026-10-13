@@ -37,7 +37,8 @@ export function normalizeReview(review) {
 }
 
 export function normalizeReviewComment(comment) {
-  const line = comment?.line ?? comment?.original_line ?? comment?.position;
+  // `position` is a diff-hunk offset, not a file line, so it is never shown as one.
+  const line = comment?.line ?? comment?.original_line;
   const location = [clean(comment?.path), line ? `L${line}` : ""].filter(Boolean).join(":");
   return {
     id: `review-comment-${comment?.id}`,

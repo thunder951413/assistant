@@ -134,7 +134,6 @@ export const BROWSER_CACHE_PATHS = Object.freeze([
   "Default/DawnGraphiteCache",
   "Default/DawnWebGPUCache",
   "Default/Service Worker/CacheStorage",
-  "Default/Service Worker/ScriptCache",
   "GrShaderCache",
   "GraphiteDawnCache",
   "ShaderCache",
@@ -154,12 +153,20 @@ export async function cleanupBrowserProfileCaches(profileDir) {
     await fs.rm(target, { recursive: true, force: true });
     removedDirectories += 1;
   }
-  // A Service Worker registration whose script cache is gone is re-fetched on the next
-  // visit; dropping the registration database avoids Chromium logging stale entries.
-  if (!(await exists(path.join(profileDir, "Default/Service Worker/ScriptCache")))) {
-    await fs.rm(path.join(profileDir, "Default/Service Worker/Database"), { recursive: true, force: true });
-  }
+  // Service Worker registrations and their scripts (Database, ScriptCache) are kept;
+  // only the CacheStorage responses they fetched are dropped and refilled on demand.
   return { reclaimedBytes, removedDirectories };
+}
+
+// Chromium marks a profile it has open with Singleton* entries (POSIX; SingletonLock is a
+// dangling symlink, so lstat is required) or a "lockfile" (Windows). Treat any of them as
+// "in use": the profile may be launching or held by another app instance.
+const PROFILE_LOCK_NAMES = ["SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile"];
+export async function isBrowserProfileLocked(profileDir) {
+  for (const name of PROFILE_LOCK_NAMES) {
+    try { await fs.lstat(path.join(profileDir, name)); return true; } catch {}
+  }
+  return false;
 }
 
 // Cleans every profile under webdriverRoot except those currently opened by a live
@@ -173,7 +180,7 @@ export async function cleanupBrowserCaches(webdriverRoot, { activeProfileDirs = 
     let stat;
     try { stat = await fs.stat(profileDir); } catch { continue; }
     if (!stat.isDirectory()) continue;
-    if (active.has(path.resolve(profileDir))) {
+    if (active.has(path.resolve(profileDir)) || await isBrowserProfileLocked(profileDir)) {
       profiles.push({ profile: name, skipped: "in-use", reclaimedBytes: 0 });
       continue;
     }
@@ -192,6 +199,7 @@ export async function trimBrowserProfileIfLarge(profileDir, { maxCacheBytes = 51
     const stat = await fs.stat(marker);
     if (now - stat.mtimeMs < intervalMs) return { checked: false, reclaimedBytes: 0 };
   } catch {}
+  if (await isBrowserProfileLocked(profileDir)) return { checked: false, reclaimedBytes: 0, locked: true };
   let cacheBytes = 0;
   for (const relative of BROWSER_CACHE_PATHS) cacheBytes += await directorySize(path.join(profileDir, relative));
   let reclaimedBytes = 0;

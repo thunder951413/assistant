@@ -37,6 +37,18 @@ async function readJsonLines(filePath) {
     .map((line) => JSON.parse(line));
 }
 
+async function readJsonLinesLenient(filePath, onError) {
+  if (!(await exists(filePath))) return [];
+  const values = [];
+  const lines = (await fs.readFile(filePath, "utf8")).split("\n");
+  lines.forEach((line, index) => {
+    const text = line.trim();
+    if (!text) return;
+    try { values.push(JSON.parse(text)); } catch (error) { onError?.(index + 1, error); }
+  });
+  return values;
+}
+
 // Recreates a directory tree with hard links instead of copying file contents.
 // Snapshot files are immutable once written, so sharing inodes between the live
 // item directory and a staged revision is safe and avoids copying megabytes of
@@ -189,7 +201,7 @@ export function createItemStore(getDirs) {
 
   // ---- Item CRUD ----
 
-  async function readNow(id) {
+  async function readNow(id, { lenientComments = false } = {}) {
     id = validateItemId(id);
     const itemDir = path.join(itemsDir(), id);
     const metadata = JSON.parse(await fs.readFile(path.join(itemDir, "metadata.json"), "utf8"));
@@ -197,7 +209,11 @@ export function createItemStore(getDirs) {
     const processedPath = path.join(itemDir, "processed.md");
     const processedDocument = await exists(processedPath) ? await fs.readFile(processedPath, "utf8") : "";
     const commentsPath = path.join(itemDir, "comments.jsonl");
-    const comments = await readJsonLines(commentsPath);
+    // Listing and search must not hide an item because one comment line is damaged;
+    // they skip bad lines and record a diagnostic. Direct reads stay strict.
+    const comments = lenientComments
+      ? await readJsonLinesLenient(commentsPath, (line, error) => recordDiagnostic({ id, error: `comments.jsonl line ${line}: ${error.message}`, observedAt: new Date().toISOString() }))
+      : await readJsonLines(commentsPath);
     return { metadata, document, processedDocument, comments };
   }
 
@@ -218,7 +234,7 @@ export function createItemStore(getDirs) {
     const stamp = `${dir}|${stamps.join("|")}`;
     const cached = readCache.get(id);
     if (cached?.stamp === stamp) return cached.entry;
-    const raw = await readNow(id);
+    const raw = await readNow(id, { lenientComments: true });
     const entry = Object.freeze({
       id,
       ...raw,

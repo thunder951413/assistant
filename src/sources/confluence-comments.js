@@ -17,13 +17,25 @@ function commentsUrl(origin, pageId, { start = 0, depthAll = true } = {}) {
   return `${origin}/rest/api/content/${encodeURIComponent(pageId)}/child/comment?${params}`;
 }
 
-function resolveNext(origin, data) {
+function sameOrigin(a, b) {
+  try { return new URL(a).origin === new URL(b).origin; } catch { return false; }
+}
+
+// Returns the next page URL, or null when the server points somewhere other than
+// the configured origin. Credentials are attached for the configured host only, so a
+// misconfigured Confluence base URL (e.g. an internal http:// host behind a proxy)
+// must never receive them; the caller then reports the comments as truncated.
+export function resolveNext(origin, data) {
   const next = data?._links?.next;
   if (!next) return "";
-  if (/^https?:\/\//i.test(next)) return next;
-  const base = data?._links?.base || origin;
-  // _links.base may include a context path (e.g. /wiki) that next omits.
-  return `${String(base).replace(/\/$/, "")}${next.startsWith("/") ? "" : "/"}${next}`;
+  if (/^https?:\/\//i.test(next)) return sameOrigin(next, origin) ? next : null;
+  const base = data?._links?.base;
+  // next omits the context path (e.g. /wiki). Prefer base when it is on our origin,
+  // otherwise rebuild the prefix from _links.context.
+  const prefix = base && sameOrigin(base, origin)
+    ? String(base)
+    : `${origin}${String(data?._links?.context || "")}`;
+  return `${prefix.replace(/\/$/, "")}${next.startsWith("/") ? "" : "/"}${next}`;
 }
 
 export async function collectConfluenceComments(origin, pageId, requestJson, { maxPages = CONFLUENCE_COMMENT_MAX_PAGES } = {}) {
@@ -53,6 +65,7 @@ export async function collectConfluenceComments(origin, pageId, requestJson, { m
       results.push(comment);
     }
     url = resolveNext(origin, data);
+    if (url === null) return { results, pageCount: pages, truncated: true, repliesIncluded: depthAll, offOriginNext: true };
   }
   return { results, pageCount: pages, truncated: Boolean(url), repliesIncluded: depthAll };
 }

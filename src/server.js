@@ -31,7 +31,7 @@ import { collectConfluenceComments, normalizeConfluenceComment } from "./sources
 import { collectPullRequestDiscussion, renderGithubDiscussionEntry } from "./sources/github-pull.js";
 import { BROWSER_DISK_CACHE_BYTES, browserCacheSize, cleanupBrowserCaches, directorySize, maintainSnapshots, trimBrowserProfileIfLarge, writeItemSnapshot } from "./storage-maintenance.js";
 import { exists, resolveWritableDir, safeReaddir } from "./fs-helpers.js";
-import { buildLocalSummary, cleanTextBlock, detectUrl, extractProcessedBodyFromDocument, isSameRelativeSourceDay, isTruthyFilter, latestTimestampValue, normalizeComments, normalizeSourceType, normalizeSourceUpdatedAt, parseSourceUpdatedAt, sourceLabel, sourceTypeLabel, unwrapMarkdownFence } from "./text-helpers.js";
+import { buildLocalSummary, cleanTextBlock, summarizeExcerpt, detectUrl, extractProcessedBodyFromDocument, isSameRelativeSourceDay, isTruthyFilter, latestTimestampValue, normalizeComments, normalizeSourceType, normalizeSourceUpdatedAt, parseSourceUpdatedAt, sourceLabel, sourceTypeLabel, unwrapMarkdownFence } from "./text-helpers.js";
 import { readBody, securityHeaders, sendJson, sendJsonDownload, sendSse, startSse, withResponseCancellation } from "./http-utils.js";
 import { defaultDoNotDisturbSettings, defaultNotificationSettings, defaultProcessingPrompts, defaultRefreshSchedule, defaultSourceProfile, mergeRefreshJobs, mergeSourceProfiles, normalizeDoNotDisturbSettings, normalizeNotificationSettings, normalizeProcessingPrompts, normalizeRefreshJob, normalizeRefreshSchedule, normalizeWebdriverWindowMode, refreshFailureState } from "./settings-schema.js";
 import { buildKnowledgeContext, buildLocalKnowledgeAnswer, buildOpenAIContext, buildVectorKnowledgeContext, chunkMaterialForEmbedding, cosineSimilarity, diversifyKnowledgeResults, mergeKnowledgeResults, parseOpenAIStreamPayloads, scoreKnowledgeMatch, toPublicKnowledgeSource, tokenizeQuery } from "./retrieval.js";
@@ -1479,12 +1479,8 @@ async function markItemManagedBySubscription(item) {
   if (metadata.managedBy === "subscription") return;
   metadata.managedBy = "subscription";
   metadata.updatedAt = metadata.updatedAt || new Date().toISOString();
-  await fs.writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
-  const documentPath = path.join(itemDir, "document.md");
-  if (await exists(documentPath)) {
-    const document = await fs.readFile(documentPath, "utf8");
-    await fs.writeFile(documentPath, renderDocument(metadata, extractBodyFromDocument(document), extractSummaryFromDocument(document)), "utf8");
-  }
+  // A metadata-only commit also re-renders the document header, atomically.
+  await store.commit(item.id, { metadata });
 }
 
 function defaultRefreshJobIdForContentUrl(url, adapter) {
@@ -2062,10 +2058,12 @@ async function listItems(filters = {}) {
 // same ranking as chat, so all entry points agree on what is relevant.
 async function searchItems(query, limit = 10) {
   if (!cleanText(query)) return [];
-  const results = await searchKnowledgeBase(query, limit);
-  return results.map(({ score, item }) => {
+  // Local keyword ranking only: these endpoints must stay fast and never send the
+  // query to a remote embedding service.
+  const results = await searchKnowledgeBase(query, limit, {}, { keywordOnly: true });
+  return results.map(({ score, item, excerpt }) => {
     const { paths, ...metadata } = item;
-    return { score, item: metadata };
+    return { score, item: { ...metadata, excerpt } };
   });
 }
 
@@ -2315,7 +2313,7 @@ async function streamWithOpenAICompatible(question, results, sources, res, optio
   res.end();
 }
 
-async function searchKnowledgeBase(query, limit = 8, filters = {}) {
+async function searchKnowledgeBase(query, limit = 8, filters = {}, options = {}) {
   const terms = tokenizeQuery(query);
   const desiredLimit = Math.min(100, Math.max(1, Number(limit) || 8));
   const materials = await readAllMaterialsForSearch();
@@ -2331,7 +2329,7 @@ async function searchKnowledgeBase(query, limit = 8, filters = {}) {
   }
 
   let ranked;
-  if (isEmbeddingEnabled()) {
+  if (isEmbeddingEnabled() && !options.keywordOnly) {
     try {
       const vectorResults = await searchKnowledgeBaseByEmbedding(query, desiredLimit * 2, filters, materials);
       ranked = mergeKnowledgeResults(results, vectorResults);
@@ -2344,6 +2342,7 @@ async function searchKnowledgeBase(query, limit = 8, filters = {}) {
   // Context snippets are only built for the results actually returned.
   return diversifyKnowledgeResults(ranked, desiredLimit, terms).map(({ material, bestChunk, ...result }) => ({
     ...result,
+    excerpt: summarizeExcerpt(material.processedDocument || material.document),
     context: bestChunk
       ? buildVectorKnowledgeContext(bestChunk, material.processedDocument || material.document, material.commentsText, terms)
       : buildKnowledgeContext(material.processedDocument || material.document, material.commentsText, terms)
@@ -2480,7 +2479,10 @@ function ensureEmbeddingIndex(materials = null) {
     materials ||= await readAllMaterialsForSearch();
     const manifest = buildEmbeddingManifest(materials);
     const saved = await readSavedEmbeddingIndex();
-    if (saved && JSON.stringify(saved.manifest) === JSON.stringify(manifest)) return saved;
+    if (saved && JSON.stringify(saved.manifest) === JSON.stringify(manifest)) {
+      Object.assign(embeddingIndexState, { status: "ready", error: "", updatedAt: saved.generatedAt || "", records: saved.records?.length || 0 });
+      return saved;
+    }
     embeddingIndexState.status = "building";
     embeddingIndexState.error = "";
     const rebuilt = await rebuildEmbeddingIndex(manifest, saved, materials);
@@ -3795,7 +3797,7 @@ async function refreshContentJob(job, refreshContext = null) {
       captureMethod: fetched.fetchMethod || "http-304",
       httpValidators: fetched.httpValidators || item.metadata.httpValidators || {}
     };
-    await fs.writeFile(path.join(itemsDir, existing.id, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+    await store.writeMetadata(existing.id, metadata);
     return {
       id: job.id,
       sourceType: adapter.sourceType,
