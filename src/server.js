@@ -1593,6 +1593,7 @@ function defaultRefreshFetchModeForAdapter(adapter, requestedMode) {
 function shouldFetchWithWebdriver(url, requestedMode, pageKind = "auto", sourceType = "") {
   const adapter = detectSourceAdapter(url || "");
   if (adapter.sourceType === "teams" && hasTeamsGraphCredentials(adapter)) return false;
+  if (hasJiraApiCredentials(adapter)) return false;
   if (requiresWebdriverExpansion(adapter)) return true;
   if (requestedMode === "webdriver") return true;
   if (requestedMode === "fetch") return false;
@@ -1602,6 +1603,13 @@ function shouldFetchWithWebdriver(url, requestedMode, pageKind = "auto", sourceT
 
 function adapterPrefersWebdriver(adapter) {
   return adapter.sourceType === "jira" || adapter.sourceType === "teams";
+}
+
+// Jira with a token or username/password can use the REST API instead of a browser.
+function hasJiraApiCredentials(adapter) {
+  if (adapter.sourceType !== "jira") return false;
+  const profile = settings.sources?.[adapter.hostname] || {};
+  return (profile.authMode === "bearer" && Boolean(profile.token)) || (profile.authMode === "basic" && Boolean(profile.username && profile.password));
 }
 
 function hasGithubToken(adapter) {
@@ -4236,6 +4244,7 @@ function resolvedRefreshFetchMode(job, adapter) {
   if (adapter.sourceType === "teams" && hasTeamsGraphCredentials(adapter)) return "fetch";
   // Issue search pages render client-side; only a token can use the search API instead.
   if (adapter.sourceType === "github" && hasGithubToken(adapter)) return "fetch";
+  if (hasJiraApiCredentials(adapter)) return "fetch";
   if (adapter.sourceType === "github" && isGithubIssueSearchUrl(job.url || "")) return "webdriver";
   if (requiresWebdriverExpansion(adapter)) return "webdriver";
   if (
@@ -4402,6 +4411,7 @@ async function fetchUrl(url, options = {}) {
       if (options.signal?.aborted || error?.name === "AbortError") throw error;
       // With a GitHub token the API is the capture path; a page fetch would only return the app shell.
       if (hasGithubToken(adapter)) throw new Error(`GitHub 接口请求失败（请检查令牌是否有效、是否有 repo 读取权限）：${error.message || error}`);
+      if (hasJiraApiCredentials(adapter)) throw new Error(`Jira 接口请求失败（请检查「站点登录」里的账号密码或令牌）：${error.message || error}`);
       console.warn(`Source API fallback for ${url}:`, error.message || error);
     }
   }
@@ -4580,6 +4590,8 @@ async function fetchJiraFromApi(url, adapter, options = {}) {
     }));
     return {
       ...renderJiraApiFilter(url, adapter, filter.data, issues, search.raw),
+      // Filter results decide membership: issues that leave the filter are flagged for keep/delete.
+      membershipComplete: Number(search.data?.total ?? issues.length) <= issues.length,
       completeness: Number(search.data?.total || issues.length) > issues.length ? "partial" : "complete",
       coverage: {
         observedCount: issues.length,
