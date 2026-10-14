@@ -82,43 +82,12 @@ const state = {
 const itemList = document.querySelector("#itemList");
 const tagList = document.querySelector("#tagList");
 const materialsNewBadge = document.querySelector("#materialsNewBadge");
-const sidebar = document.querySelector(".sidebar");
 const materialSidebar = document.querySelector("#materialSidebar");
-const homeTotalItems = document.querySelector("#homeTotalItems");
-const homeSourceSummary = document.querySelector("#homeSourceSummary");
-const homeUpdateCount = document.querySelector("#homeUpdateCount");
-const homeSubscriptionCount = document.querySelector("#homeSubscriptionCount");
-const homeSubscriptionStatus = document.querySelector("#homeSubscriptionStatus");
-const homeTagCount = document.querySelector("#homeTagCount");
-const homeRunningJobs = document.querySelector("#homeRunningJobs");
-const homeFailedJobs = document.querySelector("#homeFailedJobs");
-const homeEnabledJobs = document.querySelector("#homeEnabledJobs");
-const homeAiMode = document.querySelector("#homeAiMode");
-const homeHeroTitle = document.querySelector("#homeHeroTitle");
-const homeHeroDescription = document.querySelector("#homeHeroDescription");
-const homeRefreshTaskRows = document.querySelector("#homeRefreshTaskRows");
-const homeRefreshTaskCount = document.querySelector("#homeRefreshTaskCount");
 const homeRecentUpdates = document.querySelector("#homeRecentUpdates");
 const workbenchSearchForm = document.querySelector("#workbenchSearchForm");
 const workbenchSearchInput = document.querySelector("#workbenchSearchInput");
 const workbenchAskButton = document.querySelector("#workbenchAskButton");
 const homeFirstImportButton = document.querySelector("#homeFirstImportButton");
-const homeSourceCounts = {
-  confluence: document.querySelector("#homeSourceConfluence"),
-  jira: document.querySelector("#homeSourceJira"),
-  github: document.querySelector("#homeSourceGithub"),
-  teams: document.querySelector("#homeSourceTeams"),
-  web: document.querySelector("#homeSourceWeb")
-};
-const homeSourceNewCounts = {
-  confluence: document.querySelector("#homeSourceConfluenceNew"),
-  jira: document.querySelector("#homeSourceJiraNew"),
-  github: document.querySelector("#homeSourceGithubNew"),
-  teams: document.querySelector("#homeSourceTeamsNew"),
-  web: document.querySelector("#homeSourceWebNew")
-};
-const filterTabs = [...document.querySelectorAll("[data-filter-tab]")];
-const filterPanels = [...document.querySelectorAll("[data-filter-panel]")];
 const homeView = document.querySelector("#homeView");
 const doNotDisturbToggle = document.querySelector("#doNotDisturbToggle");
 const chatView = document.querySelector("#chatView");
@@ -307,9 +276,10 @@ subscriptionConnectionSettingsButton?.addEventListener("click", async () => {
   state.settingsTab = "capture";
   await switchView("settings");
 });
-addSourceProfileForm?.addEventListener("submit", addSourceProfile);
-refreshJobs.addEventListener("input", () => { state.subscriptionDirty = true; });
-refreshJobs.addEventListener("change", () => { state.subscriptionDirty = true; });
+document.querySelector("#addSourceProfileButton")?.addEventListener("click", addSourceProfile);
+newSourceHostname?.addEventListener("keydown", (event) => { if (event.key === "Enter") addSourceProfile(event); });
+// Unsaved edits live in the drawer; background polling never re-renders it then.
+document.querySelector("#subscriptionDrawer")?.addEventListener("input", () => { state.subscriptionDirty = true; });
 runAllSubscriptionsButton.addEventListener("click", runAllRefreshJobs);
 settingsTabs.forEach((button) => {
   button.addEventListener("click", () => setSettingsTab(button.dataset.settingsTab));
@@ -390,107 +360,16 @@ document.querySelectorAll(".nav-item").forEach((button) => {
   });
 });
 
-sidebar?.addEventListener("mouseleave", resetSidebarScroll);
-sidebar?.addEventListener("focusout", () => {
-  requestAnimationFrame(() => {
-    if (!sidebar.matches(":focus-within")) {
-      resetSidebarScroll();
-    }
-  });
-});
-
 document.querySelectorAll("[data-view-shortcut]").forEach((button) => {
   button.addEventListener("click", async () => {
     await switchView(button.dataset.viewShortcut);
   });
 });
 
-document.querySelectorAll("[data-source-shortcut]").forEach((button) => {
-  button.addEventListener("click", async () => {
-    await switchView("materials");
-    document.querySelectorAll(".source-item").forEach((item) => {
-      item.classList.toggle("is-active", item.dataset.source === button.dataset.sourceShortcut);
-    });
-    state.sourceType = button.dataset.sourceShortcut;
-    state.integrityStatus = "";
-    state.tag = "";
-    await loadItems();
-    renderTags();
-  });
-});
-
-document.querySelectorAll(".source-item").forEach((button) => {
-  button.addEventListener("click", async () => {
-    document.querySelectorAll(".source-item").forEach((item) => item.classList.remove("is-active"));
-    button.classList.add("is-active");
-    state.sourceType = button.dataset.source;
-    state.integrityStatus = button.dataset.integrityStatus || "";
-    state.tag = "";
-    await loadItems();
-    renderTags();
-  });
-});
-
-filterTabs.forEach((button) => {
-  button.addEventListener("click", () => setFilterTab(button.dataset.filterTab));
-});
-
 searchInput.addEventListener("input", debounce(async () => {
   state.query = searchInput.value.trim();
   await loadItems();
 }, 200));
-
-await loadAgentConfig();
-await loadSettings();
-startRefreshJobMonitor();
-await loadMaterialUpdateCount();
-await loadHomeOverview();
-await loadChatSessions();
-renderView();
-
-async function loadAll() {
-  await Promise.all([loadTags(), loadItems(), loadMaterialUpdateCount()]);
-}
-
-function renderView() {
-  document.querySelectorAll(".nav-item").forEach((item) => {
-    item.classList.toggle("is-active", item.dataset.view === state.view);
-  });
-
-  chatView.hidden = state.view !== "chat";
-  homeView.hidden = state.view !== "home";
-  materialsView.hidden = state.view !== "materials";
-  importView.hidden = state.view !== "import";
-  supplementalView.hidden = state.view !== "supplemental";
-  subscriptionsView.hidden = state.view !== "subscriptions";
-  settingsView.hidden = state.view !== "settings";
-  materialSidebar.hidden = state.view !== "materials";
-  if (globalAddButton) globalAddButton.hidden = state.view === "chat";
-  materialsTitle.textContent = "资料库";
-  if (state.view === "settings") {
-    setSettingsTab(state.settingsTab);
-  }
-  renderMaterialsNewBadge();
-}
-
-function resetSidebarScroll() {
-  if (!sidebar) return;
-  sidebar.scrollTop = 0;
-}
-
-function setFilterTab(tabName) {
-  const next = tabName === "tag" ? "tag" : "source";
-  filterTabs.forEach((button) => {
-    const active = button.dataset.filterTab === next;
-    button.classList.toggle("is-active", active);
-    button.setAttribute("aria-selected", active ? "true" : "false");
-  });
-  filterPanels.forEach((panel) => {
-    const active = panel.dataset.filterPanel === next;
-    panel.hidden = !active;
-    panel.classList.toggle("is-active", active);
-  });
-}
 
 function setSettingsTab(tabName) {
   const next = ["ai", "capture", "tags", "storage", "notify"].includes(tabName) ? tabName : "ai";
@@ -503,61 +382,6 @@ function setSettingsTab(tabName) {
   settingsPanels.forEach((panel) => {
     panel.hidden = panel.dataset.settingsPanel !== next;
   });
-}
-
-async function switchView(view) {
-  state.view = view;
-  renderView();
-  if (state.view === "home") {
-    await loadHomeOverview();
-  }
-  if (state.view === "materials") {
-    await loadAll();
-  }
-  if (state.view === "settings") {
-    await loadSettings();
-  }
-  if (state.view === "subscriptions") {
-    await loadSettings();
-  }
-  if (state.view === "supplemental") {
-    await loadSupplementalContext();
-  }
-}
-
-async function loadItems() {
-  const params = new URLSearchParams();
-  if (state.sourceType) params.set("sourceType", state.sourceType);
-  if (state.tag) params.set("tag", state.tag);
-  if (state.query) params.set("q", state.query);
-  if (state.integrityStatus) params.set("integrityStatus", state.integrityStatus);
-  params.set("page", "1");
-  params.set("pageSize", String(state.pageSize));
-
-  const { items, total } = await api(`/api/items?${params}`);
-  state.items = items;
-  state.page = 1;
-  state.totalItems = Number(total ?? items.length);
-  syncMaterialUpdateCountFromItems(items);
-  state.listClassification = null;
-  renderItems();
-  renderMaterialsNewBadge();
-}
-
-async function loadMoreItems() {
-  if (state.items.length >= state.totalItems) return;
-  const params = new URLSearchParams();
-  if (state.sourceType) params.set("sourceType", state.sourceType);
-  if (state.tag) params.set("tag", state.tag);
-  if (state.query) params.set("q", state.query);
-  if (state.integrityStatus) params.set("integrityStatus", state.integrityStatus);
-  params.set("page", String(state.page + 1));
-  params.set("pageSize", String(state.pageSize));
-  const { items, total } = await api(`/api/items?${params}`);
-  state.items = [...state.items, ...(items || [])];
-  state.page += 1;
-  state.totalItems = Number(total ?? state.items.length);
-  renderItems();
 }
 
 async function loadTags() {
@@ -584,126 +408,6 @@ function syncMaterialUpdateCountFromItems(items) {
   }
 }
 
-function renderMaterialsNewBadge() {
-  if (!materialsNewBadge) return;
-  materialsNewBadge.hidden = !state.updateCount;
-  materialsNewBadge.title = state.updateCount ? `${state.updateCount} 条资料有新内容` : "";
-}
-
-async function loadHomeOverview() {
-  if (!homeTotalItems) return;
-  try {
-    const [{ items }, { tags }, health] = await Promise.all([
-      api("/api/items"),
-      api("/api/tags"),
-      api("/api/source-health")
-    ]);
-    state.homeOverview = {
-      items: items || [],
-      tags: tags || [],
-      sourceHealth: health.sources || []
-    };
-    renderHomeOverview();
-  } catch (error) {
-    console.warn("Failed to load home overview:", error);
-  }
-}
-
-function renderHomeOverview() {
-  if (!homeTotalItems) return;
-  const items = state.homeOverview?.items || [];
-  const tags = state.homeOverview?.tags || [];
-  const sourceCounts = countSources(items);
-  const sourceNewCounts = countNewSources(items);
-  const refreshJobsList = state.refreshJobs || [];
-  const enabledJobs = refreshJobsList.filter((job) => job.enabled).length;
-  const runningJobs = refreshJobsList.filter((job) => job.running).length;
-  const failedJobs = refreshJobsList.filter((job) => job.enabled && ["failed", "unreachable"].includes(job.status)).length;
-  if (homeHeroTitle) {
-    homeHeroTitle.textContent = items.length ? "今天有什么需要处理？" : "保存第一条资料";
-    homeHeroDescription.textContent = items.length
-      ? "优先查看关注内容的变化和需要恢复的来源。"
-      : "粘贴链接或文本，保存后即可在这里跟踪变化、阅读资料和提问。";
-  }
-
-  homeTotalItems.textContent = String(items.length);
-  homeUpdateCount.textContent = String(state.updateCount || 0);
-  homeSubscriptionCount.textContent = String(refreshJobsList.length);
-  homeTagCount.textContent = String(tags.length);
-  homeRunningJobs.textContent = String(runningJobs);
-  homeFailedJobs.textContent = String(failedJobs);
-  homeEnabledJobs.textContent = String(enabledJobs);
-  homeFirstImportButton.hidden = items.length > 0;
-  if (homeAiMode) {
-    const baseUrl = state.settings?.ai?.baseUrl || "";
-    const embeddingUrl = state.settings?.embedding?.enabled ? state.settings?.embedding?.baseUrl || "" : "";
-    let remote = false;
-    try {
-      const host = new URL(baseUrl).hostname;
-      remote = Boolean(host && !["localhost", "127.0.0.1", "::1"].includes(host));
-    } catch {
-      remote = false;
-    }
-    let embeddingRemote = false;
-    try {
-      const host = new URL(embeddingUrl).hostname;
-      embeddingRemote = Boolean(host && !["localhost", "127.0.0.1", "::1"].includes(host));
-    } catch {}
-    homeAiMode.textContent = !baseUrl && !embeddingUrl ? "未配置 AI" : remote || embeddingRemote ? "包含远程 AI" : "本地 AI";
-    homeAiMode.classList.toggle("is-online", remote);
-    homeAiMode.classList.toggle("is-local", !remote);
-    homeAiMode.title = remote || embeddingRemote ? "已配置远程模型或 Embedding 服务；资料使用受来源隐私策略限制。" : "AI 请求发送到本机地址。";
-  }
-  homeSubscriptionStatus.textContent = failedJobs
-    ? `${failedJobs} 个任务需要检查`
-    : enabledJobs
-      ? `${enabledJobs} 个任务已启用`
-      : "还没有启用刷新任务";
-
-  for (const [source, element] of Object.entries(homeSourceCounts)) {
-    if (element) element.textContent = String(sourceCounts.get(source) || 0);
-  }
-  for (const [source, element] of Object.entries(homeSourceNewCounts)) {
-    if (!element) continue;
-    const newCount = isHomeSourceNewBadgeVisible(source) ? sourceNewCounts.get(source) || 0 : 0;
-    element.textContent = `新 ${newCount}`;
-    element.hidden = newCount <= 0;
-    element.closest("button")?.classList.toggle("has-new-content", newCount > 0);
-  }
-
-  const topSources = [...sourceCounts.entries()]
-    .filter(([, count]) => count > 0)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 3)
-    .map(([source, count]) => `${sourceLabel(source)} ${count}`);
-  homeSourceSummary.textContent = topSources.length ? topSources.join(" · ") : "暂无资料来源";
-  renderHomeRecentUpdates(items);
-  renderHomeRefreshTasks(refreshJobsList);
-}
-
-function renderHomeRecentUpdates(items) {
-  if (!homeRecentUpdates) return;
-  const updates = (items || []).filter(isNewContentItem)
-    .sort((a, b) => String(b.contentUpdatedAt || b.pendingContentUpdatedAt || b.updatedAt || "").localeCompare(String(a.contentUpdatedAt || a.pendingContentUpdatedAt || a.updatedAt || "")))
-    .slice(0, 5);
-  if (!updates.length) {
-    homeRecentUpdates.innerHTML = `<div class="empty-inline">${items?.length ? "没有未读更新。关注来源发生变化后会显示在这里。" : "保存资料后，关注来源的变化会显示在这里。"}</div>`;
-    return;
-  }
-  homeRecentUpdates.innerHTML = updates.map((entry) => `
-    <button class="recent-update-item" type="button" data-home-item-id="${escapeHtml(entry.id)}">
-      <span class="recent-update-title">${escapeHtml(entry.title || "未命名资料")}</span>
-      <small>${escapeHtml(sourceLabel(entry.sourceType))} · ${escapeHtml(relativeTime(entry.contentUpdatedAt || entry.pendingContentUpdatedAt || entry.updatedAt))}</small>
-    </button>
-  `).join("");
-  homeRecentUpdates.querySelectorAll("[data-home-item-id]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      await switchView("materials");
-      await selectItem(button.dataset.homeItemId);
-    });
-  });
-}
-
 async function openWorkbenchSearch(event) {
   event.preventDefault();
   const query = workbenchSearchInput?.value.trim();
@@ -721,325 +425,6 @@ async function openWorkbenchAsk() {
     chatInput.value = query;
     chatInput.focus();
   }
-}
-
-function renderHomeRefreshTasks(jobs) {
-  if (!homeRefreshTaskRows) return;
-  const visibleJobs = (jobs || []).filter((job) => isHomeRefreshSourceVisible(sourceTypeForSubscription(job)));
-  const summaries = summarizeRefreshSources(visibleJobs);
-  const actionable = summaries.filter((summary) => summary.status.kind === "failed" || summary.status.kind === "warning" || summary.status.kind === "running" || summary.updated > 0);
-  if (homeRefreshTaskCount) {
-    homeRefreshTaskCount.textContent = actionable.length ? `${actionable.length} 个来源需要关注` : "暂无需要处理的内容";
-  }
-  if (!actionable.length) {
-    homeRefreshTaskRows.innerHTML = `
-      <tr>
-        <td colspan="4">${state.homeOverview?.items?.length ? "当前没有需要处理的更新或异常。" : "保存第一条资料后，这里会提示变化和异常。"}</td>
-      </tr>
-    `;
-    return;
-  }
-
-  homeRefreshTaskRows.innerHTML = actionable.map((summary) => {
-    const isConfirming = state.homeSourceRefresh.confirmSource === summary.source;
-    const isRunning = state.homeSourceRefresh.runningSource === summary.source;
-    const summaryRunning = !isRunning && summary.status.kind === "running";
-    const status = isRunning
-      ? { kind: state.homeSourceRefresh.failed ? "warning" : "running", label: state.homeSourceRefresh.message || "运行中" }
-      : summary.status;
-    const action = status.kind === "failed" || status.kind === "warning"
-      ? "查看并恢复"
-      : summary.updated > 0 ? "查看更新" : "查看关注";
-    return `
-      <tr>
-        <td>
-          <div class="home-task-name">
-            <span class="home-source-icon home-source-${escapeHtml(summary.source)}">${escapeHtml(sourceIcon(summary.source))}</span>
-            <strong>${escapeHtml(subscriptionSourceLabel(summary.source))}</strong>
-          </div>
-        </td>
-        <td><span class="task-status task-status-${escapeHtml(status.kind)}">${escapeHtml(status.label)}</span>${summary.updated ? `<div class="task-delta-hot">${escapeHtml(`${summary.updated} 条内容有变化`)}</div>` : ""}</td>
-        <td>${escapeHtml(summary.latestRunAt ? relativeTime(summary.latestRunAt) : "尚未运行")}</td>
-        <td>
-          <div class="source-refresh-actions">
-            ${isConfirming ? `
-              <button type="button" class="source-refresh-confirm" data-source-refresh-confirm="${escapeHtml(summary.source)}">确认刷新</button>
-              <button type="button" class="source-refresh-all" data-source-refresh-all="${escapeHtml(summary.source)}">刷新所有</button>
-              <button type="button" class="task-icon-button" data-source-refresh-cancel aria-label="取消刷新">×</button>
-            ` : `
-              <button
-                type="button"
-                class="source-refresh-button"
-                data-source-refresh="${escapeHtml(summary.source)}"
-                ${isRunning ? "disabled" : ""}
-              >${isRunning ? "刷新中" : action}</button>
-            `}
-          </div>
-        </td>
-      </tr>
-    `;
-  }).join("");
-
-  homeRefreshTaskRows.querySelectorAll("[data-source-refresh]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const source = button.dataset.sourceRefresh;
-      const summary = actionable.find((entry) => entry.source === source);
-      if (summary?.updated) {
-        await switchView("materials");
-        state.sourceType = source;
-        await loadItems();
-        return;
-      }
-      if (summary?.status.kind === "failed" || summary?.status.kind === "warning") {
-        await switchView("subscriptions");
-        state.subscriptionSource = source;
-        renderRefreshJobs(state.refreshJobs);
-        return;
-      }
-      state.homeSourceRefresh.confirmSource = source;
-      renderHomeOverview();
-    });
-  });
-  homeRefreshTaskRows.querySelectorAll("[data-source-refresh-confirm]").forEach((button) => {
-    button.addEventListener("click", () => refreshHomeSource(button.dataset.sourceRefreshConfirm));
-  });
-  homeRefreshTaskRows.querySelectorAll("[data-source-refresh-all]").forEach((button) => {
-    button.addEventListener("click", () => refreshHomeSource(button.dataset.sourceRefreshAll, { clearFirst: true }));
-  });
-  homeRefreshTaskRows.querySelectorAll("[data-source-refresh-cancel]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.homeSourceRefresh.confirmSource = "";
-      renderHomeOverview();
-    });
-  });
-}
-
-function isHomeRefreshSourceVisible(source) {
-  return source !== "web" && source !== "text";
-}
-
-function isHomeSourceNewBadgeVisible(source) {
-  return source !== "web" && source !== "text";
-}
-
-function countNewSources(items) {
-  const counts = new Map();
-  for (const item of items || []) {
-    if (!isNewContentItem(item)) continue;
-    const source = item.sourceType || "text";
-    counts.set(source, (counts.get(source) || 0) + 1);
-  }
-  return counts;
-}
-
-function isNewContentItem(item) {
-  return Boolean(item?.contentUpdatedAt || item?.pendingContentUpdatedAt || item?.processedStale);
-}
-
-function summarizeRefreshSources(jobs) {
-  const groups = new Map();
-  for (const job of jobs || []) {
-    const source = sourceTypeForSubscription(job);
-    if (!groups.has(source)) {
-      groups.set(source, {
-        source,
-        total: 0,
-        enabled: 0,
-        running: 0,
-        failed: 0,
-        warning: 0,
-        succeeded: 0,
-        latestRunAt: "",
-        progressSum: 0,
-        updated: 0,
-        totalResult: 0
-      });
-    }
-    const group = groups.get(source);
-    const status = homeRefreshJobStatus(job);
-    const progress = homeRefreshJobProgress(job);
-    const delta = homeRefreshJobDelta(job);
-    group.total += 1;
-    group.enabled += job.enabled ? 1 : 0;
-    group.running += status.kind === "running" ? 1 : 0;
-    group.failed += job.enabled && status.kind === "failed" ? 1 : 0;
-    group.warning += job.enabled && status.kind === "warning" ? 1 : 0;
-    group.succeeded += job.enabled && status.kind === "success" ? 1 : 0;
-    if (job.enabled) group.progressSum += progress.percent;
-    group.updated += delta.updated;
-    group.totalResult += delta.total;
-    if (job.lastRunAt && (!group.latestRunAt || job.lastRunAt > group.latestRunAt)) {
-      group.latestRunAt = job.lastRunAt;
-    }
-  }
-
-  return [...groups.values()]
-    .map((group) => {
-      const status = sourceSummaryStatus(group);
-      const finished = group.succeeded + group.failed + group.warning;
-      const successRate = finished ? Math.round((group.succeeded / finished) * 100) : 0;
-      return {
-        ...group,
-        status,
-        successRate,
-        progress: group.enabled ? Math.round(group.progressSum / group.enabled) : 0
-      };
-    })
-    .sort((a, b) => {
-      const order = { running: 0, failed: 1, warning: 2, success: 3, idle: 4, skipped: 5 };
-      return (order[a.status.kind] ?? 9) - (order[b.status.kind] ?? 9)
-        || subscriptionSourceLabel(a.source).localeCompare(subscriptionSourceLabel(b.source));
-    });
-}
-
-function sourceSummaryStatus(group) {
-  if (group.running) return { kind: "running", label: `${group.running} 运行中` };
-  if (group.failed) return { kind: "failed", label: `${group.failed} 失败` };
-  if (group.warning) return { kind: "warning", label: `${group.warning} 警告` };
-  if (group.succeeded) return { kind: "success", label: "正常" };
-  if (!group.enabled) return { kind: "skipped", label: "未启用" };
-  return { kind: "idle", label: "空闲" };
-}
-
-async function refreshHomeSource(source, options = {}) {
-  const jobsToRun = (state.refreshJobs || []).filter((job) => (
-    sourceTypeForSubscription(job) === source && (options.clearFirst || job.enabled)
-  ));
-  const startedAt = new Date().toISOString();
-  const token = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  state.homeSourceRefresh.confirmSource = "";
-  state.homeSourceRefresh.runningSource = source;
-  state.homeSourceRefresh.requestToken = token;
-  state.homeSourceRefresh.startedAt = startedAt;
-  state.homeSourceRefresh.total = jobsToRun.length;
-  state.homeSourceRefresh.completed = 0;
-  state.homeSourceRefresh.failed = 0;
-  state.homeSourceRefresh.message = "启动刷新中";
-  state.homeSourceRefresh.pollErrorCount = 0;
-  state.homeSourceRefresh.timeoutAt = Date.now() + 10 * 60 * 1000;
-  renderHomeOverview();
-  if (!jobsToRun.length) {
-    resetHomeSourceRefreshState(token);
-    renderHomeOverview();
-    return;
-  }
-
-  try {
-    if (options.clearFirst) {
-      const { jobs } = await api(`/api/refresh-jobs/source/${encodeURIComponent(source)}/items`, { method: "DELETE" });
-      if (state.homeSourceRefresh.requestToken !== token) return;
-      state.refreshJobs = jobs || state.refreshJobs;
-      renderHomeOverview();
-    }
-    const { run, jobs } = await api("/api/refresh-jobs/run-batch?background=1", {
-      method: "POST",
-      body: JSON.stringify({
-        ids: jobsToRun.map((job) => job.id),
-        sourceType: source,
-        background: true
-      })
-    });
-    if (state.homeSourceRefresh.requestToken !== token) return;
-    state.homeSourceRefresh.runId = run?.id || "";
-    state.homeSourceRefresh.message = "运行中";
-    state.refreshJobs = jobs || state.refreshJobs;
-    startHomeSourceRefreshPolling(source, startedAt, jobsToRun.length, token, run?.id || "");
-    renderHomeOverview();
-  } catch (error) {
-    if (state.homeSourceRefresh.requestToken !== token) return;
-    console.warn(`Failed to refresh ${source}:`, error);
-    state.homeSourceRefresh.message = error.message || "刷新启动失败";
-    state.homeSourceRefresh.failed = jobsToRun.length;
-    showRefreshFailureToast([{
-      sourceType: source,
-      name: subscriptionSourceLabel(source),
-      url: jobsToRun[0]?.url || "",
-      error: error.message || "刷新启动失败"
-    }]);
-    await loadSettings();
-    resetHomeSourceRefreshState(token);
-    renderHomeOverview();
-  }
-}
-
-function startHomeSourceRefreshPolling(source, startedAt, total, token = state.homeSourceRefresh.requestToken, runId = state.homeSourceRefresh.runId) {
-  stopHomeSourceRefreshPolling();
-  state.homeSourceRefresh.pollTimer = setInterval(async () => {
-    if (state.homeSourceRefresh.requestToken !== token) return stopHomeSourceRefreshPolling();
-    try {
-      const payload = runId ? await api(`/api/refresh-runs/${encodeURIComponent(runId)}`) : await api("/api/refresh-jobs");
-      const run = payload.run || null;
-      syncTeamsReadyDialog(run);
-      const jobs = run?.jobs || payload.jobs || state.refreshJobs;
-      state.refreshJobs = jobs || state.refreshJobs;
-      const sourceJobs = (state.refreshJobs || []).filter((job) => sourceTypeForSubscription(job) === source);
-      const completed = run ? Number(run.completedJobs || 0) : sourceJobs.filter((job) => job.lastRunAt && job.lastRunAt >= startedAt).length;
-      const failed = run ? Number(run.failedJobs || 0) : sourceJobs.filter((job) => ["failed", "unreachable"].includes(job.status) && job.lastRunAt && job.lastRunAt >= startedAt).length;
-      const active = sourceJobs.some((job) => job.running);
-      state.homeSourceRefresh.total = run?.totalJobs || total || sourceJobs.length;
-      state.homeSourceRefresh.completed = completed;
-      state.homeSourceRefresh.failed = failed;
-      state.homeSourceRefresh.pollErrorCount = 0;
-      state.homeSourceRefresh.message = runStatusText(run) || (active ? "运行中" : failed ? "有失败" : "刷新完成");
-      renderRefreshJobs(state.refreshJobs);
-      renderHomeOverview();
-      const terminal = run && ["completed", "failed", "canceled"].includes(run.status);
-      if (terminal || (!active && completed + failed >= Math.max(1, Number(state.homeSourceRefresh.total || 0)))) {
-        if (failed) {
-          if (run) {
-            showRefreshFailureToastFromRun(run);
-          } else {
-            showRefreshFailureToast(sourceJobs
-              .filter((job) => ["failed", "unreachable"].includes(job.status) && job.lastRunAt && job.lastRunAt >= startedAt)
-              .map((job) => ({
-                sourceType: sourceTypeForSubscription(job),
-                name: job.name || job.id,
-                url: job.url || job.lastResult?.errors?.find((entry) => entry?.url)?.url || "",
-                error: refreshJobErrorText(job) || "刷新失败"
-              })));
-          }
-        }
-        await loadMaterialUpdateCount();
-        resetHomeSourceRefreshState(token);
-        renderHomeOverview();
-      } else if (Date.now() > state.homeSourceRefresh.timeoutAt) {
-        state.homeSourceRefresh.message = "已切换后台监控";
-        resetHomeSourceRefreshState(token, { keepJobs: true });
-        renderHomeOverview();
-      }
-    } catch (error) {
-      state.homeSourceRefresh.pollErrorCount += 1;
-      state.homeSourceRefresh.message = "进度同步失败";
-      console.warn(`Failed to poll ${source} refresh progress:`, error);
-      if (state.homeSourceRefresh.pollErrorCount >= 5) {
-        resetHomeSourceRefreshState(token, { keepJobs: true });
-        renderHomeOverview();
-      } else {
-        renderHomeOverview();
-      }
-    }
-  }, 1000);
-}
-
-function stopHomeSourceRefreshPolling() {
-  if (!state.homeSourceRefresh.pollTimer) return;
-  clearInterval(state.homeSourceRefresh.pollTimer);
-  state.homeSourceRefresh.pollTimer = null;
-}
-
-function resetHomeSourceRefreshState(token = state.homeSourceRefresh.requestToken, options = {}) {
-  if (token && state.homeSourceRefresh.requestToken && token !== state.homeSourceRefresh.requestToken) return;
-  stopHomeSourceRefreshPolling();
-  state.homeSourceRefresh.runningSource = "";
-  state.homeSourceRefresh.runId = "";
-  state.homeSourceRefresh.requestToken = "";
-  state.homeSourceRefresh.startedAt = "";
-  state.homeSourceRefresh.total = 0;
-  state.homeSourceRefresh.completed = 0;
-  state.homeSourceRefresh.failed = 0;
-  state.homeSourceRefresh.pollErrorCount = 0;
-  state.homeSourceRefresh.timeoutAt = 0;
-  if (!options.keepJobs) state.homeSourceRefresh.message = "";
 }
 
 function runStatusText(run) {
@@ -1103,51 +488,6 @@ async function cancelTeamsReadyRefresh() {
   }
 }
 
-function homeRefreshJobProgress(job) {
-  if (job.running) return { percent: 0 };
-  if (job.status === "failed" || job.status === "unreachable") return { percent: 0 };
-  if (job.status === "running" && !job.running) return { percent: 0 };
-  if (job.lastResult) {
-    const total = Number(job.lastResult.linkCount ?? job.lastResult.issueCount ?? 0);
-    const skipped = Number(job.lastResult.skippedItemCount || 0);
-    const updated = Number(job.lastResult.updatedItemCount ?? job.lastResult.updatedIssueCount ?? 0);
-    if (total > 0) {
-      return { percent: Math.max(0, Math.min(100, Math.round(((updated + skipped) / total) * 100))) };
-    }
-  }
-  return { percent: job.lastRunAt ? 100 : 0 };
-}
-
-function homeRefreshJobStatus(job) {
-  if (job.running) return { kind: "running", label: "运行中" };
-  if (job.status === "running") return { kind: "warning", label: "可能中断" };
-  if (job.status === "failed" || job.status === "unreachable") return { kind: "failed", label: "失败" };
-  if (!job.enabled) return { kind: "skipped", label: "跳过" };
-  if (job.lastError) return { kind: "warning", label: "警告" };
-  if (job.lastRunAt) return { kind: "success", label: "成功" };
-  return { kind: "idle", label: "空闲" };
-}
-
-function homeRefreshJobDelta(job) {
-  if (job.status === "failed" || job.status === "unreachable" || job.status === "running") {
-    return { changed: false, text: "- / -", updated: 0, total: 0 };
-  }
-  const updated = Number(job.lastResult?.updatedItemCount ?? job.lastResult?.updatedIssueCount ?? 0);
-  const total = Number(job.lastResult?.linkCount ?? job.lastResult?.issueCount ?? 0);
-  if (!job.lastResult) return { changed: false, text: "- / -", updated: 0, total: 0 };
-  return { changed: updated > 0, text: `${updated} / ${total}`, updated, total };
-}
-
-function sourceIcon(source) {
-  return {
-    confluence: "◆",
-    github: "●",
-    jira: "◆",
-    teams: "▣",
-    web: "◎"
-  }[source] || "□";
-}
-
 function relativeTime(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return formatDate(value);
@@ -1160,6 +500,14 @@ function relativeTime(value) {
   if (diffMs < day) return `${Math.round(diffMs / hour)} 小时前`;
   if (diffMs < day * 2) return `昨天 ${date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`;
   return formatDate(value);
+}
+
+function compactDate(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  if (Date.now() - date.getTime() < 2 * 24 * 60 * 60 * 1000) return relativeTime(value);
+  const sameYear = date.getFullYear() === new Date().getFullYear();
+  return `${sameYear ? "" : `${date.getFullYear()}年`}${date.getMonth() + 1}月${date.getDate()}日`;
 }
 
 function countSources(items) {
@@ -1179,18 +527,6 @@ function normalizeSourceType(source) {
   if (value.includes("confluence")) return "confluence";
   if (value.includes("web") || value.includes("http")) return "web";
   return value || "text";
-}
-
-function sourceLabel(source) {
-  const labels = {
-    confluence: "Confluence",
-    github: "GitHub",
-    jira: "Jira",
-    teams: "Teams",
-    text: "文本",
-    web: "文本"
-  };
-  return labels[source] || source;
 }
 
 function captureMethodLabel(method) {
@@ -1217,47 +553,6 @@ function coverageSummary(coverage) {
   if (coverage.gap) parts.push(`⚠ 未能接上上次抓取的位置，${coverage.oldestObservedAt ? `${String(coverage.oldestObservedAt).slice(0, 10)} 之前` : "较早"}可能有消息缺失`);
   else if (coverage.stoppedBy === "no-more-history") parts.push("已到会话开头");
   return parts.join("，") || "";
-}
-
-function renderItems() {
-  const classified = state.listClassification?.groups?.length;
-  resultCount.textContent = `${state.items.length} / ${state.totalItems || state.items.length} 条资料${classified ? ` · ${state.listClassification.groups.length} 个分类` : ""}`;
-  classifyListButton.textContent = state.listClassifying
-    ? "分类中..."
-    : classified
-      ? "重新分类"
-      : "列表分类";
-  classifyListButton.disabled = state.listClassifying || !state.items.length;
-
-  if (!state.items.length) {
-    itemList.innerHTML = `<div class="empty-state">还没有符合条件的资料。</div>`;
-    return;
-  }
-
-  if (classified) {
-    renderClassifiedItems();
-    return;
-  }
-
-  itemList.innerHTML = [
-    state.items.map(renderItemCard).join(""),
-    state.items.length < state.totalItems ? `<button class="load-more-button" type="button" data-load-more>加载更多（剩余 ${state.totalItems - state.items.length} 条）</button>` : ""
-  ].join("");
-
-  bindItemCards();
-  itemList.querySelector("[data-load-more]")?.addEventListener("click", loadMoreItems);
-}
-
-function renderItemCard(item) {
-  return `
-    <button class="item-card ${state.selectedId === item.id ? "is-selected" : ""}" data-id="${escapeHtml(item.id)}">
-      <div class="item-card-title">
-        <h3>${escapeHtml(item.title)}</h3>
-        ${item.integrityStatus === "quarantined" ? `<span class="integrity-badge">已隔离</span>` : ""}
-        ${item.contentUpdatedAt ? `<span class="new-badge item-new-badge">NEW!</span>` : ""}
-      </div>
-    </button>
-  `;
 }
 
 function bindItemCards() {
@@ -1805,24 +1100,6 @@ function unwrapMarkdownFence(markdown) {
   return match ? match[1].trim() : source;
 }
 
-function renderTags() {
-  const allButton = `<button class="tag-chip ${state.tag ? "" : "is-active"}" data-tag="">全部</button>`;
-  const tagButtons = state.tags.map((tag) => `
-    <button class="tag-chip ${state.tag === tag.name ? "is-active" : ""}" data-tag="${escapeHtml(tag.name)}">
-      ${escapeHtml(tag.name)} ${tag.count}
-    </button>
-  `).join("");
-
-  tagList.innerHTML = allButton + tagButtons;
-  tagList.querySelectorAll(".tag-chip").forEach((chip) => {
-    chip.addEventListener("click", async () => {
-      state.tag = chip.dataset.tag;
-      await loadItems();
-      renderTags();
-    });
-  });
-}
-
 async function selectItem(id) {
   state.selectedId = id;
   const requestId = ++state.itemSelectionRequest;
@@ -1836,207 +1113,6 @@ async function selectItem(id) {
     if (requestId !== state.itemSelectionRequest || state.selectedId !== id) return;
     detailPanel.innerHTML = `<div class="empty-state">${escapeHtml(error.message || "无法打开资料")}</div>`;
   }
-}
-
-async function acknowledgeSelectedItemUpdate(id) {
-  try {
-    const { item } = await api(`/api/items/${encodeURIComponent(id)}/ack-update`, { method: "POST" });
-    if (state.selectedId !== id) return item;
-    const index = state.items.findIndex((candidate) => candidate.id === id);
-    if (index !== -1) {
-      state.items[index] = {
-        ...state.items[index],
-        contentUpdatedAt: "",
-        updateAcknowledgedAt: item.metadata.updateAcknowledgedAt || ""
-      };
-      state.updateCount = Math.max(0, state.updateCount - 1);
-      renderItems();
-      renderMaterialsNewBadge();
-    } else {
-      await loadMaterialUpdateCount();
-    }
-    return item;
-  } catch (error) {
-    console.warn("Failed to acknowledge item update:", error);
-    return null;
-  }
-}
-
-function renderDetail(item) {
-  const metadata = item.metadata;
-  const hasProcessed = Boolean(item.processedDocument?.trim());
-  const showProcessed = state.detailMode === "processed" && hasProcessed;
-  const rawDocument = extractMarkdownSection(item.document, "## Content");
-  const processedDocument = extractMarkdownSection(item.processedDocument || "", "## AI Organized Content");
-  const displayedDocument = showProcessed && hasProcessed ? processedDocument : rawDocument;
-  const modeNote = showProcessed && metadata.processedStale
-      ? `<div class="detail-note">原文刷新后发生过变化，当前 AI 整理版可能不是最新。点击“更新整理”可重新生成。</div>`
-    : "";
-  const integrityNote = metadata.integrityStatus === "quarantined"
-    ? `<div class="detail-note integrity-warning"><strong>资料已隔离：</strong>${escapeHtml(metadata.integrityReason || "来源完整性校验未通过")}。在刷新验证通过前不会进入 AI 检索或批处理。</div>`
-    : "";
-  detailPanel.innerHTML = `
-    <div class="detail-title">
-      <div class="title-editor">
-        <div id="detailTitleWrap" class="title-input-wrap">
-          <input id="detailTitleInput" value="${escapeHtml(metadata.title)}" />
-          <span id="detailTitleMarquee" class="title-marquee-text" aria-hidden="true">${escapeHtml(metadata.title)}</span>
-        </div>
-      </div>
-      <div class="detail-actions">
-        <div class="detail-tabs" role="tablist" aria-label="资料版本">
-          <button id="showRawButton" type="button" class="${showProcessed ? "" : "is-active"}">原文</button>
-          <button id="showProcessedButton" type="button" class="${showProcessed ? "is-active" : ""}" ${hasProcessed ? "" : "disabled"}>整理版${metadata.processedStale ? " · 已过期" : ""}</button>
-        </div>
-        <button id="processItemButton" ${metadata.integrityStatus === "quarantined" ? "disabled" : ""}>${hasProcessed ? "更新整理" : "生成整理"}</button>
-        ${metadata.url ? `<button id="refreshButton">检查更新</button>` : ""}
-        <button id="diffItemButton">变更</button>
-        <details class="detail-manage-menu">
-          <summary>管理资料</summary>
-          <div class="detail-manage-actions">
-            <button id="saveTitleButton" type="button">保存标题</button>
-            <button id="generateTitleButton" type="button" ${metadata.integrityStatus === "quarantined" ? "disabled" : ""}>AI 生成标题</button>
-            <button id="editTagsButton">编辑标签</button>
-            <button id="deleteItemButton" class="danger-button">删除</button>
-          </div>
-        </details>
-      </div>
-      <div class="detail-meta-block">
-        <div class="item-meta">${escapeHtml(sourceLabel(metadata.sourceType))}${metadata.url ? ` · ${escapeHtml(metadata.url)}` : ""}</div>
-        ${metadata.captureMethod ? `<div class="item-meta">抓取方式：${escapeHtml(captureMethodLabel(metadata.captureMethod))}</div>` : ""}
-        ${metadata.processedAt ? `<div class="item-meta">AI 整理：${escapeHtml(formatDate(metadata.processedAt))}</div>` : ""}
-        ${coverageNote(metadata)}
-      </div>
-    </div>
-    <div class="item-meta">标签：${escapeHtml((metadata.tags || []).join(", ") || "未标记")}</div>
-    ${metadata.contentUpdatedAt ? `<div class="detail-note">内容在 ${escapeHtml(formatDate(metadata.contentUpdatedAt))} 更新。<button id="acknowledgeUpdateButton" type="button">标为已读</button></div>` : ""}
-    <hr />
-    ${integrityNote}
-    ${modeNote}
-    <div id="detailContentLayout" class="detail-content-layout">
-      <div id="detailTocWrap" class="detail-toc-wrap" hidden>
-        <button id="detailTocToggle" type="button" class="detail-toc-toggle" aria-expanded="false">目录</button>
-        <aside id="detailToc" class="detail-toc" hidden>
-          <div class="detail-toc-title">目录</div>
-          <nav id="detailTocList" class="detail-toc-list" aria-label="内容目录"></nav>
-        </aside>
-      </div>
-      <div id="detailDoc" class="detail-doc markdown-body">${renderMarkdown(displayedDocument)}</div>
-    </div>
-    <section id="detailDiff" class="detail-diff" hidden></section>
-  `;
-  setupDetailTitleMarquee();
-  setupDetailToc();
-
-  document.querySelector("#showRawButton").addEventListener("click", () => {
-    state.detailMode = "raw";
-    localStorage.setItem("materialOrganizer.detailMode", state.detailMode);
-    renderDetail(item);
-  });
-  document.querySelector("#showProcessedButton")?.addEventListener("click", () => {
-    state.detailMode = "processed";
-    localStorage.setItem("materialOrganizer.detailMode", state.detailMode);
-    renderDetail(item);
-  });
-  document.querySelector("#acknowledgeUpdateButton")?.addEventListener("click", async () => {
-    const nextItem = await acknowledgeSelectedItemUpdate(metadata.id);
-    if (state.selectedId === metadata.id) renderDetail(nextItem || item);
-  });
-
-  document.querySelector("#saveTitleButton").addEventListener("click", async () => {
-    const input = document.querySelector("#detailTitleInput");
-    const button = document.querySelector("#saveTitleButton");
-    button.disabled = true;
-    button.textContent = "保存中...";
-    try {
-      const { item: nextItem } = await api(`/api/items/${encodeURIComponent(metadata.id)}/title`, {
-        method: "PATCH",
-        body: JSON.stringify({ title: input.value })
-      });
-      renderDetail(nextItem);
-      await loadItems();
-    } catch (error) {
-      alert(error.message);
-      button.disabled = false;
-      button.textContent = "保存标题";
-    }
-  });
-
-  document.querySelector("#generateTitleButton").addEventListener("click", async () => {
-    const button = document.querySelector("#generateTitleButton");
-    button.disabled = true;
-    button.textContent = "生成中...";
-    try {
-      const { item: nextItem } = await api(`/api/items/${encodeURIComponent(metadata.id)}/recommend-title`, { method: "POST" });
-      renderDetail(nextItem);
-      await loadItems();
-    } catch (error) {
-      alert(error.message);
-      button.disabled = false;
-      button.textContent = "AI 生成标题";
-    }
-  });
-
-  document.querySelector("#processItemButton").addEventListener("click", async () => {
-    const button = document.querySelector("#processItemButton");
-    button.disabled = true;
-    button.textContent = "整理中...";
-    try {
-      const { item: nextItem } = await api(`/api/items/${encodeURIComponent(metadata.id)}/process`, { method: "POST" });
-      state.detailMode = "processed";
-      localStorage.setItem("materialOrganizer.detailMode", state.detailMode);
-      renderDetail(nextItem);
-      await loadItems();
-    } catch (error) {
-      alert(error.message);
-      button.disabled = false;
-      button.textContent = hasProcessed ? "重新生成整理" : "生成 AI 整理";
-    }
-  });
-
-  document.querySelector("#editTagsButton").addEventListener("click", () => openTagDialog(item));
-
-  document.querySelector("#refreshButton")?.addEventListener("click", async () => {
-    try {
-      const payload = await api(`/api/items/${encodeURIComponent(metadata.id)}/refresh`, { method: "POST" });
-      if (payload.run) {
-        await monitorSubscriptionRefreshRun(payload.run, `正在刷新 ${metadata.title || "Teams 对话"}`);
-      }
-      await loadAll();
-      await selectItem(metadata.id);
-    } catch (error) {
-      alert(error.message);
-    }
-  });
-
-  document.querySelector("#diffItemButton").addEventListener("click", async (event) => {
-    const button = event.currentTarget;
-    const panel = document.querySelector("#detailDiff");
-    button.disabled = true;
-    try {
-      const { diff } = await api(`/api/items/${encodeURIComponent(metadata.id)}/diff`);
-      panel.hidden = false;
-      panel.innerHTML = `<div class="detail-diff-header"><strong>最近快照差异</strong><span>新增 ${escapeHtml(diff.addedLines)} 行 · 删除 ${escapeHtml(diff.removedLines)} 行${diff.truncated ? " · 已截断" : ""}</span></div><pre>${escapeHtml(diff.text || "没有变化")}</pre>`;
-      button.textContent = "已显示变更";
-    } catch (error) {
-      alert(error.message);
-    } finally {
-      button.disabled = false;
-    }
-  });
-
-  document.querySelector("#deleteItemButton").addEventListener("click", async () => {
-    const ok = confirm(`确认删除“${metadata.title}”？该资料的正文、原始文件、评论和快照都会被删除。`);
-    if (!ok) return;
-    try {
-      await api(`/api/items/${encodeURIComponent(metadata.id)}`, { method: "DELETE" });
-      state.selectedId = null;
-      detailPanel.innerHTML = `<div class="empty-state">资料已删除。</div>`;
-      await loadAll();
-    } catch (error) {
-      alert(error.message);
-    }
-  });
 }
 
 function setupDetailTitleMarquee() {
@@ -2322,6 +1398,7 @@ async function loadSettings() {
     field.value = settings.processingPrompts?.[field.dataset.processingPrompt] || "";
   }
   settingDocumentRoot.value = settings.documentRoot || "";
+  fillAutoProcessFields(settings.autoProcess);
   activeDocumentRoot.textContent = settings.activeDocumentRoot || settings.documentRoot || "";
   renderSourceProfiles(settings.sources || {});
   renderRefreshJobs(settings.refreshJobs || []);
@@ -3198,6 +2275,12 @@ async function saveSettings(event) {
           dimensions: Number(settingEmbeddingDimensions.value || 0)
         },
         processingPrompts: collectProcessingPrompts(),
+        autoProcess: {
+          mode: settingAutoProcessMode?.value,
+          minNewMessages: Number(settingAutoProcessMessages?.value || 20),
+          minNewChars: Number(settingAutoProcessChars?.value || 3000),
+          maxStaleDays: Number(settingAutoProcessDays?.value || 7)
+        },
         documentRoot: settingDocumentRoot.value,
         sources: collectSourceProfiles(),
         refreshJobs: collectRefreshJobs()
@@ -3223,24 +2306,12 @@ async function saveSettings(event) {
       field.value = settings.processingPrompts?.[field.dataset.processingPrompt] || field.value;
     }
     agentRoot.textContent = settings.activeDocumentRoot;
+    fillAutoProcessFields(settings.autoProcess);
     settingsStatus.textContent = "设置已保存。";
     renderRefreshJobs(settings.refreshJobs || []);
     await loadSettingsTags();
   } catch (error) {
     settingsStatus.textContent = error.message;
-  }
-}
-
-function setDoNotDisturbState(enabled, options = {}) {
-  state.doNotDisturb = Boolean(enabled);
-  if (!doNotDisturbToggle) return;
-  const active = state.doNotDisturb;
-  doNotDisturbToggle.classList.toggle("is-active", active);
-  doNotDisturbToggle.setAttribute("aria-pressed", String(active));
-  doNotDisturbToggle.setAttribute("aria-label", active ? "关闭勿扰模式" : "开启勿扰模式");
-  doNotDisturbToggle.title = active ? "勿扰模式已开启：自动更新暂停" : "开启勿扰模式";
-  if (!options.renderOnly) {
-    doNotDisturbToggle.disabled = false;
   }
 }
 
@@ -3572,7 +2643,7 @@ function renderSourceProfiles(profiles) {
 }
 
 function addSourceProfile(event) {
-  event.preventDefault();
+  event?.preventDefault();
   const hostname = newSourceHostname?.value.trim().replace(/^https?:\/\//i, "").replace(/\/.*$/, "").toLowerCase();
   if (!hostname || /\s/.test(hostname)) return;
   const profiles = collectSourceProfiles();
@@ -3603,168 +2674,6 @@ function updateAuthFields(section) {
   });
 }
 
-function renderRefreshJobs(jobs) {
-  state.refreshJobs = jobs || [];
-  renderHomeOverview();
-  renderSubscriptionTabs();
-  const visibleJobs = refreshJobsForCurrentTab();
-
-  if (!visibleJobs.length) {
-    refreshJobs.innerHTML = `<div class="empty-state">还没有刷新任务。</div>`;
-    return;
-  }
-
-  if (state.subscriptionSource === "content") {
-    renderContentPageRefreshGroup(visibleJobs);
-    return;
-  }
-
-  refreshJobs.innerHTML = visibleJobs.map((job) => `
-    <section class="refresh-job" data-id="${escapeHtml(job.id)}">
-      <div class="refresh-job-title">
-        <label class="inline-toggle">
-          <input data-field="enabled" type="checkbox" ${job.enabled ? "checked" : ""} />
-          <strong>${escapeHtml(job.name)}</strong>
-          ${job.quarantined ? `<span class="integrity-badge">待验证</span>` : ""}
-        </label>
-        <div class="refresh-job-actions">
-          <button type="button" data-run-job="${escapeHtml(job.id)}" ${job.running ? "disabled" : ""}>${job.running ? "运行中" : "立即刷新"}</button>
-          ${isManagedContentPageJob(job) ? "" : `
-            <button type="button" class="danger-button" data-clear-job-items="${escapeHtml(job.id)}">清空内容</button>
-            <button type="button" class="danger-button" data-delete-job="${escapeHtml(job.id)}">删除</button>
-          `}
-        </div>
-      </div>
-      <label>
-        ${isManagedContentPageJob(job) ? "页面 URL" : "订阅 URL"}
-        <input data-field="url" value="${escapeHtml(job.url || "")}" />
-      </label>
-      <div class="settings-grid">
-        <label>
-          刷新间隔分钟
-          <input data-field="intervalMinutes" type="number" min="5" value="${escapeHtml(job.intervalMinutes || 60)}" />
-        </label>
-        <label>
-          最多刷新条数
-          <input data-field="maxItems" type="number" min="1" value="${escapeHtml(job.maxItems || 50)}" />
-        </label>
-      </div>
-      <label>
-        标签
-        <input data-field="tags" value="${escapeHtml(refreshJobTagsText(job.tags))}" />
-      </label>
-      <div class="item-meta">
-        状态：${escapeHtml(formatRefreshStatus(job.running ? "running" : job.status || "idle"))} · 上次刷新：${escapeHtml(job.lastRunAt ? formatDate(job.lastRunAt) : "未刷新")}
-      </div>
-      ${job.quarantined ? `<div class="detail-note integrity-warning">${escapeHtml(job.quarantineReason || "该 Teams 任务因历史会话串线已暂停。点击立即刷新进行验证，成功后再启用自动刷新。")}</div>` : ""}
-      ${job.circuitOpen ? `<div class="detail-note integrity-warning">连续失败 ${escapeHtml(job.consecutiveFailures || 5)} 次，自动刷新已熔断。手动“立即刷新”成功后会自动恢复。</div>` : job.nextRetryAt ? `<div class="item-meta">自动重试：${escapeHtml(formatDate(job.nextRetryAt))}（连续失败 ${escapeHtml(job.consecutiveFailures || 0)} 次）</div>` : ""}
-      ${job.lastError ? `<div class="item-meta">错误：${escapeHtml(job.lastError)}</div>` : ""}
-      ${job.lastResult && !["failed", "unreachable", "running"].includes(job.status) ? `<div class="item-meta">结果：更新 ${escapeHtml(job.lastResult.updatedItemCount ?? job.lastResult.updatedIssueCount ?? 0)} / ${escapeHtml(job.lastResult.linkCount ?? job.lastResult.issueCount ?? 0)} 个内容页，跳过 ${escapeHtml(job.lastResult.skippedItemCount || 0)}</div>` : ""}
-      <input data-field="fetchMode" type="hidden" value="${escapeHtml(job.fetchMode || "auto")}" />
-      <input data-field="pageKind" type="hidden" value="${escapeHtml(job.pageKind || "list")}" />
-    </section>
-  `).join("");
-
-  refreshJobs.querySelectorAll("[data-run-job]").forEach((button) => {
-    button.addEventListener("click", () => runRefreshJob(button.dataset.runJob));
-  });
-  refreshJobs.querySelectorAll("[data-clear-job-items]").forEach((button) => {
-    button.addEventListener("click", () => clearRefreshJobItems(button.dataset.clearJobItems));
-  });
-  refreshJobs.querySelectorAll("[data-delete-job]").forEach((button) => {
-    button.addEventListener("click", () => deleteRefreshJob(button.dataset.deleteJob));
-  });
-}
-
-function renderContentPageRefreshGroup(contentJobs) {
-  const enabledCount = contentJobs.filter((job) => job.enabled).length;
-  const intervalMinutes = commonRefreshJobValue(contentJobs, "intervalMinutes") || contentJobs[0]?.intervalMinutes || 60;
-  const latestRunAt = contentJobs
-    .map((job) => job.lastRunAt || "")
-    .filter(Boolean)
-    .sort((a, b) => b.localeCompare(a))[0] || "";
-  const failedCount = contentJobs.filter((job) => job.status === "failed" || job.status === "unreachable").length;
-  const running = contentJobs.some((job) => job.running);
-  const sourceCounts = new Map();
-  for (const job of contentJobs) {
-    const source = sourceTypeForSubscription(job);
-    sourceCounts.set(source, (sourceCounts.get(source) || 0) + 1);
-  }
-  const sourceSummary = [...sourceCounts.entries()]
-    .map(([source, count]) => `${subscriptionSourceLabel(source)} ${count}`)
-    .join(" · ");
-
-  refreshJobs.innerHTML = `
-    <section class="refresh-job content-refresh-group" data-content-page-group="1">
-      <div class="refresh-job-title">
-        <label class="inline-toggle">
-          <input data-field="enabled" type="checkbox" ${enabledCount ? "checked" : ""} />
-          <strong>普通页面整体刷新</strong>
-        </label>
-        <div class="refresh-job-actions">
-          <button type="button" data-run-content-pages ${running ? "disabled" : ""}>${running ? "运行中" : "立即刷新"}</button>
-        </div>
-      </div>
-      <div class="settings-grid">
-        <label>
-          刷新间隔分钟
-          <input data-field="intervalMinutes" type="number" min="5" value="${escapeHtml(intervalMinutes)}" />
-        </label>
-        <label>
-          页面数量
-          <input value="${escapeHtml(contentJobs.length)}" disabled />
-        </label>
-      </div>
-      <div class="item-meta">
-        已启用：${escapeHtml(String(enabledCount))} / ${escapeHtml(String(contentJobs.length))} · 上次刷新：${escapeHtml(latestRunAt ? formatDate(latestRunAt) : "未刷新")}
-      </div>
-      ${sourceSummary ? `<div class="item-meta">${escapeHtml(sourceSummary)}</div>` : ""}
-      ${failedCount ? `<div class="item-meta">失败：${escapeHtml(String(failedCount))} 个页面</div>` : ""}
-    </section>
-  `;
-
-  refreshJobs.querySelector("[data-run-content-pages]")?.addEventListener("click", () => runAllRefreshJobs());
-}
-
-function commonRefreshJobValue(jobs, field) {
-  if (!jobs.length) return "";
-  const [first] = jobs;
-  return jobs.every((job) => String(job[field] || "") === String(first[field] || "")) ? first[field] : "";
-}
-
-function renderSubscriptionTabs() {
-  const counts = new Map([["all", state.refreshJobs.length]]);
-  const contentCount = state.refreshJobs.filter(isManagedContentPageJob).length;
-  if (contentCount) counts.set("content", contentCount);
-  for (const job of state.refreshJobs) {
-    const sourceType = sourceTypeForSubscription(job);
-    counts.set(sourceType, (counts.get(sourceType) || 0) + 1);
-  }
-  const sources = ["all", "content", "jira", "github", "teams", "confluence", "web"];
-  const visibleSources = sources.filter((source) => source === "all" || counts.has(source));
-  if (!visibleSources.includes(state.subscriptionSource)) {
-    state.subscriptionSource = "all";
-  }
-  subscriptionTabs.innerHTML = visibleSources.map((source) => `
-    <button
-      type="button"
-      role="tab"
-      class="subscription-tab ${state.subscriptionSource === source ? "is-active" : ""}"
-      aria-selected="${state.subscriptionSource === source ? "true" : "false"}"
-      data-subscription-source="${escapeHtml(source)}"
-    >
-      ${escapeHtml(subscriptionSourceLabel(source))} ${escapeHtml(String(counts.get(source) || 0))}
-    </button>
-  `).join("");
-  subscriptionTabs.querySelectorAll("[data-subscription-source]").forEach((button) => {
-    button.addEventListener("click", () => {
-      syncRefreshJobsFromDom();
-      state.subscriptionSource = button.dataset.subscriptionSource;
-      renderRefreshJobs(state.refreshJobs);
-    });
-  });
-}
-
 function sourceTypeForSubscription(job) {
   const url = String(job.url || "").toLowerCase();
   if (url.includes("jira") || url.includes("atlassian.net")) return "jira";
@@ -3776,18 +2685,6 @@ function sourceTypeForSubscription(job) {
 
 function refreshJobTagsText(tags) {
   return Array.isArray(tags) ? tags.join(", ") : String(tags || "");
-}
-
-function refreshJobsForCurrentTab() {
-  if (state.subscriptionSource === "content") {
-    return state.refreshJobs.filter(isManagedContentPageJob);
-  }
-  if (state.subscriptionSource === "all") {
-    return state.refreshJobs;
-  }
-  return state.refreshJobs.filter((job) => (
-    sourceTypeForSubscription(job) === state.subscriptionSource
-  ));
 }
 
 function isManagedContentPageJob(job) {
@@ -3816,76 +2713,7 @@ function formatRefreshStatus(status) {
   }[status] || status;
 }
 
-function collectRefreshJobs() {
-  syncRefreshJobsFromDom();
-  return state.refreshJobs.map((job) => ({
-    ...job,
-    tags: job.tags || []
-  }));
-}
-
-function syncRefreshJobsFromDom() {
-  const contentGroup = refreshJobs.querySelector("[data-content-page-group]");
-  if (contentGroup) {
-    const valueOf = (field) => contentGroup.querySelector(`[data-field="${field}"]`);
-    const enabled = Boolean(valueOf("enabled")?.checked);
-    const intervalMinutes = Number(valueOf("intervalMinutes")?.value || 60);
-    state.refreshJobs = state.refreshJobs.map((job) => isManagedContentPageJob(job)
-      ? {
-          ...job,
-          enabled,
-          intervalMinutes,
-          maxItems: 1,
-          pageKind: "content",
-          managedBy: "content-page"
-        }
-      : job);
-  }
-
-  const visible = [...refreshJobs.querySelectorAll(".refresh-job")].map((section) => {
-    if (section.dataset.contentPageGroup) return null;
-    const valueOf = (field) => section.querySelector(`[data-field="${field}"]`);
-    return {
-      id: section.dataset.id,
-      name: section.querySelector("strong")?.textContent || section.dataset.id,
-      url: valueOf("url")?.value || "",
-      enabled: Boolean(valueOf("enabled")?.checked),
-      intervalMinutes: Number(valueOf("intervalMinutes")?.value || 60),
-      maxItems: Number(valueOf("maxItems")?.value || 50),
-      tags: valueOf("tags")?.value || "",
-      fetchMode: valueOf("fetchMode")?.value || "auto",
-      pageKind: valueOf("pageKind")?.value || "list"
-    };
-  }).filter(Boolean);
-  if (!visible.length) return;
-  const byId = new Map(visible.map((job) => [job.id, job]));
-  state.refreshJobs = state.refreshJobs.map((job) => byId.has(job.id) ? { ...job, ...byId.get(job.id) } : job);
-}
-
-async function saveSubscriptions() {
-  saveSubscriptionsButton.disabled = true;
-  runAllSubscriptionsButton.disabled = true;
-  refreshJobStatus.textContent = "正在保存订阅设置...";
-  try {
-    const { settings } = await api("/api/settings", {
-      method: "PATCH",
-      body: JSON.stringify({
-        refreshJobs: collectRefreshJobs()
-      })
-    });
-    renderRefreshJobs(settings.refreshJobs || []);
-    state.subscriptionDirty = false;
-    refreshJobStatus.textContent = "订阅设置已保存。";
-  } catch (error) {
-    refreshJobStatus.textContent = error.message;
-  } finally {
-    saveSubscriptionsButton.disabled = false;
-    runAllSubscriptionsButton.disabled = false;
-  }
-}
-
 async function runRefreshJob(id) {
-  syncRefreshJobsFromDom();
   const job = state.refreshJobs.find((candidate) => candidate.id === id);
   refreshJobStatus.textContent = "正在启动刷新任务...";
   try {
@@ -3895,37 +2723,6 @@ async function runRefreshJob(id) {
   } catch (error) {
     refreshJobStatus.textContent = error.message;
     await loadSettings();
-  }
-}
-
-async function runAllRefreshJobs() {
-  syncRefreshJobsFromDom();
-  const jobsToRun = refreshJobsForCurrentTab();
-
-  runAllSubscriptionsButton.disabled = true;
-  saveSubscriptionsButton.disabled = true;
-  try {
-    const sourceLabel = subscriptionSourceLabel(state.subscriptionSource);
-    refreshJobStatus.textContent = jobsToRun.length
-      ? `正在启动 ${sourceLabel} ${jobsToRun.length} 个任务...`
-      : `当前分类下没有可刷新的任务。`;
-    if (!jobsToRun.length) return;
-    const { run, jobs } = await api("/api/refresh-jobs/run-batch?background=1", {
-      method: "POST",
-      body: JSON.stringify({
-        ids: jobsToRun.map((job) => job.id),
-        sourceType: state.subscriptionSource,
-        background: true
-      })
-    });
-    renderRefreshJobs(jobs || state.refreshJobs);
-    await monitorSubscriptionRefreshRun(run, `正在刷新 ${sourceLabel}`);
-  } catch (error) {
-    refreshJobStatus.textContent = error.message;
-    await loadSettings();
-  } finally {
-    runAllSubscriptionsButton.disabled = false;
-    saveSubscriptionsButton.disabled = false;
   }
 }
 
@@ -3945,7 +2742,7 @@ async function monitorSubscriptionRefreshRun(run, initialMessage = "刷新中") 
         syncTeamsReadyDialog(latest);
         pollErrors = 0;
         state.refreshJobs = latest.jobs || state.refreshJobs;
-        if (!state.subscriptionDirty) renderRefreshJobs(state.refreshJobs);
+        renderRefreshJobs(state.refreshJobs);
         const completed = Number(latest.completedJobs || 0);
         const total = Number(latest.totalJobs || 0);
         const failed = Number(latest.failedJobs || 0);
@@ -4014,7 +2811,7 @@ async function checkRefreshJobsForUpdates() {
     if (waitingTeamsRun) syncTeamsReadyDialog(waitingTeamsRun);
     state.refreshJobs = jobs || state.refreshJobs;
     renderHomeOverview();
-    if (state.view === "subscriptions" && !state.subscriptionDirty) renderRefreshJobs(state.refreshJobs);
+    if (state.view === "subscriptions") renderRefreshJobs(state.refreshJobs);
     showNewRefreshFailureToast(jobs || []);
     const latest = latestUpdatedRefreshRun(jobs || []);
     if (!latest || latest.key <= state.seenRefreshRunKey) return;
@@ -4173,10 +2970,11 @@ function authFailureLoginUrl(failure) {
   return failure?.url || "";
 }
 
-function showToast({ title, message, duration = 9000 }) {
+function showToast({ title, message, duration = 9000, tone = "" }) {
   if (!toastRegion) return;
   const toast = document.createElement("div");
   toast.className = "toast";
+  if (tone) toast.dataset.tone = tone;
   toast.innerHTML = `
     <div><strong>${escapeHtml(title || "提示")}</strong></div>
     <button type="button" aria-label="关闭提示">×</button>
@@ -4199,45 +2997,6 @@ function schedulePageReloadForBackgroundRefresh(updatedCount) {
   loadMaterialUpdateCount();
   loadHomeOverview();
   if (state.view === "materials") loadItems();
-}
-
-async function deleteRefreshJob(id) {
-  syncRefreshJobsFromDom();
-  const section = refreshJobs.querySelector(`.refresh-job[data-id="${CSS.escape(id)}"]`);
-  const name = section?.querySelector("strong")?.textContent || id;
-  const ok = confirm(`删除自动刷新任务“${name}”？这不会删除已经导入的资料。`);
-  if (!ok) return;
-
-  refreshJobStatus.textContent = "正在删除自动刷新任务...";
-  try {
-    const { jobs } = await api(`/api/refresh-jobs/${encodeURIComponent(id)}`, { method: "DELETE" });
-    renderRefreshJobs(jobs || []);
-    refreshJobStatus.textContent = "自动刷新任务已删除。";
-  } catch (error) {
-    refreshJobStatus.textContent = error.message;
-    await loadSettings();
-  }
-}
-
-async function clearRefreshJobItems(id) {
-  syncRefreshJobsFromDom();
-  const section = refreshJobs.querySelector(`.refresh-job[data-id="${CSS.escape(id)}"]`);
-  const name = section?.querySelector("strong")?.textContent || id;
-  const ok = confirm(`清空订阅“${name}”已经抓取的内容？订阅设置会保留，下次刷新会重新抓取。`);
-  if (!ok) return;
-
-  refreshJobStatus.textContent = "正在清空订阅抓取内容...";
-  try {
-    const { result, jobs } = await api(`/api/refresh-jobs/${encodeURIComponent(id)}/items`, { method: "DELETE" });
-    renderRefreshJobs(jobs || []);
-    refreshJobStatus.textContent = `已清空 ${result.deletedItemCount || 0} 条订阅抓取内容。`;
-    if (state.view === "materials") {
-      await loadAll();
-    }
-  } catch (error) {
-    refreshJobStatus.textContent = error.message;
-    await loadSettings();
-  }
 }
 
 async function copyPreview() {
@@ -4366,7 +3125,7 @@ function formatDate(value) {
 }
 
 function escapeHtml(value) {
-  return String(value || "")
+  return String(value === false ? "" : value ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -4526,3 +3285,1292 @@ function sanitizeMarkdownHref(href) {
   if (/^(https?:|mailto:)/i.test(value) || value.startsWith("/")) return value;
   return "";
 }
+
+// ---------------------------------------------------------------------------
+// Shell, shared presentation helpers
+// ---------------------------------------------------------------------------
+
+const SOURCE_ORDER = ["teams", "jira", "confluence", "github", "web", "text"];
+const SOURCE_META = {
+  teams: { label: "Teams", mark: "T" },
+  jira: { label: "Jira", mark: "J" },
+  confluence: { label: "Confluence", mark: "C" },
+  github: { label: "GitHub", mark: "G" },
+  web: { label: "网页", mark: "W" },
+  text: { label: "文本", mark: "文" }
+};
+const homeSummary = document.querySelector("#homeSummary");
+const homeAttention = document.querySelector("#homeAttention");
+const homeSourceHealth = document.querySelector("#homeSourceHealth");
+const homeLibraryStats = document.querySelector("#homeLibraryStats");
+const homeMarkAllReadButton = document.querySelector("#homeMarkAllReadButton");
+const navUnreadCount = document.querySelector("#navUnreadCount");
+const navSubscriptionAlert = document.querySelector("#navSubscriptionAlert");
+const railLibraryMeta = document.querySelector("#railLibraryMeta");
+const facetViews = document.querySelector("#facetViews");
+const facetSources = document.querySelector("#facetSources");
+const listScope = document.querySelector("#listScope");
+const subsSummary = document.querySelector("#subsSummary");
+const subscriptionSearch = document.querySelector("#subscriptionSearch");
+const subscriptionDrawer = document.querySelector("#subscriptionDrawer");
+const dndHint = document.querySelector("#dndHint");
+const settingAutoProcessMode = document.querySelector("#settingAutoProcessMode");
+const settingAutoProcessMessages = document.querySelector("#settingAutoProcessMessages");
+const settingAutoProcessChars = document.querySelector("#settingAutoProcessChars");
+const settingAutoProcessDays = document.querySelector("#settingAutoProcessDays");
+
+Object.assign(state, {
+  allItems: [],
+  libraryView: "all",
+  subscriptionScope: null,
+  subscriptionStatusFilter: "all",
+  subscriptionQuery: "",
+  selectedSubscriptionId: "",
+  detailModeFor: { id: "", mode: "" },
+  readerMessageLimit: 150
+});
+
+homeMarkAllReadButton?.addEventListener("click", markAllHomeUpdatesRead);
+document.querySelector("#facetToggleButton")?.addEventListener("click", (event) => {
+  const open = !document.body.classList.contains("show-facets");
+  document.body.classList.toggle("show-facets", open);
+  event.currentTarget.setAttribute("aria-expanded", String(open));
+});
+document.querySelector("#materialSidebar")?.addEventListener("click", (event) => {
+  if (event.target.closest(".facet") && document.body.classList.contains("show-facets")) {
+    document.body.classList.remove("show-facets");
+    document.querySelector("#facetToggleButton")?.setAttribute("aria-expanded", "false");
+  }
+});
+subscriptionSearch?.addEventListener("input", debounce(() => {
+  state.subscriptionQuery = subscriptionSearch.value.trim().toLowerCase();
+  renderRefreshJobs(state.refreshJobs);
+}, 120));
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !subscriptionDrawer.hidden) closeSubscriptionDrawer();
+});
+document.addEventListener("click", (event) => {
+  // Close open menus when clicking elsewhere.
+  document.querySelectorAll("details.menu[open]").forEach((menu) => {
+    if (!menu.contains(event.target)) menu.open = false;
+  });
+});
+
+function sourceLabel(source) {
+  return SOURCE_META[normalizeSourceType(source)]?.label || source || "资料";
+}
+
+function sourceIcon(source) {
+  return SOURCE_META[normalizeSourceType(source)]?.mark || "·";
+}
+
+function sourceMark(source, extraClass = "") {
+  const key = SOURCE_META[normalizeSourceType(source)] ? normalizeSourceType(source) : "text";
+  return `<span class="source-mark ${extraClass}" data-source="${escapeHtml(key)}" aria-hidden="true">${escapeHtml(SOURCE_META[key].mark)}</span>`;
+}
+
+function isNewContentItem(item) {
+  return Boolean(item?.contentUpdatedAt || item?.pendingContentUpdatedAt);
+}
+
+// When the content last changed at its source (latest Teams message, page edit),
+// falling back to when this app noticed the change, then to the record's own time.
+function itemActivityTime(item) {
+  const source = item?.sourceUpdatedAt && !Number.isNaN(Date.parse(item.sourceUpdatedAt)) ? item.sourceUpdatedAt : "";
+  return source || item?.contentUpdatedAt || item?.pendingContentUpdatedAt || item?.updatedAt || "";
+}
+
+function byActivityDesc(a, b) {
+  return String(itemActivityTime(b)).localeCompare(String(itemActivityTime(a)));
+}
+
+function formatInterval(minutes) {
+  const value = Number(minutes) || 60;
+  if (value < 60) return `每 ${value} 分钟`;
+  if (value % 1440 === 0) return value === 1440 ? "每天" : `每 ${value / 1440} 天`;
+  const hours = Math.round(value / 60);
+  return hours === 1 ? "每小时" : `每 ${hours} 小时`;
+}
+
+function dayBucket(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "更早";
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+  const day = 86400000;
+  if (date >= startOfToday) return "今天";
+  if (date >= new Date(startOfToday - day)) return "昨天";
+  if (date >= new Date(startOfToday - 6 * day)) return "本周";
+  if (date >= new Date(startOfToday - 30 * day)) return "本月";
+  return "更早";
+}
+
+async function loadAll() {
+  await Promise.all([loadTags(), loadLibraryIndex()]);
+  await loadItems();
+}
+
+async function loadLibraryIndex() {
+  try {
+    const { items } = await api("/api/items");
+    state.allItems = items || [];
+    state.updateCount = state.allItems.filter(isNewContentItem).length;
+  } catch (error) {
+    console.warn("Failed to load library index:", error);
+  }
+  renderLibraryFacets();
+  renderMaterialsNewBadge();
+}
+
+function renderView() {
+  const views = { home: homeView, chat: chatView, materials: materialsView, import: importView, supplemental: supplementalView, subscriptions: subscriptionsView, settings: settingsView };
+  for (const [name, element] of Object.entries(views)) {
+    if (element) element.hidden = state.view !== name;
+  }
+  document.querySelectorAll(".nav-item").forEach((item) => {
+    const active = item.dataset.view === state.view;
+    item.classList.toggle("is-active", active);
+    if (active) item.setAttribute("aria-current", "page");
+    else item.removeAttribute("aria-current");
+  });
+  globalAddButton?.classList.toggle("is-active", state.view === "import");
+  document.body.dataset.activeView = state.view;
+  if (state.view === "settings") setSettingsTab(state.settingsTab);
+  if (state.view !== "subscriptions") closeSubscriptionDrawer();
+  renderMaterialsNewBadge();
+}
+
+async function switchView(view) {
+  state.view = view;
+  renderView();
+  if (view === "home") await loadHomeOverview();
+  if (view === "materials") await loadAll();
+  if (view === "settings") await loadSettings();
+  if (view === "subscriptions") {
+    await Promise.all([loadSettings(), loadLibraryIndex()]);
+    renderRefreshJobs(state.refreshJobs);
+  }
+  if (view === "supplemental") await loadSupplementalContext();
+}
+
+function renderMaterialsNewBadge() {
+  const unread = state.updateCount || 0;
+  for (const badge of [materialsNewBadge, navUnreadCount]) {
+    if (!badge) continue;
+    badge.hidden = !unread;
+    badge.textContent = unread > 99 ? "99+" : String(unread);
+    badge.title = unread ? `${unread} 条资料有未读的新内容` : "";
+  }
+  const problems = (state.refreshJobs || []).filter((job) => subscriptionState(job).key === "error").length;
+  if (navSubscriptionAlert) {
+    navSubscriptionAlert.hidden = !problems;
+    navSubscriptionAlert.textContent = String(problems);
+    navSubscriptionAlert.title = problems ? `${problems} 个订阅刷新失败` : "";
+  }
+  if (railLibraryMeta && state.allItems?.length) railLibraryMeta.textContent = `${state.allItems.length} 条资料`;
+}
+
+function setDoNotDisturbState(enabled, options = {}) {
+  state.doNotDisturb = Boolean(enabled);
+  if (!doNotDisturbToggle) return;
+  doNotDisturbToggle.classList.toggle("is-active", state.doNotDisturb);
+  doNotDisturbToggle.setAttribute("aria-checked", String(state.doNotDisturb));
+  doNotDisturbToggle.title = state.doNotDisturb ? "关闭免打扰，恢复定时刷新" : "开启免打扰，暂停定时刷新和通知";
+  if (dndHint) dndHint.textContent = state.doNotDisturb ? "定时刷新已暂停" : "定时刷新照常进行";
+  if (!options.renderOnly) doNotDisturbToggle.disabled = false;
+  if (state.view === "home") renderHomeAttention();
+}
+
+// ---------------------------------------------------------------------------
+// 动态 (home): what changed, what needs attention
+// ---------------------------------------------------------------------------
+
+async function loadHomeOverview() {
+  await loadLibraryIndex();
+  renderHomeOverview();
+}
+
+function renderHomeOverview() {
+  if (!homeView) return;
+  const items = state.allItems || [];
+  const jobs = state.refreshJobs || [];
+  const unread = items.filter(isNewContentItem).sort(byActivityDesc);
+  const running = jobs.filter((job) => job.enabled).length;
+  if (homeSummary) {
+    homeSummary.textContent = !items.length
+      ? "还没有资料。添加一个链接或一段文本就可以开始。"
+      : `${unread.length ? `${unread.length} 条资料有新内容` : "新内容都看过了"}。共 ${items.length} 条资料，${running} 个订阅在自动刷新。`;
+  }
+  renderHomeAttention();
+  renderHomeFeed(unread, items);
+  renderHomeSourceHealth(jobs, items);
+  renderHomeLibraryStats(items);
+  renderMaterialsNewBadge();
+}
+
+function renderHomeAttention() {
+  if (!homeAttention) return;
+  const jobs = state.refreshJobs || [];
+  const items = state.allItems || [];
+  const rows = [];
+  if (state.doNotDisturb) {
+    rows.push({ level: "warn", text: "免打扰已开启，订阅不会自动刷新。", action: `<button type="button" data-attention="dnd">恢复自动刷新</button>` });
+  }
+  for (const job of jobs.filter((candidate) => subscriptionState(candidate).key === "error").slice(0, 4)) {
+    rows.push({
+      level: "error",
+      text: `<strong>${escapeHtml(subscriptionDisplayName(job))}</strong> 刷新失败${job.lastError ? `：${escapeHtml(String(job.lastError).slice(0, 90))}` : ""}`,
+      action: `<button type="button" data-attention-run="${escapeHtml(job.id)}">重试</button><button type="button" class="quiet-button" data-attention-open="${escapeHtml(job.id)}">查看</button>`
+    });
+  }
+  const gaps = items.filter((item) => item.coverage?.gap).slice(0, 3);
+  for (const item of gaps) {
+    rows.push({ level: "warn", text: `<strong>${escapeHtml(item.title)}</strong> 没能接上上次抓取的位置，中间可能缺少消息。`, action: `<button type="button" data-attention-item="${escapeHtml(item.id)}">打开</button>` });
+  }
+  const duplicates = duplicateSubscriptionIds(jobs);
+  if (duplicates.size) {
+    rows.push({ level: "warn", text: `${duplicates.size} 个订阅指向相同的地址，会重复刷新。`, action: `<button type="button" data-attention-duplicates>去处理</button>` });
+  }
+  const quarantined = items.filter((item) => item.integrityStatus === "quarantined").length;
+  if (quarantined) {
+    rows.push({ level: "warn", text: `${quarantined} 条资料因来源校验未通过被隔离，不会进入问答。`, action: `<button type="button" data-attention-view="quarantined">查看</button>` });
+  }
+  homeAttention.hidden = !rows.length;
+  homeAttention.innerHTML = rows.map((row) => `
+    <div class="attention-row" data-level="${row.level}">
+      <span class="status-dot" data-status="${row.level}" aria-hidden="true"></span>
+      <p>${row.text}</p>
+      <div class="row-actions">${row.action}</div>
+    </div>`).join("");
+  homeAttention.querySelector("[data-attention='dnd']")?.addEventListener("click", toggleDoNotDisturb);
+  homeAttention.querySelectorAll("[data-attention-run]").forEach((button) => button.addEventListener("click", async () => {
+    button.disabled = true;
+    await switchView("subscriptions");
+    await runRefreshJob(button.dataset.attentionRun);
+  }));
+  homeAttention.querySelectorAll("[data-attention-open]").forEach((button) => button.addEventListener("click", async () => {
+    await switchView("subscriptions");
+    openSubscriptionDrawer(button.dataset.attentionOpen);
+  }));
+  homeAttention.querySelector("[data-attention-duplicates]")?.addEventListener("click", async () => {
+    state.subscriptionQuery = "";
+    state.subscriptionStatusFilter = "all";
+    await switchView("subscriptions");
+    refreshJobs.querySelector(".subs-name .flag")?.closest(".subs-row")?.scrollIntoView({ block: "center" });
+  });
+  homeAttention.querySelectorAll("[data-attention-item]").forEach((button) => button.addEventListener("click", () => openItemInLibrary(button.dataset.attentionItem)));
+  homeAttention.querySelectorAll("[data-attention-view]").forEach((button) => button.addEventListener("click", async () => {
+    state.libraryView = button.dataset.attentionView;
+    await switchView("materials");
+  }));
+}
+
+function renderHomeFeed(unread, items) {
+  if (!homeRecentUpdates) return;
+  if (homeFirstImportButton) homeFirstImportButton.hidden = items.length > 0;
+  if (homeMarkAllReadButton) homeMarkAllReadButton.hidden = unread.length < 2;
+  if (!unread.length) {
+    homeRecentUpdates.innerHTML = `<div class="empty-state compact">${items.length ? "订阅的内容有新变化时会出现在这里。" : "保存资料或订阅之后，新变化会集中显示在这里。"}</div>`;
+    return;
+  }
+  const groups = new Map();
+  for (const item of unread) {
+    const source = normalizeSourceType(item.sourceType);
+    if (!groups.has(source)) groups.set(source, []);
+    groups.get(source).push(item);
+  }
+  const ordered = [...groups.entries()].sort((a, b) => SOURCE_ORDER.indexOf(a[0]) - SOURCE_ORDER.indexOf(b[0]));
+  homeRecentUpdates.innerHTML = ordered.map(([source, entries]) => `
+    <section class="feed-group">
+      <h3>${sourceMark(source)}<span>${escapeHtml(sourceLabel(source))}</span><span class="count">${entries.length}</span></h3>
+      <ul>
+        ${entries.slice(0, 8).map((item) => `
+          <li class="feed-row">
+            <button type="button" class="feed-open" data-home-item-id="${escapeHtml(item.id)}">
+              <span class="feed-title">${escapeHtml(item.title || "未命名资料")}</span>
+              <span class="feed-meta"><time datetime="${escapeHtml(itemActivityTime(item))}">${escapeHtml(relativeTime(itemActivityTime(item)))}更新</time>${item.processedStale ? `<span class="flag">整理版待更新</span>` : ""}</span>
+            </button>
+            <button type="button" class="quiet-button" data-home-ack="${escapeHtml(item.id)}">已读</button>
+          </li>`).join("")}
+      </ul>
+      ${entries.length > 8 ? `<button type="button" class="quiet-button more" data-home-source="${escapeHtml(source)}">查看全部 ${entries.length} 条</button>` : ""}
+    </section>`).join("");
+  homeRecentUpdates.querySelectorAll("[data-home-item-id]").forEach((button) => button.addEventListener("click", () => openItemInLibrary(button.dataset.homeItemId)));
+  homeRecentUpdates.querySelectorAll("[data-home-ack]").forEach((button) => button.addEventListener("click", async () => {
+    button.disabled = true;
+    await api(`/api/items/${encodeURIComponent(button.dataset.homeAck)}/ack-update`, { method: "POST" }).catch(() => {});
+    await loadHomeOverview();
+  }));
+  homeRecentUpdates.querySelectorAll("[data-home-source]").forEach((button) => button.addEventListener("click", async () => {
+    state.libraryView = "unread";
+    state.sourceType = button.dataset.homeSource;
+    await switchView("materials");
+  }));
+}
+
+async function markAllHomeUpdatesRead() {
+  const unread = (state.allItems || []).filter(isNewContentItem);
+  if (!unread.length) return;
+  homeMarkAllReadButton.disabled = true;
+  for (const item of unread) {
+    await api(`/api/items/${encodeURIComponent(item.id)}/ack-update`, { method: "POST" }).catch(() => {});
+  }
+  homeMarkAllReadButton.disabled = false;
+  await loadHomeOverview();
+}
+
+function renderHomeSourceHealth(jobs, items) {
+  if (!homeSourceHealth) return;
+  const bySource = new Map();
+  for (const job of jobs) {
+    const source = sourceTypeForSubscription(job);
+    if (!bySource.has(source)) bySource.set(source, { ok: 0, error: 0, paused: 0, latest: "" });
+    const entry = bySource.get(source);
+    const status = subscriptionState(job).key;
+    if (status === "error") entry.error += 1;
+    else if (status === "paused") entry.paused += 1;
+    else entry.ok += 1;
+    if ((job.lastRunAt || "") > entry.latest) entry.latest = job.lastRunAt;
+  }
+  if (!bySource.size) {
+    homeSourceHealth.innerHTML = `<div class="empty-state compact">还没有订阅。添加资料时选择“保存并订阅”，之后的变化会自动收进来。</div>`;
+    return;
+  }
+  homeSourceHealth.innerHTML = [...bySource.entries()]
+    .sort((a, b) => SOURCE_ORDER.indexOf(a[0]) - SOURCE_ORDER.indexOf(b[0]))
+    .map(([source, entry]) => `
+      <button type="button" class="health-row" data-health-source="${escapeHtml(source)}">
+        ${sourceMark(source)}
+        <span class="health-name">${escapeHtml(sourceLabel(source))}</span>
+        <span class="health-counts">
+          ${entry.error ? `<span class="pill" data-status="error">${entry.error} 失败</span>` : ""}
+          <span class="pill" data-status="ok">${entry.ok} 正常</span>
+          ${entry.paused ? `<span class="pill" data-status="paused">${entry.paused} 暂停</span>` : ""}
+        </span>
+        <span class="health-time">${entry.latest ? escapeHtml(relativeTime(entry.latest)) : "未运行"}</span>
+      </button>`).join("");
+  homeSourceHealth.querySelectorAll("[data-health-source]").forEach((button) => button.addEventListener("click", async () => {
+    state.subscriptionStatusFilter = "all";
+    state.subscriptionFocusSource = button.dataset.healthSource;
+    await switchView("subscriptions");
+  }));
+}
+
+function renderHomeLibraryStats(items) {
+  if (!homeLibraryStats) return;
+  const counts = countSources(items);
+  const stale = items.filter((item) => item.processedStale).length;
+  const unprocessed = items.filter((item) => !item.hasProcessed).length;
+  homeLibraryStats.innerHTML = `
+    <div class="stat-rows">
+      ${SOURCE_ORDER.filter((source) => counts.get(source)).map((source) => `
+        <button type="button" class="stat-row" data-stat-source="${source}">${sourceMark(source)}<span>${escapeHtml(sourceLabel(source))}</span><span class="count">${counts.get(source)}</span></button>`).join("")}
+    </div>
+    <div class="stat-notes">
+      ${stale ? `<button type="button" class="quiet-button" data-stat-view="stale">${stale} 条整理版待更新</button>` : ""}
+      ${unprocessed ? `<button type="button" class="quiet-button" data-stat-view="unprocessed">${unprocessed} 条还没有整理</button>` : ""}
+    </div>`;
+  homeLibraryStats.querySelectorAll("[data-stat-source]").forEach((button) => button.addEventListener("click", async () => {
+    state.libraryView = "all";
+    state.sourceType = button.dataset.statSource;
+    state.tag = "";
+    await switchView("materials");
+  }));
+  homeLibraryStats.querySelectorAll("[data-stat-view]").forEach((button) => button.addEventListener("click", async () => {
+    state.libraryView = button.dataset.statView;
+    state.sourceType = "";
+    await switchView("materials");
+  }));
+}
+
+async function openItemInLibrary(id) {
+  state.libraryView = "all";
+  state.sourceType = "";
+  state.tag = "";
+  state.query = "";
+  state.subscriptionScope = null;
+  if (searchInput) searchInput.value = "";
+  await switchView("materials");
+  await selectItem(id);
+  itemList.querySelector(`[data-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: "nearest" });
+}
+
+// ---------------------------------------------------------------------------
+// 资料 (library): facets, grouped list
+// ---------------------------------------------------------------------------
+
+const LIBRARY_VIEWS = [
+  ["all", "全部", () => true],
+  ["unread", "未读", isNewContentItem],
+  ["stale", "整理版待更新", (item) => Boolean(item.processedStale)],
+  ["unprocessed", "还没有整理", (item) => !item.hasProcessed],
+  ["quarantined", "隔离区", (item) => item.integrityStatus === "quarantined"]
+];
+
+function renderLibraryFacets() {
+  if (!facetViews) return;
+  const items = state.allItems || [];
+  facetViews.innerHTML = LIBRARY_VIEWS.map(([key, label, test]) => {
+    const count = items.filter(test).length;
+    if (key === "quarantined" && !count) return "";
+    return `<button type="button" class="facet ${state.libraryView === key ? "is-active" : ""}" data-library-view="${key}"><span class="facet-label">${label}</span><span class="facet-count">${count}</span></button>`;
+  }).join("");
+  const counts = countSources(items);
+  facetSources.innerHTML = [`<button type="button" class="facet ${!state.sourceType ? "is-active" : ""}" data-library-source=""><span class="facet-label">所有来源</span><span class="facet-count">${items.length}</span></button>`,
+    ...SOURCE_ORDER.filter((source) => counts.get(source)).map((source) => `
+      <button type="button" class="facet ${state.sourceType === source ? "is-active" : ""}" data-library-source="${source}">${sourceMark(source)}<span class="facet-label">${escapeHtml(sourceLabel(source))}</span><span class="facet-count">${counts.get(source)}</span></button>`)].join("");
+  facetViews.querySelectorAll("[data-library-view]").forEach((button) => button.addEventListener("click", async () => {
+    state.libraryView = button.dataset.libraryView;
+    renderLibraryFacets();
+    await loadItems();
+  }));
+  facetSources.querySelectorAll("[data-library-source]").forEach((button) => button.addEventListener("click", async () => {
+    state.sourceType = button.dataset.librarySource;
+    renderLibraryFacets();
+    await loadItems();
+  }));
+}
+
+function renderTags() {
+  if (!tagList) return;
+  const tags = [...(state.tags || [])].sort((a, b) => (b.count || 0) - (a.count || 0) || String(a.name).localeCompare(String(b.name)));
+  if (!tags.length) {
+    tagList.innerHTML = `<p class="facet-empty">还没有标签。打开资料后可以添加，也可以让 AI 推荐。</p>`;
+    return;
+  }
+  const limit = state.showAllTags ? tags.length : 14;
+  tagList.innerHTML = tags.slice(0, limit).map((tag) => `
+    <button type="button" class="facet facet-tag ${state.tag === tag.name ? "is-active" : ""}" data-library-tag="${escapeHtml(tag.name)}"><span class="facet-label">${escapeHtml(tag.name)}</span><span class="facet-count">${escapeHtml(tag.count ?? "")}</span></button>`).join("")
+    + (tags.length > 14 ? `<button type="button" class="facet-more" data-toggle-tags>${state.showAllTags ? "收起" : `显示全部 ${tags.length} 个标签`}</button>` : "");
+  tagList.querySelectorAll("[data-library-tag]").forEach((button) => button.addEventListener("click", async () => {
+    state.tag = state.tag === button.dataset.libraryTag ? "" : button.dataset.libraryTag;
+    renderTags();
+    await loadItems();
+  }));
+  tagList.querySelector("[data-toggle-tags]")?.addEventListener("click", () => {
+    state.showAllTags = !state.showAllTags;
+    renderTags();
+  });
+}
+
+function libraryFilterNeedsFullList() {
+  return ["stale", "unprocessed"].includes(state.libraryView) || Boolean(state.subscriptionScope);
+}
+
+function libraryParams(page, pageSize) {
+  const params = new URLSearchParams();
+  if (state.sourceType) params.set("sourceType", state.sourceType);
+  if (state.tag) params.set("tag", state.tag);
+  if (state.query) params.set("q", state.query);
+  if (state.libraryView === "quarantined") params.set("integrityStatus", "quarantined");
+  if (state.libraryView === "unread") params.set("updates", "1");
+  params.set("page", String(page));
+  params.set("pageSize", String(pageSize));
+  return params;
+}
+
+function applyClientLibraryFilters(items) {
+  const viewTest = LIBRARY_VIEWS.find(([key]) => key === state.libraryView)?.[2] || (() => true);
+  const scope = state.subscriptionScope;
+  return items.filter((item) => viewTest(item) && (!scope || scope.itemIds.has(item.id)));
+}
+
+async function loadItems() {
+  const full = libraryFilterNeedsFullList();
+  const { items, total } = await api(`/api/items?${libraryParams(1, full ? 2000 : state.pageSize)}`);
+  state.items = full ? applyClientLibraryFilters(items || []) : (items || []);
+  state.page = 1;
+  state.totalItems = full ? state.items.length : Number(total ?? state.items.length);
+  state.listClassification = null;
+  renderListScope();
+  renderItems();
+  renderMaterialsNewBadge();
+}
+
+async function loadMoreItems() {
+  if (state.items.length >= state.totalItems || libraryFilterNeedsFullList()) return;
+  const { items, total } = await api(`/api/items?${libraryParams(state.page + 1, state.pageSize)}`);
+  state.items = [...state.items, ...(items || [])];
+  state.page += 1;
+  state.totalItems = Number(total ?? state.items.length);
+  renderItems();
+}
+
+function renderListScope() {
+  if (!listScope) return;
+  const chips = [];
+  const view = LIBRARY_VIEWS.find(([key]) => key === state.libraryView);
+  if (state.libraryView !== "all" && view) chips.push({ key: "view", label: view[1] });
+  if (state.sourceType) chips.push({ key: "source", label: sourceLabel(state.sourceType) });
+  if (state.tag) chips.push({ key: "tag", label: `标签：${state.tag}` });
+  if (state.subscriptionScope) chips.push({ key: "scope", label: `订阅：${state.subscriptionScope.name}` });
+  listScope.hidden = !chips.length;
+  listScope.innerHTML = chips.map((chip) => `<button type="button" class="scope-chip" data-clear-scope="${chip.key}" aria-label="移除筛选 ${escapeHtml(chip.label)}">${escapeHtml(chip.label)}<span aria-hidden="true">×</span></button>`).join("")
+    + (chips.length > 1 ? `<button type="button" class="quiet-button" data-clear-scope="all">清除全部</button>` : "");
+  listScope.querySelectorAll("[data-clear-scope]").forEach((button) => button.addEventListener("click", async () => {
+    const key = button.dataset.clearScope;
+    if (key === "view" || key === "all") state.libraryView = "all";
+    if (key === "source" || key === "all") state.sourceType = "";
+    if (key === "tag" || key === "all") state.tag = "";
+    if (key === "scope" || key === "all") state.subscriptionScope = null;
+    renderLibraryFacets();
+    renderTags();
+    await loadItems();
+  }));
+}
+
+function renderItems() {
+  const classified = state.listClassification?.groups?.length;
+  resultCount.textContent = `${state.totalItems || state.items.length} 条${classified ? `，已分成 ${state.listClassification.groups.length} 类` : ""}`;
+  classifyListButton.textContent = state.listClassifying ? "正在分类……" : classified ? "重新用 AI 分类" : "用 AI 给当前列表分类";
+  classifyListButton.disabled = state.listClassifying || !state.items.length;
+  if (!state.items.length) {
+    const filtered = state.query || state.tag || state.sourceType || state.libraryView !== "all" || state.subscriptionScope;
+    itemList.innerHTML = `<div class="empty-state compact">${filtered ? "没有符合当前筛选的资料。" : "资料库还是空的。点左侧“添加资料”保存第一条。"}</div>`;
+    return;
+  }
+  if (classified) {
+    renderClassifiedItems();
+    return;
+  }
+  const groups = new Map();
+  for (const item of state.items) {
+    const bucket = state.query ? "搜索结果" : dayBucket(itemActivityTime(item));
+    if (!groups.has(bucket)) groups.set(bucket, []);
+    groups.get(bucket).push(item);
+  }
+  itemList.innerHTML = [...groups.entries()].map(([bucket, entries]) => `
+    <section class="item-group" aria-label="${escapeHtml(bucket)}">
+      <h3 class="item-group-label">${escapeHtml(bucket)}</h3>
+      ${entries.map(renderItemCard).join("")}
+    </section>`).join("")
+    + (state.items.length < state.totalItems ? `<button class="load-more-button" type="button" data-load-more>再显示 ${Math.min(state.pageSize, state.totalItems - state.items.length)} 条（还有 ${state.totalItems - state.items.length} 条）</button>` : "");
+  bindItemCards();
+  itemList.querySelector("[data-load-more]")?.addEventListener("click", loadMoreItems);
+}
+
+function renderItemCard(item) {
+  const unread = isNewContentItem(item);
+  const flags = [
+    item.integrityStatus === "quarantined" ? `<span class="flag" data-tone="error">已隔离</span>` : "",
+    item.processedStale ? `<span class="flag">整理版待更新</span>` : !item.hasProcessed ? `<span class="flag" data-tone="muted">未整理</span>` : ""
+  ].join("");
+  return `
+    <button type="button" class="item-card item-row ${state.selectedId === item.id ? "is-selected" : ""} ${unread ? "is-unread" : ""}" data-id="${escapeHtml(item.id)}" ${state.selectedId === item.id ? 'aria-current="true"' : ""}>
+      ${sourceMark(item.sourceType)}
+      <span class="item-main">
+        <span class="item-title">${escapeHtml(item.title || "未命名资料")}</span>
+        <span class="item-sub"><time datetime="${escapeHtml(itemActivityTime(item))}">${escapeHtml(relativeTime(itemActivityTime(item)))}</time>${flags}</span>
+      </span>
+      ${unread ? `<span class="unread-dot" title="有未读的新内容"></span>` : ""}
+    </button>`;
+}
+
+// ---------------------------------------------------------------------------
+// Reader: original first when the organized version is out of date, newest first
+// ---------------------------------------------------------------------------
+
+function linkifyEscaped(text) {
+  return text.replace(/(https?:\/\/[^\s<>"]+[^\s<>".,;:!?)\]，。；：！？）])/g, (url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`);
+}
+
+function renderMessageText(text) {
+  const lines = String(text || "").split("\n");
+  const html = [];
+  let quote = [];
+  const flushQuote = () => {
+    if (quote.length) html.push(`<blockquote>${quote.map((line) => linkifyEscaped(escapeHtml(line))).join("<br>")}</blockquote>`);
+    quote = [];
+  };
+  let paragraph = [];
+  const flushParagraph = () => {
+    if (paragraph.length) html.push(`<p>${paragraph.map((line) => linkifyEscaped(escapeHtml(line))).join("<br>")}</p>`);
+    paragraph = [];
+  };
+  for (const line of lines) {
+    if (/^>\s?/.test(line)) { flushParagraph(); quote.push(line.replace(/^>\s?/, "")); continue; }
+    flushQuote();
+    if (!line.trim()) { flushParagraph(); continue; }
+    paragraph.push(line);
+  }
+  flushParagraph();
+  flushQuote();
+  return html.join("");
+}
+
+function renderMessageBody(text) {
+  return String(text || "").split("```").map((part, index) => index % 2
+    ? `<pre class="msg-code"><code>${escapeHtml(part.replace(/^\n+|\n+$/g, ""))}</code></pre>`
+    : renderMessageText(part)).join("") || `<p class="muted">（空消息）</p>`;
+}
+
+function messageDayLabel(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "时间未知";
+  const bucket = dayBucket(value);
+  const label = date.toLocaleDateString("zh-CN", { month: "long", day: "numeric", weekday: "short", ...(date.getFullYear() !== new Date().getFullYear() ? { year: "numeric" } : {}) });
+  return bucket === "今天" || bucket === "昨天" ? `${bucket} · ${label}` : label;
+}
+
+function renderMessageTimeline(comments, { since = "", limit = 150, kind = "消息" } = {}) {
+  const sorted = [...comments].sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+  const shown = sorted.slice(0, limit);
+  let currentDay = "";
+  const rows = [];
+  for (const comment of shown) {
+    const day = messageDayLabel(comment.createdAt);
+    if (day !== currentDay) {
+      currentDay = day;
+      rows.push(`<h3 class="msg-day">${escapeHtml(day)}</h3>`);
+    }
+    const isNew = since && String(comment.createdAt || "") > since;
+    const time = comment.createdAt && !Number.isNaN(new Date(comment.createdAt).getTime())
+      ? new Date(comment.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) : "";
+    rows.push(`
+      <article class="msg ${isNew ? "is-new" : ""} ${comment.author ? "" : "is-system"}">
+        <header>
+          <strong>${escapeHtml(comment.author || "系统")}</strong>
+          ${time ? `<time datetime="${escapeHtml(comment.createdAt)}">${escapeHtml(time)}</time>` : ""}
+          ${isNew ? `<span class="flag" data-tone="accent">新</span>` : ""}
+        </header>
+        <div class="msg-body">${renderMessageBody(comment.body)}</div>
+      </article>`);
+  }
+  if (sorted.length > shown.length) {
+    rows.push(`<button type="button" class="load-more-button" data-more-messages>显示更早的 ${Math.min(300, sorted.length - shown.length)} 条${kind}（还有 ${sorted.length - shown.length} 条）</button>`);
+  }
+  return rows.join("");
+}
+
+// The stored original starts with a title and capture metadata that the reader
+// header already shows; drop that preamble and a leading "## Content" heading.
+function cleanRawBody(markdown, title = "") {
+  const lines = String(markdown || "").split("\n");
+  let index = 0;
+  const skip = (line) => !line.trim()
+    || (line.startsWith("# ") && (!title || line.slice(2).trim() === String(title).trim()))
+    || /^(Source|Adapter|Page ID|Space|Version|Labels|Source updated|Messages captured|Latest message|URL|Fetched|Captured)\s*:/i.test(line)
+    || /^##\s+Content\s*$/i.test(line);
+  while (index < lines.length && index < 20 && skip(lines[index])) index += 1;
+  return lines.slice(index).join("\n").trim() || String(markdown || "");
+}
+
+function stripCommentSections(markdown) {
+  return String(markdown || "").replace(/\n##\s+(Comments|Messages|评论)\s*\n[\s\S]*$/i, "").trim();
+}
+
+function renderDetail(item) {
+  const metadata = item.metadata;
+  const comments = Array.isArray(item.comments) ? item.comments : [];
+  const source = normalizeSourceType(metadata.sourceType);
+  const isStream = source === "teams";
+  const hasProcessed = Boolean(item.processedDocument?.trim());
+  const stale = Boolean(metadata.processedStale);
+  const quarantined = metadata.integrityStatus === "quarantined";
+  if (state.detailModeFor.id !== metadata.id) state.detailModeFor = { id: metadata.id, mode: "", limit: state.readerMessageLimit };
+  const preferred = hasProcessed && !stale && state.detailMode !== "raw" ? "processed" : "raw";
+  const mode = state.detailModeFor.mode || preferred;
+  const unread = isNewContentItem(metadata);
+  const since = unread ? metadata.updateAcknowledgedAt || "" : "";
+  const newSinceRead = since ? comments.filter((comment) => String(comment.createdAt || "") > since).length : 0;
+  const throughAt = metadata.processedThroughAt || metadata.processedAt || "";
+  const newSinceProcessed = throughAt ? comments.filter((comment) => String(comment.createdAt || "") > throughAt).length : 0;
+  const rawLabel = isStream ? "消息" : "原文";
+  const processLabel = !hasProcessed ? "生成整理" : stale ? "更新整理" : "重新整理";
+  const tags = metadata.tags || [];
+
+  const banners = [];
+  if (quarantined) banners.push(`<div class="banner" data-tone="error"><p><strong>已隔离：</strong>${escapeHtml(metadata.integrityReason || "来源校验未通过")}。在验证通过前不会进入问答和批量处理。</p></div>`);
+  if (unread) banners.push(`<div class="banner" data-tone="accent"><p>有新内容${newSinceRead ? `：上次阅读后新增 ${newSinceRead} 条${isStream ? "消息" : "评论"}，已标“新”` : `，${escapeHtml(relativeTime(metadata.contentUpdatedAt || metadata.pendingContentUpdatedAt))}更新`}。</p><button id="acknowledgeUpdateButton" type="button">标为已读</button></div>`);
+  if (hasProcessed && stale && mode === "raw") {
+    banners.push(`<div class="banner"><p>整理版生成于 ${escapeHtml(formatDate(metadata.processedAt))}${isStream && newSinceProcessed ? `，之后又有 ${newSinceProcessed} 条消息` : "，之后原文有变化"}，所以这里先显示${rawLabel}。</p><button type="button" data-banner-process>${escapeHtml(processLabel)}</button><button type="button" class="quiet-button" data-show-mode="processed">看旧整理版</button></div>`);
+  }
+  if (hasProcessed && stale && mode === "processed") {
+    banners.push(`<div class="banner"><p>这是 ${escapeHtml(formatDate(metadata.processedAt))} 的整理版，之后${isStream && newSinceProcessed ? `新增了 ${newSinceProcessed} 条消息` : "原文有变化"}。</p><button type="button" data-banner-process>${escapeHtml(processLabel)}</button><button type="button" class="quiet-button" data-show-mode="raw">看${rawLabel}</button></div>`);
+  }
+  const coverage = coverageNote(metadata);
+
+  let body;
+  if (mode === "processed" && hasProcessed) {
+    body = `
+      <div id="detailContentLayout" class="detail-content-layout">
+        <div id="detailTocWrap" class="detail-toc-wrap" hidden>
+          <button id="detailTocToggle" type="button" class="detail-toc-toggle" aria-expanded="false">目录</button>
+          <aside id="detailToc" class="detail-toc" hidden><div class="detail-toc-title">目录</div><nav id="detailTocList" class="detail-toc-list" aria-label="内容目录"></nav></aside>
+        </div>
+        <div id="detailDoc" class="detail-doc markdown-body">${renderMarkdown(extractMarkdownSection(item.processedDocument || "", "## AI Organized Content"))}</div>
+      </div>`;
+  } else if (isStream) {
+    body = `<div class="msg-summary">${comments.length} 条消息，最新的在最上面${metadata.coverage?.gap ? `；<span class="warn-text">中间可能缺少部分历史</span>` : ""}</div>
+      <div id="detailDoc" class="timeline">${renderMessageTimeline(comments, { since, limit: state.detailModeFor.limit || state.readerMessageLimit })}</div>`;
+  } else {
+    const rawDocument = cleanRawBody(extractMarkdownSection(item.document, "## Content"), metadata.title);
+    const main = comments.length ? stripCommentSections(rawDocument) : rawDocument;
+    body = `<div id="detailDoc" class="detail-doc markdown-body">${renderMarkdown(main)}</div>
+      ${comments.length ? `<section class="comments-block"><h2>评论 <span class="count">${comments.length}</span><small>最新的在最上面</small></h2><div class="timeline">${renderMessageTimeline(comments, { since, limit: state.detailModeFor.limit || state.readerMessageLimit, kind: "评论" })}</div></section>` : ""}`;
+  }
+
+  detailPanel.innerHTML = `
+    <header class="reader-head">
+      <div class="reader-source">
+        ${sourceMark(source)}<span>${escapeHtml(sourceLabel(source))}</span>
+        ${metadata.url ? `<a href="${escapeHtml(metadata.url)}" target="_blank" rel="noopener noreferrer">打开原页面</a>` : ""}
+      </div>
+      <div class="reader-title-row">
+        <input id="detailTitleInput" class="reader-title" value="${escapeHtml(metadata.title)}" aria-label="标题" />
+        <button id="saveTitleButton" type="button" class="primary-button" hidden>保存标题</button>
+      </div>
+      <dl class="reader-meta">
+        <div><dt>更新</dt><dd>${escapeHtml(relativeTime(itemActivityTime(metadata)))}</dd></div>
+        ${metadata.lastFetchedAt ? `<div><dt>抓取</dt><dd>${escapeHtml(relativeTime(metadata.lastFetchedAt))}${metadata.captureMethod ? `（${escapeHtml(captureMethodLabel(metadata.captureMethod))}）` : ""}</dd></div>` : ""}
+        <div><dt>整理</dt><dd>${hasProcessed ? `${escapeHtml(relativeTime(metadata.processedAt))}${stale ? `<span class="flag">待更新</span>` : ""}` : "还没有整理"}</dd></div>
+        <div class="reader-tags"><dt>标签</dt><dd>${tags.length ? tags.map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("") : `<span class="muted">无</span>`}<button id="editTagsButton" type="button" class="quiet-button">编辑</button></dd></div>
+      </dl>
+      <div class="reader-toolbar">
+        <div class="segmented" role="tablist" aria-label="显示内容">
+          <button id="showRawButton" type="button" role="tab" aria-selected="${mode === "raw"}" class="${mode === "raw" ? "is-active" : ""}">${rawLabel}</button>
+          <button id="showProcessedButton" type="button" role="tab" aria-selected="${mode === "processed"}" class="${mode === "processed" ? "is-active" : ""}" ${hasProcessed ? "" : "disabled"}>整理版${hasProcessed && stale ? `<span class="tab-flag">待更新</span>` : ""}</button>
+        </div>
+        <div class="toolbar-spacer"></div>
+        ${metadata.url ? `<button id="refreshButton" type="button">检查更新</button>` : ""}
+        <button id="processItemButton" type="button" ${quarantined ? "disabled" : ""}>${escapeHtml(processLabel)}</button>
+        <details class="menu">
+          <summary class="icon-button" aria-label="更多操作">⋯</summary>
+          <div class="menu-panel">
+            <button id="diffItemButton" type="button">对比上次的变化</button>
+            <button id="generateTitleButton" type="button" ${quarantined ? "disabled" : ""}>用 AI 生成标题</button>
+            ${hasProcessed ? `<button id="fullProcessButton" type="button" ${quarantined ? "disabled" : ""}>完整重新整理</button>` : ""}
+            <button id="deleteItemButton" type="button" class="danger-button">删除这条资料</button>
+          </div>
+        </details>
+      </div>
+    </header>
+    <div class="reader-banners">${banners.join("")}${coverage}</div>
+    <section id="detailDiff" class="detail-diff" hidden></section>
+    <div class="reader-body">${body}</div>
+  `;
+  if (mode === "processed") setupDetailToc();
+  bindReaderEvents(item, { mode });
+}
+
+function bindReaderEvents(item, { mode }) {
+  const metadata = item.metadata;
+  const setMode = (next) => {
+    state.detailModeFor = { ...state.detailModeFor, id: metadata.id, mode: next };
+    state.detailMode = next;
+    localStorage.setItem("materialOrganizer.detailMode", next);
+    renderDetail(item);
+  };
+  document.querySelector("#showRawButton")?.addEventListener("click", () => setMode("raw"));
+  document.querySelector("#showProcessedButton")?.addEventListener("click", () => setMode("processed"));
+  detailPanel.querySelectorAll("[data-show-mode]").forEach((button) => button.addEventListener("click", () => setMode(button.dataset.showMode)));
+  detailPanel.querySelector("[data-more-messages]")?.addEventListener("click", () => {
+    state.detailModeFor.limit = (state.detailModeFor.limit || state.readerMessageLimit) + 300;
+    renderDetail(item);
+  });
+
+  const titleInput = document.querySelector("#detailTitleInput");
+  const saveTitleButton = document.querySelector("#saveTitleButton");
+  titleInput?.addEventListener("input", () => { saveTitleButton.hidden = titleInput.value.trim() === metadata.title; });
+  titleInput?.addEventListener("keydown", (event) => { if (event.key === "Enter") saveTitleButton.click(); });
+  saveTitleButton?.addEventListener("click", async () => {
+    saveTitleButton.disabled = true;
+    try {
+      const { item: next } = await api(`/api/items/${encodeURIComponent(metadata.id)}/title`, { method: "PATCH", body: JSON.stringify({ title: titleInput.value }) });
+      notify("标题已保存", next.metadata.title);
+      renderDetail(next);
+      await loadItems();
+    } catch (error) {
+      notify("没能保存标题", error.message, "error");
+      saveTitleButton.disabled = false;
+    }
+  });
+
+  document.querySelector("#acknowledgeUpdateButton")?.addEventListener("click", async () => {
+    const next = await acknowledgeSelectedItemUpdate(metadata.id);
+    if (state.selectedId === metadata.id) renderDetail(next || item);
+  });
+
+  const runProcess = async (button, full = false) => {
+    const original = button.textContent;
+    button.disabled = true;
+    button.textContent = "整理中……";
+    try {
+      const { item: next } = await api(`/api/items/${encodeURIComponent(metadata.id)}/process`, { method: "POST", body: JSON.stringify({ full }) });
+      state.detailModeFor = { id: metadata.id, mode: "processed", limit: state.readerMessageLimit };
+      renderDetail(next);
+      await loadLibraryIndex();
+      await loadItems();
+      notify(next.metadata.processedMode === "incremental" ? "已把新增内容合并进整理版" : "整理版已更新", next.metadata.title);
+    } catch (error) {
+      notify("整理没有完成", error.message, "error");
+      button.disabled = false;
+      button.textContent = original;
+    }
+  };
+  document.querySelector("#processItemButton")?.addEventListener("click", (event) => runProcess(event.currentTarget));
+  detailPanel.querySelectorAll("[data-banner-process]").forEach((button) => button.addEventListener("click", () => runProcess(button)));
+  document.querySelector("#fullProcessButton")?.addEventListener("click", (event) => runProcess(event.currentTarget, true));
+
+  document.querySelector("#generateTitleButton")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try {
+      const { item: next } = await api(`/api/items/${encodeURIComponent(metadata.id)}/recommend-title`, { method: "POST" });
+      renderDetail(next);
+      await loadItems();
+    } catch (error) {
+      notify("没能生成标题", error.message, "error");
+      button.disabled = false;
+    }
+  });
+  document.querySelector("#editTagsButton")?.addEventListener("click", () => openTagDialog(item));
+  document.querySelector("#refreshButton")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = "检查中……";
+    try {
+      const payload = await api(`/api/items/${encodeURIComponent(metadata.id)}/refresh`, { method: "POST" });
+      if (payload.run) await monitorSubscriptionRefreshRun(payload.run, `正在检查 ${metadata.title}`);
+      await loadLibraryIndex();
+      await loadItems();
+      await selectItem(metadata.id);
+    } catch (error) {
+      notify("检查更新失败", error.message, "error");
+      button.disabled = false;
+      button.textContent = "检查更新";
+    }
+  });
+  document.querySelector("#diffItemButton")?.addEventListener("click", async () => {
+    const panel = document.querySelector("#detailDiff");
+    try {
+      const { diff } = await api(`/api/items/${encodeURIComponent(metadata.id)}/diff`);
+      panel.hidden = false;
+      panel.innerHTML = `<div class="detail-diff-header"><strong>和上一个版本相比</strong><span>新增 ${escapeHtml(diff.addedLines)} 行，删除 ${escapeHtml(diff.removedLines)} 行${diff.truncated ? "（已截断）" : ""}</span><button type="button" class="quiet-button" data-close-diff>关闭</button></div><pre>${escapeHtml(diff.text || "没有变化")}</pre>`;
+      panel.querySelector("[data-close-diff]").addEventListener("click", () => { panel.hidden = true; });
+      panel.scrollIntoView({ block: "nearest" });
+    } catch (error) {
+      notify("没能读取变化", error.message, "error");
+    }
+  });
+  document.querySelector("#deleteItemButton")?.addEventListener("click", async () => {
+    if (!confirm(`删除“${metadata.title}”？正文、原始文件、评论和历史快照都会删除，无法恢复。`)) return;
+    try {
+      await api(`/api/items/${encodeURIComponent(metadata.id)}`, { method: "DELETE" });
+      state.selectedId = null;
+      detailPanel.innerHTML = `<div class="empty-state">资料已删除。</div>`;
+      await loadAll();
+    } catch (error) {
+      notify("没能删除", error.message, "error");
+    }
+  });
+}
+
+async function acknowledgeSelectedItemUpdate(id) {
+  try {
+    const { item } = await api(`/api/items/${encodeURIComponent(id)}/ack-update`, { method: "POST" });
+    for (const list of [state.items, state.allItems]) {
+      const index = (list || []).findIndex((candidate) => candidate.id === id);
+      if (index !== -1) list[index] = { ...list[index], contentUpdatedAt: "", pendingContentUpdatedAt: "", updateAcknowledgedAt: item.metadata.updateAcknowledgedAt || "" };
+    }
+    state.updateCount = (state.allItems || []).filter(isNewContentItem).length;
+    renderItems();
+    renderLibraryFacets();
+    renderMaterialsNewBadge();
+    return item;
+  } catch (error) {
+    console.warn("Failed to acknowledge item update:", error);
+    return null;
+  }
+}
+
+function notify(title, message = "", tone = "info") {
+  showToast({ title, message, duration: tone === "error" ? 14000 : 5000, tone });
+}
+
+// ---------------------------------------------------------------------------
+// 订阅: one compact row per subscription, grouped by source, edit in a drawer
+// ---------------------------------------------------------------------------
+
+const INTERVAL_CHOICES = [[30, "每 30 分钟"], [60, "每小时"], [120, "每 2 小时"], [240, "每 4 小时"], [480, "每 8 小时"], [1440, "每天"]];
+
+function subscriptionDisplayName(job) {
+  return String(job?.name || job?.id || "").replace(/\s+refresh$/i, "").trim() || "未命名订阅";
+}
+
+function duplicateSubscriptionIds(jobs = state.refreshJobs || []) {
+  const seen = new Map();
+  const duplicates = new Set();
+  for (const job of jobs) {
+    const key = normalizeUrlKey(job.url);
+    if (!key) continue;
+    if (seen.has(key)) { duplicates.add(job.id); duplicates.add(seen.get(key)); }
+    else seen.set(key, job.id);
+  }
+  return duplicates;
+}
+
+function subscriptionState(job) {
+  if (job.running) return { key: "running", label: "刷新中" };
+  if (!job.enabled) return { key: "paused", label: "已暂停" };
+  if (job.quarantined) return { key: "warn", label: "待验证" };
+  if (job.circuitOpen) return { key: "error", label: "多次失败，已停止重试" };
+  if (["failed", "unreachable"].includes(job.status)) return { key: "error", label: job.status === "unreachable" ? "网络不可达" : "刷新失败" };
+  if (job.lastRunAt) return { key: "ok", label: "正常" };
+  return { key: "idle", label: "还没刷新过" };
+}
+
+function subscriptionKind(job) {
+  if (job.pageKind === "list") return "列表：自动收录新条目";
+  if (job.managedBy === "content-page") return "页面：检查内容变化";
+  return sourceTypeForSubscription(job) === "teams" ? "会话：同步新消息" : "页面：同步更新";
+}
+
+function normalizeUrlKey(value) {
+  try {
+    const url = new URL(value);
+    return `${url.host}${url.pathname.replace(/\/$/, "")}${url.search}`.toLowerCase();
+  } catch {
+    return String(value || "").trim().toLowerCase();
+  }
+}
+
+function subscriptionItems(job) {
+  const key = normalizeUrlKey(job.url);
+  return (state.allItems || []).filter((item) => item.refreshJob?.id === job.id
+    || (key && (normalizeUrlKey(item.url) === key || normalizeUrlKey(item.parentUrl) === key)));
+}
+
+function subscriptionMatchesFilters(job) {
+  const status = subscriptionState(job).key;
+  const filter = state.subscriptionStatusFilter;
+  if (filter === "problem" && !["error", "warn"].includes(status)) return false;
+  if (filter === "ok" && !["ok", "running", "idle"].includes(status)) return false;
+  if (filter === "paused" && status !== "paused") return false;
+  const query = state.subscriptionQuery;
+  return !query || `${subscriptionDisplayName(job)} ${job.url}`.toLowerCase().includes(query);
+}
+
+function collectRefreshJobs() {
+  return (state.refreshJobs || []).map((job) => ({ ...job, tags: job.tags || [] }));
+}
+
+function refreshJobsForCurrentTab() {
+  return (state.refreshJobs || []).filter((job) => job.enabled && subscriptionMatchesFilters(job));
+}
+
+function renderSubscriptionTabs() {
+  const jobs = state.refreshJobs || [];
+  const count = (test) => jobs.filter((job) => test(subscriptionState(job).key)).length;
+  const tabs = [
+    ["all", "全部", jobs.length],
+    ["problem", "有问题", count((key) => ["error", "warn"].includes(key))],
+    ["ok", "正常", count((key) => ["ok", "running", "idle"].includes(key))],
+    ["paused", "已暂停", count((key) => key === "paused")]
+  ];
+  subscriptionTabs.innerHTML = tabs.map(([key, label, value]) => `
+    <button type="button" role="tab" aria-selected="${state.subscriptionStatusFilter === key}" class="${state.subscriptionStatusFilter === key ? "is-active" : ""}" data-subscription-filter="${key}" ${key === "problem" && value ? 'data-alert="1"' : ""}>${label}<span class="tab-count">${value}</span></button>`).join("");
+  subscriptionTabs.querySelectorAll("[data-subscription-filter]").forEach((button) => button.addEventListener("click", () => {
+    state.subscriptionStatusFilter = button.dataset.subscriptionFilter;
+    renderRefreshJobs(state.refreshJobs);
+  }));
+}
+
+function renderRefreshJobs(jobs) {
+  state.refreshJobs = jobs || [];
+  renderMaterialsNewBadge();
+  if (state.view === "home") renderHomeOverview();
+  if (!refreshJobs) return;
+  renderSubscriptionTabs();
+  const all = state.refreshJobs;
+  const counts = { ok: 0, error: 0, paused: 0 };
+  for (const job of all) {
+    const key = subscriptionState(job).key;
+    if (key === "error" || key === "warn") counts.error += 1;
+    else if (key === "paused") counts.paused += 1;
+    else counts.ok += 1;
+  }
+  if (subsSummary) {
+    subsSummary.innerHTML = all.length
+      ? `${all.length} 个订阅：<span class="pill" data-status="ok">${counts.ok} 正常</span>${counts.error ? `<span class="pill" data-status="error">${counts.error} 有问题</span>` : ""}${counts.paused ? `<span class="pill" data-status="paused">${counts.paused} 已暂停</span>` : ""}<span class="muted">刷新时段 ${escapeHtml(state.settings?.refreshSchedule?.startTime || "08:00")}–${escapeHtml(state.settings?.refreshSchedule?.endTime || "20:00")}${state.doNotDisturb ? "，免打扰中" : ""}</span>`
+      : "还没有订阅。";
+  }
+  const visible = all.filter(subscriptionMatchesFilters);
+  if (!all.length) {
+    refreshJobs.innerHTML = `<div class="empty-state">还没有订阅。添加资料时选择“保存并订阅”，或者添加一个 Jira 过滤器、GitHub 通知页、Teams 群聊链接。</div>`;
+    return;
+  }
+  if (!visible.length) {
+    refreshJobs.innerHTML = `<div class="empty-state compact">没有符合筛选条件的订阅。</div>`;
+    return;
+  }
+  const groups = new Map();
+  for (const job of visible) {
+    const source = sourceTypeForSubscription(job);
+    if (!groups.has(source)) groups.set(source, []);
+    groups.get(source).push(job);
+  }
+  const rank = { error: 0, warn: 1, running: 2, ok: 3, idle: 4, paused: 5 };
+  refreshJobs.innerHTML = [...groups.entries()]
+    .sort((a, b) => SOURCE_ORDER.indexOf(a[0]) - SOURCE_ORDER.indexOf(b[0]))
+    .map(([source, entries]) => {
+      entries.sort((a, b) => rank[subscriptionState(a).key] - rank[subscriptionState(b).key] || subscriptionDisplayName(a).localeCompare(subscriptionDisplayName(b), "zh-CN"));
+      const problems = entries.filter((job) => ["error", "warn"].includes(subscriptionState(job).key)).length;
+      return `
+        <section class="subs-group" data-source-group="${source}" ${state.subscriptionFocusSource === source ? 'data-focus="1"' : ""}>
+          <header class="subs-group-head">
+            <h2>${sourceMark(source)}<span>${escapeHtml(sourceLabel(source))}</span><span class="count">${entries.length}</span>${problems ? `<span class="pill" data-status="error">${problems} 有问题</span>` : ""}</h2>
+            <button type="button" class="quiet-button" data-run-group="${source}">刷新这一组</button>
+          </header>
+          <div class="subs-table" role="table" aria-label="${escapeHtml(sourceLabel(source))} 订阅">
+            <div class="subs-row subs-row-head" role="row">
+              <span role="columnheader">启用</span><span role="columnheader">名称</span><span role="columnheader">状态</span><span role="columnheader">最近内容</span><span role="columnheader">频率</span><span role="columnheader">资料</span><span role="columnheader"><span class="visually-hidden">操作</span></span>
+            </div>
+            ${entries.map(renderSubscriptionRow).join("")}
+          </div>
+        </section>`;
+    }).join("");
+  bindSubscriptionRows();
+  if (state.subscriptionFocusSource) {
+    refreshJobs.querySelector(`[data-source-group="${CSS.escape(state.subscriptionFocusSource)}"]`)?.scrollIntoView({ block: "start" });
+    state.subscriptionFocusSource = "";
+  }
+  if (state.selectedSubscriptionId && !subscriptionDrawer.hidden && !state.subscriptionDirty) renderSubscriptionDrawer(state.selectedSubscriptionId);
+}
+
+function renderSubscriptionRow(job) {
+  const status = subscriptionState(job);
+  const items = subscriptionItems(job);
+  const unread = items.filter(isNewContentItem).length;
+  const latest = items.map(itemActivityTime).filter(Boolean).sort().at(-1) || "";
+  let host = "";
+  try { host = new URL(job.url).host; } catch {}
+  const statusTime = job.running ? "" : status.key === "error" ? (job.lastRunAt ? relativeTime(job.lastRunAt) : "") : job.lastRunAt ? relativeTime(job.lastRunAt) : "";
+  return `
+    <div class="subs-row ${state.selectedSubscriptionId === job.id ? "is-selected" : ""}" role="row" data-subscription-id="${escapeHtml(job.id)}" tabindex="0">
+      <span role="cell"><label class="switch" title="${job.enabled ? "已启用自动刷新" : "已暂停"}"><input type="checkbox" data-toggle-job="${escapeHtml(job.id)}" ${job.enabled ? "checked" : ""} aria-label="自动刷新 ${escapeHtml(subscriptionDisplayName(job))}" /><span aria-hidden="true"></span></label></span>
+      <span role="cell" class="subs-name"><strong>${escapeHtml(subscriptionDisplayName(job))}${duplicateSubscriptionIds().has(job.id) ? ` <span class="flag" title="另一个订阅指向同一个地址，可以删除其中一个">重复</span>` : ""}</strong><small>${escapeHtml(subscriptionKind(job))}${host ? ` · ${escapeHtml(host)}` : ""}</small></span>
+      <span role="cell" class="subs-status"><span class="status-dot" data-status="${status.key}" aria-hidden="true"></span><span>${escapeHtml(status.label)}${statusTime ? `<small>${escapeHtml(statusTime)}</small>` : ""}</span></span>
+      <span role="cell" class="subs-latest" title="${escapeHtml(latest ? formatDate(latest) : "")}">${latest ? escapeHtml(compactDate(latest)) : `<span class="muted">—</span>`}</span>
+      <span role="cell" class="subs-interval">${escapeHtml(formatInterval(job.intervalMinutes))}</span>
+      <span role="cell" class="subs-items">${items.length}${unread ? `<span class="pill" data-status="accent">${unread} 新</span>` : ""}</span>
+      <span role="cell" class="subs-actions"><button type="button" class="quiet-button" data-run-job="${escapeHtml(job.id)}" ${job.running ? "disabled" : ""}>${job.running ? "刷新中" : "刷新"}</button></span>
+    </div>`;
+}
+
+function bindSubscriptionRows() {
+  refreshJobs.querySelectorAll("[data-subscription-id]").forEach((row) => {
+    const open = (event) => {
+      if (event.target.closest("button, input, label, a")) return;
+      openSubscriptionDrawer(row.dataset.subscriptionId);
+    };
+    row.addEventListener("click", open);
+    row.addEventListener("keydown", (event) => { if (event.key === "Enter") open(event); });
+  });
+  refreshJobs.querySelectorAll("[data-run-job]").forEach((button) => button.addEventListener("click", () => runRefreshJob(button.dataset.runJob)));
+  refreshJobs.querySelectorAll("[data-toggle-job]").forEach((input) => input.addEventListener("change", () => updateSubscription(input.dataset.toggleJob, { enabled: input.checked })));
+  refreshJobs.querySelectorAll("[data-run-group]").forEach((button) => button.addEventListener("click", () => {
+    const ids = (state.refreshJobs || []).filter((job) => job.enabled && sourceTypeForSubscription(job) === button.dataset.runGroup).map((job) => job.id);
+    runRefreshJobsByIds(ids, `${sourceLabel(button.dataset.runGroup)} 订阅`);
+  }));
+}
+
+async function updateSubscription(id, patch, { quiet = false } = {}) {
+  const next = (state.refreshJobs || []).map((job) => job.id === id ? { ...job, ...patch } : job);
+  try {
+    const { settings } = await api("/api/settings", { method: "PATCH", body: JSON.stringify({ refreshJobs: next.map((job) => ({ ...job, tags: job.tags || [] })) }) });
+    state.settings = { ...(state.settings || {}), refreshJobs: settings.refreshJobs };
+    renderRefreshJobs(settings.refreshJobs || next);
+    if (!quiet) refreshJobStatus.textContent = patch.enabled === false ? "已暂停自动刷新。" : patch.enabled === true ? "已恢复自动刷新。" : "订阅已保存。";
+    return true;
+  } catch (error) {
+    refreshJobStatus.textContent = `没能保存：${error.message}`;
+    renderRefreshJobs(state.refreshJobs);
+    return false;
+  }
+}
+
+async function saveSubscriptions() {
+  return updateSubscription("", {}, { quiet: false });
+}
+
+async function runAllRefreshJobs() {
+  const ids = (state.refreshJobs || []).filter((job) => job.enabled).map((job) => job.id);
+  await runRefreshJobsByIds(ids, "全部已启用的订阅");
+}
+
+async function runRefreshJobsByIds(ids, label) {
+  if (!ids.length) {
+    refreshJobStatus.textContent = "没有已启用的订阅可以刷新。";
+    return;
+  }
+  runAllSubscriptionsButton.disabled = true;
+  refreshJobStatus.textContent = `正在启动 ${label}（${ids.length} 个）……`;
+  try {
+    const { run, jobs } = await api("/api/refresh-jobs/run-batch?background=1", { method: "POST", body: JSON.stringify({ ids, background: true }) });
+    renderRefreshJobs(jobs || state.refreshJobs);
+    await monitorSubscriptionRefreshRun(run, `正在刷新 ${label}`);
+    await loadLibraryIndex();
+    renderRefreshJobs(state.refreshJobs);
+  } catch (error) {
+    refreshJobStatus.textContent = error.message;
+    await loadSettings();
+  } finally {
+    runAllSubscriptionsButton.disabled = false;
+  }
+}
+
+function openSubscriptionDrawer(id) {
+  state.selectedSubscriptionId = id;
+  state.subscriptionDirty = false;
+  renderSubscriptionDrawer(id);
+  subscriptionDrawer.hidden = false;
+  document.body.classList.add("has-drawer");
+  refreshJobs.querySelectorAll("[data-subscription-id]").forEach((row) => row.classList.toggle("is-selected", row.dataset.subscriptionId === id));
+  subscriptionDrawer.querySelector("input, button")?.focus();
+}
+
+function closeSubscriptionDrawer() {
+  if (!subscriptionDrawer || subscriptionDrawer.hidden) return;
+  subscriptionDrawer.hidden = true;
+  state.subscriptionDirty = false;
+  document.body.classList.remove("has-drawer");
+  state.selectedSubscriptionId = "";
+  refreshJobs?.querySelectorAll(".subs-row.is-selected").forEach((row) => row.classList.remove("is-selected"));
+}
+
+function renderSubscriptionDrawer(id) {
+  const job = (state.refreshJobs || []).find((candidate) => candidate.id === id);
+  if (!job) { closeSubscriptionDrawer(); return; }
+  const status = subscriptionState(job);
+  const source = sourceTypeForSubscription(job);
+  const items = subscriptionItems(job).sort(byActivityDesc);
+  const result = job.lastResult || {};
+  const interval = Number(job.intervalMinutes) || 60;
+  const intervalOptions = INTERVAL_CHOICES.some(([value]) => value === interval) ? INTERVAL_CHOICES : [...INTERVAL_CHOICES, [interval, formatInterval(interval)]].sort((a, b) => a[0] - b[0]);
+  const managedPage = isManagedContentPageJob(job);
+  subscriptionDrawer.innerHTML = `
+    <header class="drawer-head">
+      <div class="reader-source">${sourceMark(source)}<span>${escapeHtml(sourceLabel(source))}</span><span class="muted">${escapeHtml(subscriptionKind(job))}</span></div>
+      <button type="button" class="icon-button" data-close-drawer aria-label="关闭">×</button>
+    </header>
+    <form class="drawer-body" data-subscription-form>
+      <label>名称<input name="name" value="${escapeHtml(subscriptionDisplayName(job))}" /></label>
+      <label>地址<input name="url" value="${escapeHtml(job.url || "")}" ${managedPage ? "readonly" : ""} /></label>
+      <div class="field-row">
+        <label>自动刷新<select name="intervalMinutes">${intervalOptions.map(([value, label]) => `<option value="${value}" ${value === interval ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select></label>
+        ${job.pageKind === "list" ? `<label>每次最多收录<input name="maxItems" type="number" min="1" value="${escapeHtml(job.maxItems || 50)}" /></label>` : ""}
+      </div>
+      <label>给收录的资料加标签<input name="tags" value="${escapeHtml(refreshJobTagsText(job.tags))}" placeholder="用逗号分隔" /></label>
+      <label class="inline-toggle"><input name="enabled" type="checkbox" ${job.enabled ? "checked" : ""} /> 启用自动刷新</label>
+      <div class="drawer-actions">
+        <button type="submit" class="primary-button">保存</button>
+        <button type="button" data-drawer-run ${job.running ? "disabled" : ""}>${job.running ? "刷新中" : "立即刷新"}</button>
+      </div>
+    </form>
+    <section class="drawer-section">
+      <h3>最近一次刷新</h3>
+      <p class="drawer-status"><span class="status-dot" data-status="${status.key}" aria-hidden="true"></span>${escapeHtml(status.label)}${job.lastRunAt ? `，${escapeHtml(formatDate(job.lastRunAt))}` : ""}</p>
+      ${job.lastError ? `<p class="error-text">${escapeHtml(job.lastError)}</p>` : ""}
+      ${job.circuitOpen ? `<p class="muted">连续失败 ${escapeHtml(job.consecutiveFailures || 5)} 次后已停止自动重试，手动刷新成功后会自动恢复。</p>` : job.nextRetryAt ? `<p class="muted">将在 ${escapeHtml(formatDate(job.nextRetryAt))} 自动重试。</p>` : ""}
+      ${job.lastResult && !job.lastError ? `<p class="muted">检查了 ${escapeHtml(result.linkCount ?? result.issueCount ?? 0)} 个页面，更新 ${escapeHtml(result.updatedItemCount ?? result.updatedIssueCount ?? 0)} 个，新增 ${escapeHtml(result.newItemCount || 0)} 个。</p>` : ""}
+      ${job.quarantined ? `<p class="error-text">${escapeHtml(job.quarantineReason || "需要手动刷新一次验证后才能恢复自动刷新。")}</p>` : ""}
+    </section>
+    <section class="drawer-section">
+      <h3>收录的资料 <span class="count">${items.length}</span></h3>
+      ${items.length ? `<ul class="drawer-items">${items.slice(0, 8).map((item) => `<li><button type="button" data-drawer-item="${escapeHtml(item.id)}"><span>${escapeHtml(item.title)}</span><small>${escapeHtml(relativeTime(itemActivityTime(item)))}${isNewContentItem(item) ? `<span class="pill" data-status="accent">新</span>` : ""}</small></button></li>`).join("")}</ul>
+        ${items.length > 8 ? `<button type="button" class="quiet-button" data-drawer-all-items>在资料中查看全部 ${items.length} 条</button>` : ""}` : `<p class="muted">还没有收录资料。刷新一次后会出现在这里。</p>`}
+    </section>
+    ${managedPage ? "" : `<section class="drawer-section danger-zone">
+      <h3>危险操作</h3>
+      <div class="drawer-actions">
+        <button type="button" class="danger-button" data-drawer-clear>清空已收录的资料</button>
+        <button type="button" class="danger-button" data-drawer-delete>删除订阅</button>
+      </div>
+      <p class="muted">删除订阅不会删除已经收录的资料。</p>
+    </section>`}
+  `;
+  subscriptionDrawer.querySelector("[data-close-drawer]").addEventListener("click", closeSubscriptionDrawer);
+  subscriptionDrawer.querySelector("[data-subscription-form]").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const name = String(form.get("name") || "").trim();
+    const saved = await updateSubscription(job.id, {
+      name: /\srefresh$/i.test(job.name || "") && name ? `${name} refresh` : name || job.name,
+      url: String(form.get("url") || job.url).trim(),
+      intervalMinutes: Number(form.get("intervalMinutes") || interval),
+      ...(job.pageKind === "list" ? { maxItems: Number(form.get("maxItems") || job.maxItems || 50) } : {}),
+      tags: String(form.get("tags") || "").split(/[,，]/).map((tag) => tag.trim()).filter(Boolean),
+      enabled: form.get("enabled") === "on"
+    });
+    if (saved) {
+      state.subscriptionDirty = false;
+      renderSubscriptionDrawer(job.id);
+      notify("订阅已保存", name);
+    }
+  });
+  subscriptionDrawer.querySelector("[data-drawer-run]")?.addEventListener("click", () => runRefreshJob(job.id));
+  subscriptionDrawer.querySelectorAll("[data-drawer-item]").forEach((button) => button.addEventListener("click", () => openItemInLibrary(button.dataset.drawerItem)));
+  subscriptionDrawer.querySelector("[data-drawer-all-items]")?.addEventListener("click", async () => {
+    state.subscriptionScope = { id: job.id, name: subscriptionDisplayName(job), itemIds: new Set(items.map((item) => item.id)) };
+    state.libraryView = "all";
+    state.sourceType = "";
+    state.tag = "";
+    await switchView("materials");
+  });
+  subscriptionDrawer.querySelector("[data-drawer-clear]")?.addEventListener("click", () => clearRefreshJobItems(job.id));
+  subscriptionDrawer.querySelector("[data-drawer-delete]")?.addEventListener("click", () => deleteRefreshJob(job.id));
+}
+
+async function deleteRefreshJob(id) {
+  const job = (state.refreshJobs || []).find((candidate) => candidate.id === id);
+  if (!confirm(`删除订阅“${subscriptionDisplayName(job)}”？已经收录的资料会保留。`)) return;
+  try {
+    const { jobs } = await api(`/api/refresh-jobs/${encodeURIComponent(id)}`, { method: "DELETE" });
+    closeSubscriptionDrawer();
+    renderRefreshJobs(jobs || []);
+    refreshJobStatus.textContent = "订阅已删除。";
+  } catch (error) {
+    refreshJobStatus.textContent = error.message;
+    await loadSettings();
+  }
+}
+
+async function clearRefreshJobItems(id) {
+  const job = (state.refreshJobs || []).find((candidate) => candidate.id === id);
+  if (!confirm(`清空订阅“${subscriptionDisplayName(job)}”已经收录的资料？订阅本身保留，下次刷新会重新收录。`)) return;
+  try {
+    const { result, jobs } = await api(`/api/refresh-jobs/${encodeURIComponent(id)}/items`, { method: "DELETE" });
+    await loadLibraryIndex();
+    renderRefreshJobs(jobs || []);
+    refreshJobStatus.textContent = `已清空 ${result.deletedItemCount || 0} 条资料。`;
+  } catch (error) {
+    refreshJobStatus.textContent = error.message;
+    await loadSettings();
+  }
+}
+
+function fillAutoProcessFields(policy = {}) {
+  if (!settingAutoProcessMode) return;
+  settingAutoProcessMode.value = policy.mode || "threshold";
+  settingAutoProcessMessages.value = policy.minNewMessages ?? 20;
+  settingAutoProcessChars.value = policy.minNewChars ?? 3000;
+  settingAutoProcessDays.value = policy.maxStaleDays ?? 7;
+  const manual = settingAutoProcessMode.value !== "threshold";
+  for (const input of [settingAutoProcessMessages, settingAutoProcessChars, settingAutoProcessDays]) input.disabled = manual;
+}
+settingAutoProcessMode?.addEventListener("change", () => fillAutoProcessFields({
+  mode: settingAutoProcessMode.value,
+  minNewMessages: settingAutoProcessMessages.value,
+  minNewChars: settingAutoProcessChars.value,
+  maxStaleDays: settingAutoProcessDays.value
+}));
+
+// Startup runs last so every declaration above is initialized.
+await loadAgentConfig();
+await loadSettings();
+startRefreshJobMonitor();
+await loadMaterialUpdateCount();
+await loadHomeOverview();
+await loadChatSessions();
+renderView();

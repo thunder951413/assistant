@@ -53,7 +53,7 @@ async function boot(handler, localSessions = []) {
     return new Response(JSON.stringify(result ?? {}), { status: 200, headers: { "Content-Type": "application/json" } });
   };
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-  await new AsyncFunction(`${appSource}\nglobalThis.__uiWorkflow = { state, selectItem, sendChatMessage, activateChatSession, checkRefreshJobsForUpdates, renderRefreshJobs, confirmImport, loadChatSessions, saveChatSessions, appendMessage };`)();
+  await new AsyncFunction(`${appSource}\nglobalThis.__uiWorkflow = { state, selectItem, sendChatMessage, activateChatSession, checkRefreshJobsForUpdates, renderRefreshJobs, confirmImport, loadChatSessions, saveChatSessions, appendMessage, renderDetail };`)();
   const ui = globalThis.__uiWorkflow;
   clearInterval(ui.state.refreshMonitorTimer);
   return {
@@ -122,7 +122,7 @@ test("switching chat and cancelling a stream cannot write into the new chat", as
   } finally { app.cleanup(); }
 });
 
-test("subscription polling preserves an unsaved form", async () => {
+test("subscription polling updates the list but preserves an unsaved drawer edit", async () => {
   const app = await boot((path) => {
     if (path === "/api/refresh-jobs") return { jobs: [{ id: "job", name: "新版", url: "https://new.example", enabled: true }] };
     if (path === "/api/refresh-runs") return { runs: [] };
@@ -131,11 +131,14 @@ test("subscription polling preserves an unsaved form", async () => {
   try {
     app.ui.state.view = "subscriptions";
     app.ui.renderRefreshJobs([{ id: "job", name: "原任务", url: "https://old.example", enabled: true }]);
-    const url = document.querySelector(".refresh-job [data-field='url']");
+    document.querySelector('[data-subscription-id="job"] .subs-name').dispatchEvent(new app.dom.window.MouseEvent("click", { bubbles: true }));
+    const url = document.querySelector("#subscriptionDrawer input[name='url']");
+    assert.equal(url.value, "https://old.example");
     url.value = "https://draft.example";
     url.dispatchEvent(new app.dom.window.Event("input", { bubbles: true }));
     await app.ui.checkRefreshJobsForUpdates();
-    assert.equal(document.querySelector(".refresh-job [data-field='url']").value, "https://draft.example");
+    assert.equal(document.querySelector("#subscriptionDrawer input[name='url']").value, "https://draft.example", "the draft survives polling");
+    assert.match(document.querySelector('[data-subscription-id="job"] .subs-name strong').textContent, /新版/, "the list itself is refreshed");
   } finally { app.cleanup(); }
 });
 
@@ -230,5 +233,51 @@ test("chat source buttons open the cited material", async () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(app.ui.state.view, "materials");
     assert.match(document.querySelector("#detailPanel").textContent, /验收资料/);
+  } finally { app.cleanup(); }
+});
+
+test("reader shows the original when the organized version is stale, newest messages first", async () => {
+  const app = await boot((path) => defaultApi(path));
+  try {
+    const t = (minute) => new Date(Date.UTC(2026, 9, 14, 1, minute)).toISOString();
+    app.ui.renderDetail({
+      metadata: { id: "teams-bm", title: "BM Test", sourceType: "teams", tags: [], url: "https://teams.microsoft.com/l/chat/19:x@thread.v2/conversations",
+        processedAt: t(5), processedThroughAt: t(5), processedStale: true, contentUpdatedAt: t(30), updateAcknowledgedAt: t(10) },
+      document: "# BM Test\n\n## Content\n\n## Messages", processedDocument: "# x\n\n## AI Organized Content\n\nold summary",
+      comments: [
+        { id: "1", author: "Ada", createdAt: t(1), body: "oldest" },
+        { id: "2", author: "Ben", createdAt: t(20), body: "step 1: make\nstep 2: flash" },
+        { id: "3", author: "Cy", createdAt: t(25), body: "newest" }
+      ]
+    });
+    const bodies = [...document.querySelectorAll(".msg .msg-body")].map((node) => node.textContent.trim());
+    assert.deepEqual(bodies, ["newest", "step 1: makestep 2: flash", "oldest"]);
+    assert.equal(document.querySelector(".msg .msg-body br") !== null, true, "line breaks are kept");
+    assert.equal(document.querySelectorAll(".msg.is-new").length, 2, "messages after the last read are marked new");
+    assert.match(document.querySelector(".reader-banners").textContent, /之后又有 2 条消息/);
+    assert.equal(document.querySelector("#showRawButton").classList.contains("is-active"), true);
+    assert.doesNotMatch(document.querySelector(".reader-body").textContent, /old summary/);
+    document.querySelector("[data-show-mode='processed']").click();
+    assert.match(document.querySelector(".reader-body").textContent, /old summary/);
+  } finally { app.cleanup(); }
+});
+
+test("subscriptions group by source and surface failures and duplicates", async () => {
+  const app = await boot((path) => defaultApi(path));
+  try {
+    app.ui.state.view = "subscriptions";
+    app.ui.renderRefreshJobs([
+      { id: "a", name: "BM Test refresh", url: "https://teams.microsoft.com/l/chat/19:a@thread.v2/conversations", enabled: true, lastRunAt: new Date().toISOString(), status: "idle", pageKind: "content", intervalMinutes: 240 },
+      { id: "b", name: "BM Test copy", url: "https://teams.microsoft.com/l/chat/19:a@thread.v2/conversations", enabled: true, status: "idle", pageKind: "content" },
+      { id: "c", name: "Filter 50724", url: "https://jira.example.com/issues/?filter=50724", enabled: true, status: "failed", lastError: "timeout", pageKind: "list" },
+      { id: "d", name: "Paused page", url: "https://confluence.example.com/x", enabled: false, pageKind: "content", managedBy: "content-page" }
+    ]);
+    const groups = [...document.querySelectorAll(".subs-group")].map((group) => group.dataset.sourceGroup);
+    assert.deepEqual(groups, ["teams", "jira", "confluence"]);
+    assert.match(document.querySelector('[data-subscription-filter="problem"]').textContent, /1/);
+    assert.equal(document.querySelectorAll(".subs-name .flag").length, 2, "both duplicate rows are flagged");
+    assert.match(document.querySelector('[data-subscription-id="a"] .subs-interval').textContent, /每 4 小时/);
+    document.querySelector('[data-subscription-filter="problem"]').click();
+    assert.deepEqual([...document.querySelectorAll("[data-subscription-id]")].map((row) => row.dataset.subscriptionId), ["c"]);
   } finally { app.cleanup(); }
 });

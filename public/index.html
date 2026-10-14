@@ -4,211 +4,132 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>工作助理</title>
-    <link rel="stylesheet" href="/styles.css?v=20260922-verified" />
+    <link rel="stylesheet" href="/styles.css?v=20261014-redesign" />
   </head>
   <body>
-    <div class="app-shell">
-      <aside class="sidebar">
-        <div class="brand">
-          <div class="brand-mark">W</div>
-          <div>
-            <div class="brand-title-row">
-              <h1>工作助理</h1>
-              <button id="doNotDisturbToggle" class="dnd-toggle" type="button" aria-pressed="false" aria-label="开启勿扰模式" title="开启勿扰模式">
-                <span class="dnd-toggle-icon" aria-hidden="true"></span>
-              </button>
-            </div>
-            <p>本地资料库</p>
-          </div>
+    <div class="app">
+      <nav class="rail" aria-label="主导航">
+        <div class="rail-brand">
+          <span class="rail-logo" aria-hidden="true"></span>
+          <div><strong>工作助理</strong><small id="railLibraryMeta">本地资料库</small></div>
         </div>
-
-        <nav class="nav-block">
-          <button class="nav-item is-active" data-view="home">
-            <span class="nav-icon" aria-hidden="true">⌂</span>
-            <span>工作台</span>
-          </button>
-          <button class="nav-item" data-view="chat">
-            <span class="nav-icon" aria-hidden="true">◉</span>
-            <span>问答</span>
-          </button>
-          <button class="nav-item" data-view="materials">
-            <span class="nav-icon" aria-hidden="true">□</span>
-            <span>资料库</span>
-            <span id="materialsNewBadge" class="new-badge" hidden>NEW!</span>
-          </button>
-          <button class="nav-item" data-view="supplemental">
-            <span class="nav-icon" aria-hidden="true">◇</span>
-            <span>补充资料</span>
-          </button>
-          <button class="nav-item" data-view="subscriptions">
-            <span class="nav-icon" aria-hidden="true">◷</span>
-            <span>关注来源</span>
-          </button>
-          <button class="nav-item" data-view="settings">
-            <span class="nav-icon" aria-hidden="true">⚙</span>
-            <span>设置</span>
-          </button>
-        </nav>
-        <button id="globalAddButton" class="global-add-button" type="button"><span aria-hidden="true">＋</span> 添加资料</button>
-
-        <div id="materialSidebar" class="material-sidebar" hidden>
-          <div class="filter-tabs" role="tablist" aria-label="资料筛选">
-            <button class="filter-tab is-active" type="button" role="tab" aria-selected="true" data-filter-tab="source">来源</button>
-            <button class="filter-tab" type="button" role="tab" aria-selected="false" data-filter-tab="tag">标签</button>
-          </div>
-
-          <section class="source-panel filter-panel is-active" data-filter-panel="source">
-            <div class="source-list">
-              <button class="source-item is-active" data-source="">全部资料</button>
-              <button class="source-item" data-source="text">文本</button>
-              <button class="source-item" data-source="web">文本来源</button>
-              <button class="source-item" data-source="confluence">Confluence</button>
-              <button class="source-item" data-source="jira">Jira</button>
-              <button class="source-item" data-source="github">GitHub</button>
-              <button class="source-item" data-source="teams">Teams</button>
-              <button class="source-item source-item-warning" data-source="" data-integrity-status="quarantined">隔离区</button>
-            </div>
-          </section>
-
-          <section class="tag-panel filter-panel" data-filter-panel="tag" hidden>
-            <div id="tagList" class="tag-list"></div>
-          </section>
+        <button id="globalAddButton" class="rail-add" type="button"><span aria-hidden="true">+</span> 添加资料</button>
+        <div class="rail-nav">
+          <button class="nav-item is-active" type="button" data-view="home"><svg viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M3 10.5 10 4l7 6.5M5.5 9v7h9V9"/></svg><span class="nav-label">动态</span><span id="navUnreadCount" class="nav-count" hidden></span></button>
+          <button class="nav-item" type="button" data-view="materials"><svg viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M4 3.5h8.5L16 7v9.5H4zM12 3.5V7h4M7 10.5h6M7 13.5h6"/></svg><span class="nav-label">资料</span><span id="materialsNewBadge" class="nav-count" hidden></span></button>
+          <button class="nav-item" type="button" data-view="subscriptions"><svg viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M4 16a12 12 0 0 1 12-12M4 11a7 7 0 0 1 7-7M5 16.2h.01"/></svg><span class="nav-label">订阅</span><span id="navSubscriptionAlert" class="nav-count nav-count-alert" hidden></span></button>
+          <button class="nav-item" type="button" data-view="chat"><svg viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M3.5 4.5h13v9h-7l-4 3v-3h-2z"/></svg><span class="nav-label">问答</span></button>
         </div>
-      </aside>
+        <div class="rail-nav rail-nav-secondary">
+          <button class="nav-item" type="button" data-view="supplemental"><svg viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M5 3.5h8a2 2 0 0 1 2 2v11H7a2 2 0 0 1-2-2zM5 14.5a2 2 0 0 1 2-2h8"/></svg><span class="nav-label">术语与背景</span></button>
+          <button class="nav-item" type="button" data-view="settings"><svg viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M10 7a3 3 0 1 0 0 6 3 3 0 0 0 0-6zM10 2.5v2M10 15.5v2M2.5 10h2M15.5 10h2M4.7 4.7l1.4 1.4M13.9 13.9l1.4 1.4M4.7 15.3l1.4-1.4M13.9 6.1l1.4-1.4"/></svg><span class="nav-label">设置</span></button>
+        </div>
+        <div class="rail-footer">
+          <button id="doNotDisturbToggle" class="dnd-switch" type="button" role="switch" aria-checked="false">
+            <span class="dnd-track" aria-hidden="true"><span class="dnd-thumb"></span></span>
+            <span class="dnd-text"><strong>免打扰</strong><small id="dndHint">定时刷新照常进行</small></span>
+          </button>
+        </div>
+      </nav>
 
-      <main class="workspace">
-        <section id="homeView" class="home-view">
-          <div class="view-heading">
-            <h2>工作台</h2>
-            <p>优先处理变化、异常和最近阅读。</p>
-          </div>
-
-          <section class="home-overview" aria-label="首页概览">
-            <div class="overview-hero">
-              <div>
-                <span class="section-kicker">工作台</span>
-                <h3 id="homeHeroTitle">准备好收集你的第一条资料</h3>
-                <p id="homeHeroDescription">粘贴链接或文本，保存后即可在这里跟踪变化、阅读资料和提问。</p>
+      <main class="stage">
+        <section id="homeView" class="view home-view">
+          <header class="view-header">
+            <div class="view-title">
+              <h1>动态</h1>
+              <p id="homeSummary">正在读取资料库……</p>
+            </div>
+            <form id="workbenchSearchForm" class="ask-bar" role="search">
+              <input id="workbenchSearchInput" type="search" placeholder="搜索资料，或直接提一个问题" aria-label="搜索或提问" />
+              <button type="submit">搜索</button>
+              <button type="button" id="workbenchAskButton" class="primary-button">提问</button>
+            </form>
+          </header>
+          <section id="homeAttention" class="attention" aria-label="需要处理" hidden></section>
+          <div class="home-grid">
+            <section class="feed" aria-labelledby="feedTitle">
+              <div class="section-head">
+                <h2 id="feedTitle">新内容</h2>
+                <button id="homeMarkAllReadButton" class="quiet-button" type="button" hidden>全部标为已读</button>
               </div>
-              <div class="overview-status-row">
-                <span id="homeAiMode" class="status-pill is-local">AI 状态载入中</span>
-              </div>
-            </div>
-
-            <div class="workbench-entry">
-              <form id="workbenchSearchForm" class="workbench-search-form">
-                <input id="workbenchSearchInput" type="search" placeholder="搜索资料，或直接提出问题" />
-                <button class="primary-button" type="submit">搜索资料</button>
-                <button id="workbenchAskButton" type="button">去问答</button>
-              </form>
-              <button id="homeFirstImportButton" class="primary-button" type="button">添加第一条资料</button>
-            </div>
-
-            <div class="overview-metrics">
-              <article class="metric-card">
-                <span>资料总数</span>
-                <strong id="homeTotalItems">--</strong>
-                <small id="homeSourceSummary">等待载入</small>
-              </article>
-              <article class="metric-card">
-                <span>待处理更新</span>
-                <strong id="homeUpdateCount">--</strong>
-                <small>来自订阅刷新和内容快照</small>
-              </article>
-              <article class="metric-card">
-                <span>订阅任务</span>
-                <strong id="homeSubscriptionCount">--</strong>
-                <small id="homeSubscriptionStatus">等待载入</small>
-              </article>
-              <article class="metric-card">
-                <span>知识范围</span>
-                <strong id="homeTagCount">--</strong>
-                <small>可用于问答过滤和整理</small>
-              </article>
-            </div>
-
-            <section class="recent-updates-panel" aria-label="最近未读更新">
-              <div class="overview-panel-header"><h4>最近未读更新</h4><button type="button" data-view-shortcut="materials">查看全部</button></div>
-              <div id="homeRecentUpdates" class="recent-updates-list"></div>
+              <div id="homeRecentUpdates" class="feed-list"></div>
+              <button id="homeFirstImportButton" class="primary-button" type="button" hidden>添加第一条资料</button>
             </section>
-
-            <div class="overview-lower">
-              <section class="overview-panel">
-                <div class="overview-panel-header">
-                  <h4>导入来源</h4>
-                  <button type="button" data-view-shortcut="import">新增</button>
+            <aside class="home-side">
+              <section class="panel" aria-labelledby="healthTitle">
+                <div class="section-head">
+                  <h2 id="healthTitle">订阅状况</h2>
+                  <button class="quiet-button" type="button" data-view-shortcut="subscriptions">管理订阅</button>
                 </div>
-                <div class="source-shortcuts">
-                  <button type="button" data-source-shortcut="confluence">Confluence <span class="source-shortcut-counts"><span class="source-total" id="homeSourceConfluence">0</span><span class="source-new" id="homeSourceConfluenceNew" hidden>新 0</span></span></button>
-                  <button type="button" data-source-shortcut="jira">Jira <span class="source-shortcut-counts"><span class="source-total" id="homeSourceJira">0</span><span class="source-new" id="homeSourceJiraNew" hidden>新 0</span></span></button>
-                  <button type="button" data-source-shortcut="github">GitHub <span class="source-shortcut-counts"><span class="source-total" id="homeSourceGithub">0</span><span class="source-new" id="homeSourceGithubNew" hidden>新 0</span></span></button>
-                  <button type="button" data-source-shortcut="teams">Teams <span class="source-shortcut-counts"><span class="source-total" id="homeSourceTeams">0</span><span class="source-new" id="homeSourceTeamsNew" hidden>新 0</span></span></button>
-                  <button type="button" data-source-shortcut="web">文本 <span class="source-shortcut-counts"><span class="source-total" id="homeSourceWeb">0</span><span class="source-new" id="homeSourceWebNew" hidden>新 0</span></span></button>
-                </div>
+                <div id="homeSourceHealth" class="health-list"></div>
               </section>
-              <section class="overview-panel">
-                <div class="overview-panel-header">
-                  <h4>刷新状态</h4>
-                  <button type="button" data-view-shortcut="subscriptions">管理</button>
-                </div>
-                <div class="refresh-snapshot">
-                  <div>
-                    <span>运行中</span>
-                    <strong id="homeRunningJobs">0</strong>
-                  </div>
-                  <div>
-                    <span>异常</span>
-                    <strong id="homeFailedJobs">0</strong>
-                  </div>
-                  <div>
-                    <span>已启用</span>
-                    <strong id="homeEnabledJobs">0</strong>
-                  </div>
-                </div>
+              <section class="panel" aria-labelledby="libraryTitle">
+                <div class="section-head"><h2 id="libraryTitle">资料库</h2></div>
+                <div id="homeLibraryStats" class="library-stats"></div>
               </section>
-            </div>
-          </section>
-
-          <section class="home-task-panel" aria-label="需要处理">
-            <div class="home-task-header">
-              <div>
-                <h3>需要你处理</h3>
-                <p>只显示需要操作的关注来源和资料变化。</p>
-              </div>
-              <div class="home-task-actions">
-                <button type="button" data-view-shortcut="subscriptions">管理关注</button>
-              </div>
-            </div>
-            <div class="home-task-table-wrap">
-              <table class="home-task-table">
-                <thead>
-                  <tr>
-                    <th>数据源</th>
-                    <th>来源</th>
-                    <th>需要处理</th>
-                    <th>最近活动</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody id="homeRefreshTaskRows">
-                  <tr>
-                    <td colspan="4">正在载入需要处理的内容。</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-            <div class="home-task-footer">
-              <span id="homeRefreshTaskCount">暂无需要处理的内容</span>
-              <button type="button" data-view-shortcut="materials">查看资料库</button>
-            </div>
-          </section>
+            </aside>
+          </div>
         </section>
 
-        <section id="chatView" class="chat-view" hidden>
-          <div class="view-heading">
-            <h2>问答</h2>
-            <p>从资料库里查找、总结和回到原文。</p>
+        <section id="materialsView" class="view library-view" hidden>
+          <aside id="materialSidebar" class="facets" aria-label="资料分类">
+            <div class="facet-group">
+              <h3>视图</h3>
+              <div id="facetViews" class="facet-list"></div>
+            </div>
+            <div class="facet-group">
+              <h3>来源</h3>
+              <div id="facetSources" class="facet-list"></div>
+            </div>
+            <div class="facet-group">
+              <h3>标签</h3>
+              <div id="tagList" class="facet-list facet-tags"></div>
+            </div>
+          </aside>
+          <section class="list-pane" aria-label="资料列表">
+            <div class="list-head">
+              <button id="facetToggleButton" type="button" class="facet-toggle" aria-controls="materialSidebar" aria-expanded="false">筛选</button>
+              <input id="searchInput" type="search" placeholder="搜索标题、标签和正文" aria-label="搜索资料" />
+              <details class="menu">
+                <summary class="icon-button" aria-label="列表操作">⋯</summary>
+                <div class="menu-panel">
+                  <button id="classifyListButton" type="button">用 AI 给当前列表分类</button>
+                  <button id="batchProcessButton" type="button">批量整理或打标签</button>
+                </div>
+              </details>
+            </div>
+            <div id="listScope" class="list-scope" hidden></div>
+            <p id="resultCount" class="list-count">准备载入</p>
+            <div id="itemList" class="item-list"></div>
+          </section>
+          <article id="detailPanel" class="reader" aria-label="资料内容">
+            <div class="empty-state">选择一条资料查看内容。</div>
+          </article>
+          <h2 id="materialsTitle" hidden>资料</h2>
+        </section>
+
+        <section id="subscriptionsView" class="view subs-view" hidden>
+          <header class="view-header">
+            <div class="view-title">
+              <h1>订阅</h1>
+              <p id="subsSummary">正在读取订阅……</p>
+            </div>
+            <div class="header-actions">
+              <button id="subscriptionConnectionSettingsButton" type="button">站点登录</button>
+              <button id="runAllSubscriptionsButton" class="primary-button" type="button">刷新全部已启用</button>
+            </div>
+          </header>
+          <div class="subs-toolbar">
+            <div id="subscriptionTabs" class="segmented" role="tablist" aria-label="按状态筛选"></div>
+            <input id="subscriptionSearch" type="search" placeholder="按名称或地址筛选" aria-label="筛选订阅" />
           </div>
+          <p id="refreshJobStatus" class="run-status" aria-live="polite"></p>
+          <div id="refreshJobs" class="subs-groups"></div>
+          <button id="saveSubscriptionsButton" type="button" hidden>保存</button>
+        </section>
+
+        <section id="chatView" class="view chat-view" hidden>
+          <header class="view-header"><div class="view-title"><h1>问答</h1><p>基于资料库检索相关内容后回答，答案附带来源，可直接打开原文。</p></div></header>
 
           <section class="chat-panel">
             <aside class="chat-history-panel">
@@ -244,32 +165,8 @@
           </section>
         </section>
 
-        <section id="materialsView" class="materials-view" hidden>
-          <section class="toolbar">
-            <div>
-              <h2 id="materialsTitle">资料整理</h2>
-              <p id="resultCount">准备载入</p>
-            </div>
-            <div class="toolbar-actions">
-              <input id="searchInput" type="search" placeholder="搜索标题、标签、内容" />
-              <button id="classifyListButton" type="button">列表分类</button>
-              <button id="batchProcessButton" type="button">处理</button>
-            </div>
-          </section>
-
-          <section class="content-grid">
-            <div class="item-list" id="itemList"></div>
-            <article class="detail-panel" id="detailPanel">
-              <div class="empty-state">选择一条资料查看内容，或新增第一条资料。</div>
-            </article>
-          </section>
-        </section>
-
-        <section id="importView" class="import-view" hidden>
-          <div class="view-heading">
-            <h2>新增资料</h2>
-            <p>拖入文件、粘贴文本或输入网页链接，先解析预览，确认后再导入资料库。</p>
-          </div>
+                <section id="importView" class="view import-view" hidden>
+          <header class="view-header"><div class="view-title"><h1>添加资料</h1><p>粘贴链接或文本，先预览解析结果。只想保存一次就选“保存”，希望以后自动跟进变化就选“保存并订阅”。</p></div></header>
 
           <section class="import-layout">
             <form id="importForm" class="import-form">
@@ -372,24 +269,21 @@
 
               <div class="import-actions">
                 <button type="button" id="copyPreviewButton">复制预览</button>
-                <button type="button" id="confirmImportButton" class="primary-button" disabled>一次保存</button>
-                <button type="button" id="subscribeImportButton" disabled>持续关注</button>
+                <button type="button" id="confirmImportButton" class="primary-button" disabled>保存</button>
+                <button type="button" id="subscribeImportButton" disabled>保存并订阅</button>
               </div>
             </section>
           </section>
         </section>
 
-        <section id="supplementalView" class="supplemental-view" hidden>
-          <div class="view-heading">
-            <h2>补充资料</h2>
-            <p>维护缩写、项目名、术语和背景说明。AI 整理、标题生成、标签推荐和问答都会参考这里的内容。</p>
-          </div>
+                <section id="supplementalView" class="view supplemental-view" hidden>
+          <header class="view-header"><div class="view-title"><h1>术语与背景</h1><p>项目代号、缩写和背景说明。AI 整理、生成标题、推荐标签和问答都会参考这里。</p></div></header>
 
           <section class="supplemental-panel">
             <div class="supplemental-actions">
               <button id="addSupplementalEntryButton" type="button">新增条目</button>
-              <button id="suggestSupplementalButton" type="button">AI 分析候选补充项</button>
-              <button id="saveSupplementalButton" type="button" class="primary-button">保存补充资料</button>
+              <button id="suggestSupplementalButton" type="button">从资料中找候选词</button>
+              <button id="saveSupplementalButton" type="button" class="primary-button">保存</button>
             </div>
             <p id="supplementalStatus" class="status-message">载入中。</p>
             <div id="supplementalSummary" class="supplemental-summary"></div>
@@ -397,31 +291,8 @@
           </section>
         </section>
 
-        <section id="subscriptionsView" class="subscriptions-view" hidden>
-          <div class="view-heading">
-            <h2>订阅管理</h2>
-            <p>管理需要定时刷新或手动刷新的订阅和普通页面，例如 Jira filter、GitHub notifications、Teams 对话和已导入网页。</p>
-          </div>
-
-          <section class="subscriptions-panel">
-            <div class="subscription-toolbar">
-              <div id="subscriptionTabs" class="subscription-tabs" role="tablist" aria-label="订阅来源"></div>
-              <div class="subscription-toolbar-actions">
-                <button id="subscriptionConnectionSettingsButton" type="button">连接设置</button>
-                <button id="runAllSubscriptionsButton" type="button">刷新所有</button>
-                <button id="saveSubscriptionsButton" type="button" class="primary-button">保存订阅设置</button>
-              </div>
-            </div>
-            <p id="refreshJobStatus">未执行刷新任务。</p>
-            <div id="refreshJobs" class="refresh-jobs"></div>
-          </section>
-        </section>
-
-        <section id="settingsView" class="settings-view" hidden>
-          <div class="view-heading">
-            <h2>设置</h2>
-            <p>配置 AI 接口和资料库保存位置。</p>
-          </div>
+                <section id="settingsView" class="view settings-view" hidden>
+          <header class="view-header"><div class="view-title"><h1>设置</h1><p>AI 服务、站点登录、标签、存储和提醒。</p></div></header>
 
           <form id="settingsForm" class="settings-panel">
             <div id="settingsTabs" class="settings-tabs" role="tablist" aria-label="设置分类">
@@ -448,6 +319,24 @@
                 Model
                 <input id="settingModel" placeholder="例如 gpt-4.1-mini" />
               </label>
+            </section>
+
+            <section class="settings-section" data-settings-panel="ai">
+              <h3>自动整理</h3>
+              <p>订阅刷新后什么时候自动让 AI 重新整理。Teams 这类消息流每次只多几句话，按新增量触发并只发送新增部分，可以大幅减少调用次数和费用；未达到条件时阅读页直接显示原文。</p>
+              <label>
+                触发方式
+                <select id="settingAutoProcessMode">
+                  <option value="threshold">新增内容达到下面的条件时</option>
+                  <option value="always">每次有更新都整理</option>
+                  <option value="manual">只在我点“更新整理”时</option>
+                </select>
+              </label>
+              <div class="settings-grid settings-grid-3">
+                <label>新增消息达到（条）<input id="settingAutoProcessMessages" type="number" min="1" /></label>
+                <label>或新增文字达到（字）<input id="settingAutoProcessChars" type="number" min="100" step="100" /></label>
+                <label>或整理版超过（天）<input id="settingAutoProcessDays" type="number" min="1" /></label>
+              </div>
             </section>
 
             <section class="settings-section" data-settings-panel="ai">
@@ -570,11 +459,11 @@
             <section class="settings-section" data-settings-panel="capture" hidden>
               <h3>页面来源认证</h3>
               <p>抓取会优先调用 Jira、Confluence、GitHub 或 Microsoft Graph API，API 不可用时再回退到 HTML/WebDriver。Token、Cookie 或 Basic 认证仅保存在本机。</p>
-              <form id="addSourceProfileForm" class="source-profile-add">
-                <input id="newSourceHostname" placeholder="来源域名，例如 jira.example.com" />
-                <select id="newSourceType"><option value="web">网页</option><option value="jira">Jira</option><option value="confluence">Confluence</option><option value="github">GitHub</option><option value="teams">Teams</option></select>
-                <button type="submit">添加来源实例</button>
-              </form>
+              <div id="addSourceProfileForm" class="source-profile-add" role="group" aria-label="添加站点">
+                <input id="newSourceHostname" placeholder="站点域名，例如 jira.example.com" aria-label="站点域名" />
+                <select id="newSourceType" aria-label="站点类型"><option value="web">网页</option><option value="jira">Jira</option><option value="confluence">Confluence</option><option value="github">GitHub</option><option value="teams">Teams</option></select>
+                <button id="addSourceProfileButton" type="button">添加站点</button>
+              </div>
               <div id="sourceProfiles" class="source-profiles"></div>
             </section>
 
@@ -667,6 +556,7 @@
           </form>
         </section>
       </main>
+      <aside id="subscriptionDrawer" class="drawer" aria-label="订阅详情" hidden></aside>
     </div>
 
     <dialog id="tagDialog" class="tag-dialog">
@@ -825,25 +715,23 @@
       <form method="dialog">
         <div class="dialog-header">
           <div>
-            <h3>确认 Teams 已就绪</h3>
-            <p>刷新正在等待你完成 Teams Web 登录。</p>
+            <h3>Teams 需要登录</h3>
+            <p>刷新会在登录完成后自动继续。</p>
           </div>
         </div>
-        <div class="teams-ready-note">
-          请在 WebDriver 窗口中完成登录，选择“使用 Web 应用”，并进入能看到聊天列表和聊天内容的页面。确认后，应用会在当前页面内依次查找目标对话，不会打开对话深链接或新窗口。
-        </div>
-        <p id="teamsReadyStatus" class="status-message">确认聊天列表和聊天窗口可见后再继续。</p>
+        <div class="teams-ready-note">已打开 Teams 登录窗口。请在那个窗口里完成登录；如果出现“使用 Web 应用”的选项请选择它。登录成功后无需回到这里，刷新会自动开始。</div>
+        <p id="teamsReadyStatus" class="status-message">正在等待登录……</p>
         <div class="dialog-actions">
           <button type="button" id="cancelTeamsRefreshButton">取消此次刷新</button>
-          <button type="button" id="confirmTeamsReadyButton" class="primary-button">聊天窗口已就绪，开始抓取</button>
+          <button type="button" id="confirmTeamsReadyButton" class="primary-button">我已登录，立即继续</button>
         </div>
       </form>
     </dialog>
 
-    <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+        <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
 
     <script src="/vendor/purify.min.js"></script>
     <script src="/vendor/marked.umd.js"></script>
-    <script type="module" src="/app.js?v=20260922-verified"></script>
+    <script type="module" src="/app.js?v=20261014-redesign"></script>
   </body>
 </html>

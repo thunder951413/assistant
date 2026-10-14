@@ -28,6 +28,7 @@ import { collectVirtualTeamsMessages, extractTeamsMessagesFromDocument, mergeTea
 import { createItemStore, renderDocument, extractBodyFromDocument, extractSummaryFromDocument } from "./item-store.js";
 import { computeSourceHealth, createRunHistory, lineDiff } from "./reliability.js";
 import { collectConfluenceComments, normalizeConfluenceComment } from "./sources/confluence-comments.js";
+import { analyzeProcessingDelta, buildProcessingInput, defaultAutoProcessSettings, normalizeAutoProcessSettings, shouldAutoProcess } from "./ai-processing.js";
 import { collectChatsvcMessages, fetchChatsvcTopic, recordChatsvcAuth } from "./sources/teams-chatsvc.js";
 import { collectPullRequestDiscussion, renderGithubDiscussionEntry } from "./sources/github-pull.js";
 import { BROWSER_DISK_CACHE_BYTES, browserCacheSize, cleanupBrowserCaches, directorySize, maintainSnapshots, trimBrowserProfileIfLarge, writeItemSnapshot } from "./storage-maintenance.js";
@@ -184,8 +185,9 @@ api.post("/api/items/:id/recommend-tags", async ({ params, res }) => {
   sendJson(res, 200, recommendations);
 });
 
-api.post("/api/items/:id/process", async ({ params, res }) => {
-  const item = await processItemWithAi(params.id);
+api.post("/api/items/:id/process", async ({ req, params, res }) => {
+  const body = await readBody(req).catch(() => ({}));
+  const item = await processItemWithAi(params.id, { full: Boolean(body?.full) });
   sendJson(res, 200, { item });
 });
 
@@ -1963,7 +1965,8 @@ async function processItemWithAi(id, options = {}) {
   }
 
   const prompt = resolveProcessingPrompt(item.metadata.sourceType);
-  const processedText = unwrapMarkdownFence(await processDocumentWithOpenAICompatible(item, prompt, options));
+  const processed = await processDocumentWithOpenAICompatible(item, prompt, options);
+  const processedText = unwrapMarkdownFence(processed.text);
   return withItemUrlMutationLock(item.metadata.url || "", async () => {
   const now = new Date().toISOString();
   options.signal?.throwIfAborted();
@@ -1977,6 +1980,12 @@ async function processItemWithAi(id, options = {}) {
     processedModel: settings.ai.model,
     processedPromptSource: item.metadata.sourceType || "default",
     processedStale: false,
+    // How far the organized version reaches, so the reader and the auto-process
+    // policy can tell how much arrived after it.
+    processedThroughAt: processed.processedThroughAt || latest.metadata.processedThroughAt || "",
+    processedMode: processed.mode,
+    processedIncrementalCount: processed.mode === "incremental" ? Number(latest.metadata.processedIncrementalCount || 0) + 1 : 0,
+    processedMessageCount: (latest.comments || []).length,
     contentUpdatedAt: latest.metadata.contentUpdatedAt || "",
     pendingContentUpdatedAt: "",
     updatedAt: now
@@ -1989,17 +1998,14 @@ async function processItemWithAi(id, options = {}) {
 
 async function processDocumentWithOpenAICompatible(item, prompt, options = {}) {
   const supplemental = await supplementalPromptBlock();
-  const sourceBody = extractBodyFromDocument(item.document).trim();
-  const summary = extractSummaryFromDocument(item.document).trim();
-  const comments = (item.comments || [])
-    .map((comment) => [
-      comment.author ? `Author: ${comment.author}` : "",
-      comment.createdAt ? `Time: ${comment.createdAt}` : "",
-      comment.body || ""
-    ].filter(Boolean).join("\n"))
-    .join("\n\n---\n\n");
-
-  return ai.chat([
+  const processedBody = item.processedDocument ? extractProcessedBodyFromDocument(item.processedDocument) : "";
+  const input = buildProcessingInput(options.full ? { ...item, metadata: { ...item.metadata, processedIncrementalCount: Number.MAX_SAFE_INTEGER } } : item, {
+    body: extractBodyFromDocument(item.document).trim(),
+    summary: extractSummaryFromDocument(item.document).trim(),
+    processedBody,
+    policy: settings.autoProcess
+  });
+  const text = await ai.chat([
     {
       role: "system",
       content: [
@@ -2011,26 +2017,13 @@ async function processDocumentWithOpenAICompatible(item, prompt, options = {}) {
         "- 只整理资料内容，不编造原文没有的信息。",
         "- 如果信息不足或状态不明确，要明确写出\u201c不明确\u201d。",
         "- 保留关键原始标识，例如 Jira key、GitHub issue/PR 编号、URL、时间、人名。",
+        input.systemExtra,
         supplemental
-      ].join("\n")
+      ].filter((line) => line !== undefined).join("\n")
     },
-    {
-      role: "user",
-      content: [
-        `标题：${item.metadata.title}`,
-        `来源类型：${item.metadata.sourceType}`,
-        `URL：${item.metadata.url || "local input"}`,
-        `标签：${(item.metadata.tags || []).join(", ") || "none"}`,
-        `最后抓取：${item.metadata.lastFetchedAt || "not fetched"}`,
-        `来源更新时间：${item.metadata.sourceUpdatedAt || "unknown"}`,
-        "",
-        summary ? `已有摘要：\n${summary}\n` : "",
-        "原始提取内容：",
-        sourceBody.slice(0, 28000),
-        comments ? `\n\n评论/对话结构化内容：\n${comments.slice(0, 12000)}` : ""
-      ].join("\n")
-    }
+    { role: "user", content: input.user }
   ], { materials: [item.metadata], signal: options.signal });
+  return { text, mode: input.mode, processedThroughAt: input.processedThroughAt };
 }
 
 async function readItem(id) {
@@ -3458,9 +3451,10 @@ async function collectRefreshItemIdsNeedingAi(results) {
   for (const itemId of candidateIds) {
     try {
       const item = await readItem(itemId);
-      if (item.metadata.pendingContentUpdatedAt || item.metadata.processedStale) {
-        itemIds.push(itemId);
-      }
+      // Message streams wait until enough has accumulated (settings.autoProcess);
+      // below the threshold the item stays marked stale and the reader shows the
+      // original messages.
+      if (shouldAutoProcess(item, settings.autoProcess).process) itemIds.push(itemId);
     } catch {
       // Ignore missing items; the refresh result may be stale.
     }
@@ -4826,7 +4820,10 @@ async function fetchTeamsViaChatsvc(session, page, url, adapter, options = {}) {
     };
     const stableUrl = canonicalizeMaterialUrl(url) || url;
     const previous = await readExistingTeamsComments(stableUrl);
-    const knownIds = new Set(previous.flatMap((comment) => [comment.id, comment.createdAt].filter(Boolean)));
+    // Rows stored by older page extractors have no real message id. While any remain,
+    // do one full backfill so the API copies (same author + time) supersede them.
+    const hasLegacyRows = previous.some((comment) => !/^(?:message-body-)?\d{13}$/.test(String(comment.id || "")));
+    const knownIds = hasLegacyRows ? new Set() : new Set(previous.flatMap((comment) => [comment.id, comment.createdAt].filter(Boolean)));
     if (options.run) updateRefreshRun(options.run, { status: "running", currentJobName: `正在通过 Teams 接口读取：${options.teamsConversationTitle || conversationId}` });
     let collected;
     try {
@@ -5847,6 +5844,7 @@ async function saveSettingsNow(input) {
     notifications: normalizeNotificationSettings(input.notifications || settings.notifications || {}),
     refreshSchedule: normalizeRefreshSchedule(input.refreshSchedule || settings.refreshSchedule || {}),
     processingPrompts: normalizeProcessingPrompts(input.processingPrompts || settings.processingPrompts || {}),
+    autoProcess: normalizeAutoProcessSettings(input.autoProcess || settings.autoProcess || {}),
     documentRoot: cleanText(input.documentRoot ?? settings.documentRoot),
     sources: mergeSourceProfiles(settings.sources, input.sources || {}),
     refreshJobs: mergeRefreshJobs(settings.refreshJobs || [], input.refreshJobs || settings.refreshJobs || [])
@@ -5880,6 +5878,7 @@ function defaultSettings() {
     notifications: defaultNotificationSettings(),
     refreshSchedule: defaultRefreshSchedule(),
     processingPrompts: defaultProcessingPrompts(),
+    autoProcess: defaultAutoProcessSettings(),
     sources: {
       "confluence.amlogic.com": defaultSourceProfile("confluence.amlogic.com", "confluence"),
       "jira.amlogic.com": defaultSourceProfile("jira.amlogic.com", "jira"),
@@ -5923,6 +5922,10 @@ function mergeSettings(base, patch) {
       ...(base.processingPrompts || {}),
       ...(patch.processingPrompts || {})
     }),
+    autoProcess: normalizeAutoProcessSettings({
+      ...(base.autoProcess || {}),
+      ...(patch.autoProcess || {})
+    }),
     sources: mergeSourceProfiles(base.sources || {}, patch.sources || {}),
     refreshJobs: mergeRefreshJobs(base.refreshJobs || [], patch.refreshJobs || [])
   };
@@ -5952,6 +5955,7 @@ function publicSettings() {
     notifications: normalizeNotificationSettings(settings.notifications || {}),
     refreshSchedule: normalizeRefreshSchedule(settings.refreshSchedule || {}),
     processingPrompts: normalizeProcessingPrompts(settings.processingPrompts || {}),
+    autoProcess: normalizeAutoProcessSettings(settings.autoProcess || {}),
     sources: publicSourceProfiles(),
     refreshJobs: publicRefreshJobs()
   };
