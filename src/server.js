@@ -28,6 +28,7 @@ import { collectVirtualTeamsMessages, extractTeamsMessagesFromDocument, mergeTea
 import { createItemStore, renderDocument, extractBodyFromDocument, extractSummaryFromDocument } from "./item-store.js";
 import { computeSourceHealth, createRunHistory, lineDiff } from "./reliability.js";
 import { collectConfluenceComments, normalizeConfluenceComment } from "./sources/confluence-comments.js";
+import { collectChatsvcMessages, fetchChatsvcTopic, recordChatsvcAuth } from "./sources/teams-chatsvc.js";
 import { collectPullRequestDiscussion, renderGithubDiscussionEntry } from "./sources/github-pull.js";
 import { BROWSER_DISK_CACHE_BYTES, browserCacheSize, cleanupBrowserCaches, directorySize, maintainSnapshots, trimBrowserProfileIfLarge, writeItemSnapshot } from "./storage-maintenance.js";
 import { exists, resolveWritableDir, safeReaddir } from "./fs-helpers.js";
@@ -4677,6 +4678,9 @@ async function fetchUrlWithWebdriverInSession(url, options = {}) {
     }
     let teamsLocation = null;
     if (adapter.sourceType === "teams") {
+      // Message API first: no UI navigation or scrolling, full history paging.
+      const viaApi = await fetchTeamsViaChatsvc(session, page, url, adapter, options);
+      if (viaApi) return viaApi;
       teamsLocation = await openTeamsConversationFromUi(page, {
         title: options.teamsConversationTitle,
         url,
@@ -4785,6 +4789,80 @@ async function waitForRecoveredNavigation(page, navigationUrl, adapter, original
   const loadedDocument = Boolean(recovered && (recovered.bodyLength > 0 || recovered.title));
   if (!sameTarget || !loadedDocument) {
     throw originalError;
+  }
+}
+
+const CHATSVC_AUTH_MAX_AGE_MS = 20 * 60 * 1000;
+
+// Waits for the Teams page to send a chatsvc request so its current auth headers
+// are known; reloads the app once when the recorded headers are stale.
+async function ensureChatsvcAuth(session, page, { forceRefresh = false } = {}) {
+  const fresh = () => session.chatsvcAuth && Date.now() - session.chatsvcAuth.seenAt < CHATSVC_AUTH_MAX_AGE_MS;
+  if (!forceRefresh && fresh()) return session.chatsvcAuth;
+  const before = session.chatsvcAuth?.seenAt || 0;
+  if (forceRefresh || session.chatsvcAuth) {
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+  }
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    if (session.chatsvcAuth && session.chatsvcAuth.seenAt > before) return session.chatsvcAuth;
+    await page.waitForTimeout(500);
+  }
+  return null;
+}
+
+// Teams capture through the chatsvc API the web client uses. Returns null (so the
+// caller falls back to UI navigation) when no conversation id or auth is available.
+async function fetchTeamsViaChatsvc(session, page, url, adapter, options = {}) {
+  const conversationId = extractTeamsConversationId(url);
+  if (!conversationId) return null;
+  const signal = options.signal || options.run?.abortController?.signal;
+  try {
+    let auth = await ensureChatsvcAuth(session, page);
+    if (!auth) return null;
+    const requestJson = async (target) => {
+      const response = await page.context().request.get(target, { headers: session.chatsvcAuth.headers, timeout: 30000 });
+      return { status: response.status(), json: response.ok() ? await response.json() : null };
+    };
+    const stableUrl = canonicalizeMaterialUrl(url) || url;
+    const previous = await readExistingTeamsComments(stableUrl);
+    const knownIds = new Set(previous.flatMap((comment) => [comment.id, comment.createdAt].filter(Boolean)));
+    if (options.run) updateRefreshRun(options.run, { status: "running", currentJobName: `正在通过 Teams 接口读取：${options.teamsConversationTitle || conversationId}` });
+    let collected;
+    try {
+      collected = await collectChatsvcMessages({ requestJson, base: auth.base, conversationId, conversationUrl: stableUrl, knownIds, signal });
+    } catch (error) {
+      if (![401, 403].includes(error.status)) throw error;
+      auth = await ensureChatsvcAuth(session, page, { forceRefresh: true });
+      if (!auth) return null;
+      collected = await collectChatsvcMessages({ requestJson, base: auth.base, conversationId, conversationUrl: stableUrl, knownIds, signal });
+    }
+    if (!collected.comments.length && !previous.length) return null;
+    const title = await fetchChatsvcTopic({ requestJson, base: auth.base, conversationId })
+      || options.teamsConversationTitle || "Microsoft Teams conversation";
+    // A message deleted before it was ever captured has no text to keep; one captured
+    // earlier keeps its stored text (the merge never replaces a body with an empty one).
+    const storedIds = new Set(previous.map((comment) => comment.id));
+    const comments = collected.comments.map((comment) => comment.body || storedIds.has(comment.id)
+      ? comment
+      : { ...comment, body: comment.deletedAt ? "[消息已删除]" : "[空消息]" });
+    return {
+      raw: JSON.stringify({ title, conversationId, coverage: collected.coverage, messages: comments }, null, 2),
+      title,
+      text: renderTeamsTextFromComments(title, stableUrl, adapter, comments),
+      comments,
+      sourceUpdatedAt: latestTimestampValue(comments.map((comment) => comment.createdAt)) || "",
+      url: stableUrl,
+      fetchMethod: "teams-chatsvc",
+      completeness: collected.completeness,
+      coverage: collected.coverage,
+      identityEvidence: { method: "chatsvc-conversation-id", conversationId, verified: true },
+      conversationId
+    };
+  } catch (error) {
+    if (signal?.aborted || error?.name === "AbortError") throw error;
+    console.warn(`Teams message API unavailable for ${conversationId}, falling back to the page:`, error.message || error);
+    return null;
   }
 }
 
@@ -4952,6 +5030,7 @@ async function ensureWebdriverSession(hostname, url, options = {}) {
     autoClose,
     startedAt: new Date().toISOString()
   };
+  if (/teams/i.test(key)) recordChatsvcAuth(context, session);
   webdriverSessions.set(key, session);
   context.on("close", () => webdriverSessions.delete(key));
   return session;

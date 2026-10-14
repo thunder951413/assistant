@@ -129,3 +129,32 @@ test('userscript shares the tested DOM extractor and rejects ambiguous root-page
   dom.window.document.body.insertAdjacentHTML('beforeend','<div data-fui-tree-item-value="OneGQL|19:b@thread.v2">Group</div>');
   assert.throws(()=>resolve('Group'),/无法唯一确认/);dom.window.close();
 });
+
+test('server Teams API path: incremental fetch, auth refresh on 401, deleted-message text, fallback when no auth',async()=>{
+  const {collectChatsvcMessages,fetchChatsvcTopic}=await import('../src/sources/teams-chatsvc.js');
+  const CONV='19:g@thread.v2';
+  const message=(id,extra={})=>({id:String(id),type:'Message',conversationid:CONV,messagetype:'RichText/Html',imdisplayname:'Ada',composetime:new Date(id).toISOString(),content:`<p>m${id}</p>`,properties:{},...extra});
+  let calls=0,refreshed=0;
+  const session={chatsvcAuth:{base:'https://t/api/chatsvc/apac/v1',headers:{authorization:'Bearer x'},seenAt:Date.now()}};
+  const page={context:()=>({request:{get:async(url)=>{
+    calls++;
+    if(calls===1)return {status:()=>401,ok:()=>false};
+    if(/\/messages/.test(url))return {status:()=>200,ok:()=>true,json:async()=>({messages:[message(1790000000300),message(1790000000200,{properties:{deletetime:'1790000000999'}}),message(1790000000100)],_metadata:{backwardLink:'more'}})};
+    return {status:()=>200,ok:()=>true,json:async()=>({threadProperties:{topic:'BM Test'}})};
+  }}})};
+  const fetchViaApi=load('fetchTeamsViaChatsvc',{
+    extractTeamsConversationId,canonicalizeMaterialUrl:x=>x,collectChatsvcMessages,fetchChatsvcTopic,latestTimestampValue:v=>v.filter(Boolean).sort().at(-1),
+    renderTeamsTextFromComments:(title,url,adapter,comments)=>`# ${title}\n${comments.map(c=>c.body).join('\n')}`,
+    readExistingTeamsComments:async()=>[{id:'1790000000100',body:'stored'}],
+    ensureChatsvcAuth:async(s,p,opts={})=>{if(opts.forceRefresh)refreshed++;return s.chatsvcAuth;},
+    updateRefreshRun:()=>{},console,DOMException,Set,JSON,Date
+  });
+  const result=await fetchViaApi(session,page,`https://teams.microsoft.com/l/chat/${CONV}/conversations`,{id:'teams'},{});
+  assert.equal(refreshed,1,'a 401 refreshes auth once and retries');
+  assert.equal(result.fetchMethod,'teams-chatsvc');assert.equal(result.title,'BM Test');assert.equal(result.conversationId,CONV);
+  assert.equal(result.coverage.reachedPrevious,true);
+  assert.equal(result.comments.find(c=>c.id==='1790000000200').body,'[消息已删除]');
+  assert.equal(result.identityEvidence.verified,true);
+  const noAuth=load('fetchTeamsViaChatsvc',{extractTeamsConversationId,ensureChatsvcAuth:async()=>null,console,DOMException});
+  assert.equal(await noAuth({}, {}, `https://teams.microsoft.com/l/chat/${CONV}/conversations`,{}, {}),null,'falls back to the page when auth is unavailable');
+});
