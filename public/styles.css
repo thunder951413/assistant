@@ -779,3 +779,13 @@ progress { width: 100%; accent-color: var(--accent); }
 
 /* Row-shaped buttons lay out their content left-aligned. */
 .feed-open, .health-row, .stat-row, .item-row, .drawer-items button, .chat-history-item, .facet, .chat-source-link { justify-content: stretch; }
+
+/* Items that left a filtered subscription */
+.left-items { background: var(--warn-soft, #fbf3e4); border-radius: 8px; padding: 12px 14px; }
+.left-items .drawer-items { margin-bottom: 10px; }
+.left-item { display: flex; align-items: center; gap: 6px; border-top: 1px solid var(--line); }
+.left-item:first-child { border-top: 0; }
+.left-item > button { flex: 1; min-width: 0; border-top: 0 !important; }
+.left-item .row-actions { display: flex; gap: 2px; flex-shrink: 0; }
+.danger-text { color: var(--error); }
+.subs-items { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }

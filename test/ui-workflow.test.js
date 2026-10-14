@@ -53,7 +53,7 @@ async function boot(handler, localSessions = []) {
     return new Response(JSON.stringify(result ?? {}), { status: 200, headers: { "Content-Type": "application/json" } });
   };
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-  await new AsyncFunction(`${appSource}\nglobalThis.__uiWorkflow = { state, selectItem, sendChatMessage, activateChatSession, checkRefreshJobsForUpdates, renderRefreshJobs, confirmImport, loadChatSessions, saveChatSessions, appendMessage, renderDetail };`)();
+  await new AsyncFunction(`${appSource}\nglobalThis.__uiWorkflow = { state, selectItem, sendChatMessage, activateChatSession, checkRefreshJobsForUpdates, renderRefreshJobs, confirmImport, loadChatSessions, saveChatSessions, appendMessage, renderDetail, openSubscriptionDrawer };`)();
   const ui = globalThis.__uiWorkflow;
   clearInterval(ui.state.refreshMonitorTimer);
   return {
@@ -279,5 +279,32 @@ test("subscriptions group by source and surface failures and duplicates", async 
     assert.match(document.querySelector('[data-subscription-id="a"] .subs-interval').textContent, /每 4 小时/);
     document.querySelector('[data-subscription-filter="problem"]').click();
     assert.deepEqual([...document.querySelectorAll("[data-subscription-id]")].map((row) => row.dataset.subscriptionId), ["c"]);
+  } finally { app.cleanup(); }
+});
+
+test("issue search subscriptions show items that left the filter and resolve them", async () => {
+  const posts = [];
+  const app = await boot((path, options) => {
+    if (path === "/api/list-membership/resolve") { posts.push(JSON.parse(options.body)); return { ok: true }; }
+    return defaultApi(path);
+  });
+  try {
+    const listUrl = "https://github.example.com/o/r/issues?q=is%3Aissue%20involves%3A%40me";
+    app.ui.state.allItems = [
+      { id: "i1", title: "Still open", sourceType: "github", url: "https://github.example.com/o/r/issues/1", parentUrl: listUrl, listMembership: { status: "member" } },
+      { id: "i2", title: "Closed one", sourceType: "github", url: "https://github.example.com/o/r/issues/2", parentUrl: listUrl, listMembership: { status: "left", leftAt: new Date().toISOString() } }
+    ];
+    app.ui.state.view = "subscriptions";
+    app.ui.renderRefreshJobs([{ id: "s", name: "o/r issue 搜索", url: listUrl, enabled: true, status: "idle", pageKind: "list" }]);
+    assert.match(document.querySelector('[data-subscription-id="s"]').textContent, /搜索：跟随过滤结果/);
+    assert.match(document.querySelector('[data-subscription-id="s"] .subs-items').textContent, /1 移出/);
+    app.ui.openSubscriptionDrawer("s");
+    const section = document.querySelector(".left-items");
+    assert.ok(section, "drawer lists items that left the filter");
+    assert.match(section.textContent, /Closed one/);
+    assert.doesNotMatch(section.textContent, /Still open/);
+    section.querySelector("[data-left-keep-all]").click();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(posts[0], { itemIds: ["i2"], action: "keep" });
   } finally { app.cleanup(); }
 });
