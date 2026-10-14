@@ -41,9 +41,18 @@ export function restoreLegacyBody(comment) {
   const body = String(comment.body || "");
   const author = collapse(comment.author);
   if (!author) return body;
-  const pattern = new RegExp(`^[\\s\\S]*? by ${escapeRe(author)} ${escapeRe(author)} ${ROW_TIME} (?:Edited )?(?:Translate )?([\\s\\S]+)$`);
-  const match = body.match(pattern);
-  return match ? match[1].trim() : body;
+  const name = escapeRe(author);
+  // Row header variants written by older extractors:
+  //   "<preview> by A A <time> [Edited] [Translate] <body>"           (others)
+  //   "<preview> by A <time> [Edited] A <body>"                       (own messages)
+  //   "<preview> by A, has an attachment. A <time> … <body/filename>" (attachments)
+  const header = new RegExp(`^([\\s\\S]*?) by ${name}(?:, has (?:an )?attachments?\\.)? (?:${name} )?${ROW_TIME}(?: Edited)?(?: ${name})?(?: Edited)?(?: Translate)?(?: ([\\s\\S]+))?$`);
+  const match = body.match(header);
+  if (!match) return body;
+  const restored = (match[2] || "").trim();
+  if (restored) return restored;
+  const preview = match[1].trim();
+  return preview && preview !== "Message" ? `[${preview}]` : "[附件]";
 }
 
 export function migrateComments(comments) {

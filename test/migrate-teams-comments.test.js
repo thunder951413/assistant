@@ -7,6 +7,12 @@ it("restores bodies, drops date dividers and legacy duplicates, never real Teams
   assert.equal(restoreLegacyBody({ author: "Changwen Dai", body: "ok by Changwen Dai Changwen Dai 7/29/2025 10:21 AM ok" }), "ok");
   assert.equal(restoreLegacyBody({ author: "yahui han", body: "可以分成两步... by yahui han yahui han Wednesday 3:30 PM Edited Translate 可以分成两步来处理" }), "可以分成两步来处理");
   assert.equal(restoreLegacyBody({ author: "Ada", body: "hi by Ada Ada 3:30 PM hi there" }), "hi there");
+  assert.equal(restoreLegacyBody({ author: "Yan Yan", body: "好的多谢 by Yan Yan 6/9 2:00 PM Yan Yan 好的多谢" }), "好的多谢");
+  assert.equal(restoreLegacyBody({ author: "Yan Yan", body: "图像 by Yan Yan Friday 9:44 AM Yan Yan" }), "[图像]");
+  assert.equal(restoreLegacyBody({ author: "Yan Yan", body: "图像 by Yan Yan Yesterday 4:55 PM Edited Yan Yan" }), "[图像]");
+  assert.equal(restoreLegacyBody({ author: "Junchao Yuan", body: "Message by Junchao Yuan, has an attachment. Junchao Yuan 7/9 10:49 AM wvcas33" }), "wvcas33");
+  assert.equal(restoreLegacyBody({ author: "Yan Yan", body: "Message by Yan Yan, has an attachment. Yesterday 2:43 PM Yan Yan log 1.txt" }), "log 1.txt");
+  assert.equal(restoreLegacyBody({ author: "HangYu Li", body: "Yan Yan ./mk... by HangYu Li, has attachments. HangYu Li Yesterday 5:25 PM Translate Yan Yan ./mk xxxx --bl32" }), "Yan Yan ./mk xxxx --bl32");
   assert.equal(migrateComments([{ id: "chat-pane-item", author: "", body: "Wednesday" }]).comments.length, 0);
   const { comments, stats } = migrateComments([
     { id: "chat-pane-item", author: "", createdAt: "", body: "Friday, December 5, 2025" },
