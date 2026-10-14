@@ -77,8 +77,11 @@ export function collectGithubIssueRows(baseUrl, doc) {
   const textOf = (node) => String(node?.textContent || "").replace(/\s+/g, " ").trim();
   const isTitleText = (text) => text && !/^#?\d+$/.test(text) && !/^\d+\s+comments?$/i.test(text);
   const groups = new Map();
-  for (const anchor of doc.querySelectorAll("a[href]")) {
-    if (anchor.closest("nav, header, footer, [role='navigation']")) continue;
+  // Newer GitHub marks result titles; pinned issues above the list are not results.
+  const titleLinks = doc.querySelectorAll("a[data-testid='issue-pr-title-link']");
+  const excluded = "nav, header, footer, [role='navigation'], [class*='PinnedIssues'], .pinned-issue-item, .js-pinned-issues-reorder-list";
+  for (const anchor of titleLinks.length ? titleLinks : doc.querySelectorAll("a[href]")) {
+    if (anchor.closest(excluded)) continue;
     const info = keyOf(anchor);
     if (!info) continue;
     if (!groups.has(info.key)) groups.set(info.key, { info, anchors: [] });
@@ -131,12 +134,24 @@ export function collectGithubIssueRows(baseUrl, doc) {
     });
   }
   const nextLink = doc.querySelector("a[rel='next'], a[aria-label='Next Page'], a[aria-label='Next page'], a.next_page:not(.disabled)");
-  const bodyText = textOf(doc.body).slice(0, 20000);
+  const bodyText = String(doc.body?.innerText || doc.body?.textContent || "").replace(/\s+/g, " ").slice(0, 20000);
+  // "Open 7  Closed 61" (or "7 Open  61 Closed") counts for the current query.
+  const countOf = (word) => {
+    const match = bodyText.match(new RegExp(`\\b${word}\\s*([\\d,]+)(?![\\d,])`)) || bodyText.match(new RegExp(`(?<![\\d,])([\\d,]+)\\s+${word}\\b`));
+    return match ? Number(match[1].replace(/,/g, "")) : null;
+  };
+  const openCount = countOf("Open");
+  const closedCount = countOf("Closed");
+  const query = String(base.searchParams.get("q") || "");
+  const expectedCount = /\b(state:open|is:open)\b/i.test(query) ? openCount
+    : /\b(state:closed|is:closed)\b/i.test(query) ? closedCount
+    : openCount !== null && closedCount !== null ? openCount + closedCount : null;
   return {
     rows,
     nextHref: nextLink ? new URL(nextLink.getAttribute("href"), base).toString() : "",
-    emptyConfirmed: rows.length === 0 && /No results|No (open |closed )?(issues|pull requests)|didn't match any|0 Open|没有结果/i.test(bodyText),
-    totalText: (bodyText.match(/([\d,]+)\s+(Open|results?)\b/i) || [])[0] || ""
+    emptyConfirmed: rows.length === 0 && (expectedCount === 0 || /No results|No (open |closed )?(issues|pull requests)|didn't match any|没有结果/i.test(bodyText)),
+    expectedCount,
+    totalText: openCount !== null ? `Open ${openCount}${closedCount !== null ? ` / Closed ${closedCount}` : ""}` : ""
   };
 }
 

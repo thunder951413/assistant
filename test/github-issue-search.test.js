@@ -92,3 +92,19 @@ test("a single result stays inside its own row", () => {
   const [row] = collectGithubIssueRows("https://github.example.com/o/r/issues?q=x", dom.window.document).rows;
   assert.deepEqual(row.times, ["2026-10-02T00:00:00Z"]);
 });
+
+test("new GitHub list: pinned issues are not results and the Open count is read", () => {
+  const url = "https://github.example.com/o/r/issues?q=is%3Aissue%20state%3Aopen";
+  const dom = new JSDOM(`<body>
+    <div class="PinnedIssues-module__area--x"><ul><li class="PinnedIssues-module__container--y"><a href="/o/r/issues/2247">[Request] QA checklist</a></li></ul></div>
+    <div><a href="#">Open 2</a><a href="#">Closed 61</a></div>
+    <ul><li role="listitem"><h3><a data-testid="issue-pr-title-link" href="/o/r/issues/2653">[CAM test] No signal</a></h3>
+      <a href="/o/r/issues?q=label%3AAML">AML</a><relative-time data-testid="created-at" datetime="2026-10-07T12:51:02.000Z"></relative-time>
+      <div data-testid="list-row-comments" aria-label=" 18 comments;">18</div></li>
+    <li role="listitem"><h3><a data-testid="issue-pr-title-link" href="/o/r/issues/2640">[Sola-F] freeze</a></h3></li></ul></body>`, { url });
+  const result = collectGithubIssueRows(url, dom.window.document);
+  assert.deepEqual(result.rows.map((row) => row.number), ["2653", "2640"]);
+  assert.equal(result.rows[0].commentCount, 18);
+  assert.deepEqual(result.rows[0].labels, ["AML"]);
+  assert.equal(result.expectedCount, 2);
+});

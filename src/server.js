@@ -4861,6 +4861,7 @@ async function fetchGithubIssueSearchWithWebdriver(page, url, adapter, options =
   let emptyConfirmed = false;
   let exhausted = false;
   let totalText = "";
+  let expectedCount = null;
   while (pageIndex <= maxPages) {
     if (pageIndex > 1) {
       await navigateWebdriverPage(page, pageUrl, adapter);
@@ -4874,6 +4875,7 @@ async function fetchGithubIssueSearchWithWebdriver(page, url, adapter, options =
     await page.waitForTimeout(800);
     const collected = await page.evaluate(collectGithubIssueRows, page.url() || pageUrl);
     totalText = totalText || collected.totalText;
+    if (pageIndex === 1) expectedCount = collected.expectedCount ?? null;
     if (pageIndex === 1 && collected.emptyConfirmed) emptyConfirmed = true;
     let added = 0;
     for (const row of collected.rows) {
@@ -4892,7 +4894,9 @@ async function fetchGithubIssueSearchWithWebdriver(page, url, adapter, options =
   }
   const entries = githubIssueRowsToEntries(rows.slice(0, maxItems));
   const title = githubIssueSearchTitle(url);
-  const complete = (exhausted && rows.length <= maxItems) || emptyConfirmed;
+  // The page's own count ("Open 7") must agree before anything can be judged as gone.
+  const countAgrees = expectedCount === null || rows.length >= expectedCount;
+  const complete = (exhausted && rows.length <= maxItems && countAgrees) || emptyConfirmed;
   // Nothing recognized and no explicit "no results": keep the page so the layout can be diagnosed.
   const diagnosticHtml = !rows.length && !emptyConfirmed ? String(await page.content().catch(() => "")).slice(0, 400000) : undefined;
   return {
@@ -4904,7 +4908,7 @@ async function fetchGithubIssueSearchWithWebdriver(page, url, adapter, options =
     fetchMethod: "webdriver",
     entries,
     completeness: complete ? "complete" : "partial",
-    coverage: { observedCount: entries.length, pageCount: pageIndex, totalText },
+    coverage: { observedCount: entries.length, expectedCount, pageCount: pageIndex, totalText },
     // Only a fully observed list may mark earlier items as having left it.
     membershipComplete: complete && (entries.length > 0 || emptyConfirmed)
   };
