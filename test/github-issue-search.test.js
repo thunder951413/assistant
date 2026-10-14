@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { JSDOM } from "jsdom";
-import { buildGithubIssueSearchApiUrl, collectGithubIssueRows, githubIssueRowsToEntries, githubIssueSearchScope, isGithubIssueSearchUrl } from "../src/sources/github-issue-search.js";
+import { buildGithubIssueSearchApiUrls, collectGithubIssueRows, expandGithubSearchQuery, githubIssueRowsToEntries, githubIssueSearchScope, isGithubIssueSearchUrl } from "../src/sources/github-issue-search.js";
 import { diffListMembership, membershipPatch, shouldSkipByListFingerprint } from "../src/list-membership.js";
 
 const SEARCH = "https://github.example.com/VD-SOC-AML/26_T950D5/issues?q=is%3Aissue%20(involves%3A%40me%20OR%20involves%3Ajing-li1)%20state%3Aopen";
@@ -16,8 +16,13 @@ test("recognizes GitHub issue search pages but not single issues", () => {
   const scope = githubIssueSearchScope(SEARCH);
   assert.equal(scope.repository, "VD-SOC-AML/26_T950D5");
   assert.equal(scope.query, "is:issue (involves:@me OR involves:jing-li1) state:open");
-  const api = buildGithubIssueSearchApiUrl(SEARCH, "https://github.example.com");
-  assert.equal(api.searchParams.get("q"), "repo:VD-SOC-AML/26_T950D5 is:issue (involves:@me OR involves:jing-li1) state:open");
+  const apis = buildGithubIssueSearchApiUrls(SEARCH, "https://github.example.com");
+  assert.deepEqual(apis.map((api) => api.searchParams.get("q")), [
+    "repo:VD-SOC-AML/26_T950D5 is:issue involves:@me state:open",
+    "repo:VD-SOC-AML/26_T950D5 is:issue involves:jing-li1 state:open"
+  ]);
+  assert.deepEqual(expandGithubSearchQuery("is:issue (label:a OR label:b) (author:x OR author:y)").length, 4);
+  assert.deepEqual(expandGithubSearchQuery("is:issue label:a"), ["is:issue label:a"]);
 });
 
 test("collects rows from a React-style issue list", () => {

@@ -31,17 +31,42 @@ export function githubIssueSearchScope(url) {
   };
 }
 
-export function buildGithubIssueSearchApiUrl(url, origin, perPage = 100) {
+// The REST search API on GitHub Enterprise does not understand "(a OR b)".
+// Expand each parenthesized OR group into separate queries; results are merged.
+export function expandGithubSearchQuery(query, limit = 8) {
+  let queries = [cleanQuery(query)];
+  for (let guard = 0; guard < 4; guard += 1) {
+    const next = [];
+    let expanded = false;
+    for (const current of queries) {
+      const match = current.match(/\(([^()]*\sOR\s[^()]*)\)/);
+      if (!match) { next.push(current); continue; }
+      expanded = true;
+      for (const option of match[1].split(/\s+OR\s+/)) {
+        next.push(cleanQuery(current.slice(0, match.index) + option.trim() + current.slice(match.index + match[0].length)));
+      }
+    }
+    queries = [...new Set(next)].slice(0, limit);
+    if (!expanded) break;
+  }
+  return queries;
+}
+
+export function buildGithubIssueSearchApiUrls(url, origin, perPage = 100) {
   const scope = githubIssueSearchScope(url);
-  const q = [scope.repository && !/\brepo:/i.test(scope.query) ? `repo:${scope.repository}` : "", scope.query].filter(Boolean).join(" ");
-  const apiUrl = new URL(`${origin}/api/v3/search/issues`);
-  apiUrl.searchParams.set("q", q);
-  apiUrl.searchParams.set("per_page", String(Math.max(1, Math.min(100, Number(perPage) || 100))));
-  apiUrl.searchParams.set("sort", "updated");
-  apiUrl.searchParams.set("order", "desc");
-  // Needed for parentheses / OR on newer GitHub; ignored by servers without it.
-  apiUrl.searchParams.set("advanced_search", "true");
-  return apiUrl;
+  return expandGithubSearchQuery(scope.query).map((query) => {
+    const q = [scope.repository && !/\brepo:/i.test(query) ? `repo:${scope.repository}` : "", query].filter(Boolean).join(" ");
+    const apiUrl = new URL(`${origin}/api/v3/search/issues`);
+    apiUrl.searchParams.set("q", q);
+    apiUrl.searchParams.set("per_page", String(Math.max(1, Math.min(100, Number(perPage) || 100))));
+    apiUrl.searchParams.set("sort", "updated");
+    apiUrl.searchParams.set("order", "desc");
+    return apiUrl;
+  });
+}
+
+export function buildGithubIssueSearchApiUrl(url, origin, perPage = 100) {
+  return buildGithubIssueSearchApiUrls(url, origin, perPage)[0];
 }
 
 export function githubIssueSearchPageUrl(url, page) {

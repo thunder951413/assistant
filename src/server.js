@@ -41,7 +41,7 @@ import { classifyItemLocally, classifyItemsLocally, cleanGeneratedTitle, normali
 import { assertFetchedPageIsAuthenticated, confluenceHtmlToMarkdown, detectAuthenticationPage, extractContentLinksFromList, extractContentPage, extractFilterId, extractJiraIssues, extractListPage, extractTitle, htmlToText, inferTitle, looksLikeHtml } from "./sources/html-extractors.js";
 import { activateTeamsChatArea, clickTeamsConversationById, clickTeamsConversationCandidate, closeTeamsChatListFilter, currentTeamsConversationTitle, extractTeamsConversationId, extractTeamsDeepPath, extractTeamsFromPage, filterTeamsChatList, isTeamsWebAppReady, openTeamsConversationFromUi, renderTeamsTextFromComments, scrollTeamsMessages, teamsConversationTitleForJob, validateTeamsExtraction, waitForTeamsConversation, waitForTeamsConversationTitle, waitForTeamsReady } from "./sources/teams-page.js";
 import { clickGithubLoadMore, githubPageGrowthSnapshot } from "./sources/github-page.js";
-import { buildGithubIssueSearchApiUrl, collectGithubIssueRows, githubIssueRowsToEntries, githubIssueSearchPageUrl, githubIssueSearchTitle, isGithubIssueSearchUrl, renderGithubIssueSearchText } from "./sources/github-issue-search.js";
+import { buildGithubIssueSearchApiUrls, collectGithubIssueRows, githubIssueRowsToEntries, githubIssueSearchPageUrl, githubIssueSearchTitle, isGithubIssueSearchUrl, renderGithubIssueSearchText } from "./sources/github-issue-search.js";
 import { MEMBERSHIP_KEPT, MEMBERSHIP_LEFT, MEMBERSHIP_MEMBER, diffListMembership, membershipPatch, shouldSkipByListFingerprint } from "./list-membership.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1604,8 +1604,13 @@ function adapterPrefersWebdriver(adapter) {
   return adapter.sourceType === "jira" || adapter.sourceType === "teams";
 }
 
+function hasGithubToken(adapter) {
+  return adapter.sourceType === "github" && Boolean(settings.sources?.[adapter.hostname]?.token);
+}
+
 function requiresWebdriverExpansion(adapter) {
-  return adapter.sourceType === "github" && adapter.hostname === "github.ecodesamsung.com";
+  // With a token the REST API returns the full issue and comments; no page needed.
+  return adapter.sourceType === "github" && adapter.hostname === "github.ecodesamsung.com" && !hasGithubToken(adapter);
 }
 
 async function importLinkedItemsFromList(input) {
@@ -4230,7 +4235,8 @@ async function readExistingGithubComments(url, adapter = detectSourceAdapter(url
 function resolvedRefreshFetchMode(job, adapter) {
   if (adapter.sourceType === "teams" && hasTeamsGraphCredentials(adapter)) return "fetch";
   // Issue search pages render client-side; only a token can use the search API instead.
-  if (adapter.sourceType === "github" && isGithubIssueSearchUrl(job.url || "")) return settings.sources?.[adapter.hostname]?.token ? "fetch" : "webdriver";
+  if (adapter.sourceType === "github" && hasGithubToken(adapter)) return "fetch";
+  if (adapter.sourceType === "github" && isGithubIssueSearchUrl(job.url || "")) return "webdriver";
   if (requiresWebdriverExpansion(adapter)) return "webdriver";
   if (
     adapter.sourceType === "github"
@@ -4394,6 +4400,8 @@ async function fetchUrl(url, options = {}) {
       if (apiResult) return apiResult;
     } catch (error) {
       if (options.signal?.aborted || error?.name === "AbortError") throw error;
+      // With a GitHub token the API is the capture path; a page fetch would only return the app shell.
+      if (hasGithubToken(adapter)) throw new Error(`GitHub 接口请求失败（请检查令牌是否有效、是否有 repo 读取权限）：${error.message || error}`);
       console.warn(`Source API fallback for ${url}:`, error.message || error);
     }
   }
@@ -4689,8 +4697,19 @@ async function fetchGithubFromApi(url, adapter, options = {}) {
   if (!profile.token && profile.authMode !== "basic") return null;
   const origin = `https://${adapter.hostname}`;
   if (isGithubIssueSearchUrl(url)) {
-    const apiUrl = buildGithubIssueSearchApiUrl(url, origin, options.maxItems || 100);
-    const result = await requestSourceJson(apiUrl, adapter, options);
+    // One request per OR alternative; merge by issue URL, newest update first.
+    const byUrl = new Map();
+    let incomplete = false;
+    const raws = [];
+    for (const apiUrl of buildGithubIssueSearchApiUrls(url, origin, options.maxItems || 100)) {
+      const part = await requestSourceJson(apiUrl, adapter, options);
+      raws.push(part.data || {});
+      const partItems = part.data?.items || [];
+      if (part.data?.incomplete_results || Number(part.data?.total_count ?? partItems.length) > partItems.length) incomplete = true;
+      for (const issue of partItems) byUrl.set(String(issue.html_url || ""), issue);
+    }
+    const merged = [...byUrl.values()].sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
+    const result = { data: { items: merged, total_count: merged.length, incomplete_results: incomplete } };
     const entries = githubIssueRowsToEntries((result.data?.items || []).map((issue) => ({
       href: cleanText(issue.html_url || ""),
       repository: cleanText(String(issue.repository_url || "").split("/repos/")[1] || ""),
@@ -4704,7 +4723,7 @@ async function fetchGithubFromApi(url, adapter, options = {}) {
     const total = Number(result.data?.total_count ?? entries.length);
     const title = githubIssueSearchTitle(url);
     return {
-      raw: JSON.stringify(result.data || {}, null, 2), title, text: renderGithubIssueSearchText(title, url, `${adapter.id}-api`, entries), comments: [],
+      raw: JSON.stringify(raws, null, 2), title, text: renderGithubIssueSearchText(title, url, `${adapter.id}-api`, entries), comments: [],
       url, fetchMethod: "github-rest", entries,
       completeness: total > entries.length || result.data?.incomplete_results ? "partial" : "complete",
       coverage: { observedCount: entries.length, expectedCount: total },
