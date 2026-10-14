@@ -41,8 +41,6 @@ import { classifyItemLocally, classifyItemsLocally, cleanGeneratedTitle, normali
 import { assertFetchedPageIsAuthenticated, confluenceHtmlToMarkdown, detectAuthenticationPage, extractContentLinksFromList, extractContentPage, extractFilterId, extractJiraIssues, extractListPage, extractTitle, htmlToText, inferTitle, looksLikeHtml } from "./sources/html-extractors.js";
 import { activateTeamsChatArea, clickTeamsConversationById, clickTeamsConversationCandidate, closeTeamsChatListFilter, currentTeamsConversationTitle, extractTeamsConversationId, extractTeamsDeepPath, extractTeamsFromPage, filterTeamsChatList, isTeamsWebAppReady, openTeamsConversationFromUi, renderTeamsTextFromComments, scrollTeamsMessages, teamsConversationTitleForJob, validateTeamsExtraction, waitForTeamsConversation, waitForTeamsConversationTitle, waitForTeamsReady } from "./sources/teams-page.js";
 import { clickGithubLoadMore, githubPageGrowthSnapshot } from "./sources/github-page.js";
-import { buildGithubIssueSearchApiUrl, collectGithubIssueRows, githubIssueRowsToEntries, githubIssueSearchPageUrl, githubIssueSearchTitle, isGithubIssueSearchUrl, renderGithubIssueSearchText } from "./sources/github-issue-search.js";
-import { MEMBERSHIP_KEPT, MEMBERSHIP_LEFT, MEMBERSHIP_MEMBER, diffListMembership, membershipPatch, shouldSkipByListFingerprint } from "./list-membership.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const APP_VERSION = (() => {
@@ -80,7 +78,6 @@ const refreshHistory = createRunHistory(path.join(configDir, "runtime", "refresh
 
 const FETCH_TIMEOUT_MS = 45 * 1000;
 const REFRESH_JOB_TIMEOUT_MS = 4 * 60 * 1000;
-const LIST_REFRESH_JOB_TIMEOUT_MS = 12 * 60 * 1000;
 // Teams may need extra scrolling to close a gap since the previous capture.
 const TEAMS_REFRESH_JOB_TIMEOUT_MS = 7 * 60 * 1000;
 const TEAMS_GAP_SCROLL_DEADLINE_MS = 3 * 60 * 1000;
@@ -192,13 +189,6 @@ api.post("/api/items/:id/process", async ({ req, params, res }) => {
   const body = await readBody(req).catch(() => ({}));
   const item = await processItemWithAi(params.id, { full: Boolean(body?.full) });
   sendJson(res, 200, { item });
-});
-
-api.post("/api/list-membership/resolve", async ({ req, res }) => {
-  const body = await readBody(req);
-  const ids = Array.isArray(body.itemIds) ? body.itemIds.map(String) : [];
-  const resolved = await resolveLeftListItems({ itemIds: ids, action: body.action });
-  sendJson(res, 200, { ok: true, resolved });
 });
 
 api.post("/api/items/:id/ack-update", async ({ params, res }) => {
@@ -877,7 +867,7 @@ function previewRefreshJob(url, options = {}) {
     url: canonicalUrl,
     enabled: false,
     intervalMinutes: 60,
-    maxItems: isList ? (isGithubIssueSearchUrl(canonicalUrl) ? 100 : 50) : 1,
+    maxItems: isList ? 50 : 1,
     managedBy: options.managedBy || (isList ? "" : "content-page"),
     fetchMode: defaultRefreshFetchModeForAdapter(adapter, options.fetchMode),
     pageKind,
@@ -1330,7 +1320,7 @@ async function ensureRefreshJobForListUrl(url, options = {}) {
     url: canonicalUrl,
     enabled: false,
     intervalMinutes: 60,
-    maxItems: isGithubIssueSearchUrl(canonicalUrl) ? 100 : 50,
+    maxItems: 50,
     tags: defaultRefreshTagsForListUrl(canonicalUrl, adapter),
     fetchMode: defaultRefreshFetchModeForAdapter(adapter, options.fetchMode),
     pageKind: "list",
@@ -1527,9 +1517,6 @@ function defaultRefreshJobIdForListUrl(url, adapter) {
       const query = parsed.searchParams.get("query") || "all";
       return `${slugify(adapter.hostname)}-notifications-${slugify(query.replace(/^reason:/i, ""))}`;
     }
-    if (adapter.sourceType === "github" && isGithubIssueSearchUrl(url)) {
-      return `${slugify(adapter.hostname)}-search-${createHash("sha1").update(url).digest("hex").slice(0, 10)}`;
-    }
   } catch {
     // Fall through to a URL-based id.
   }
@@ -1540,7 +1527,6 @@ function defaultRefreshJobNameForListUrl(url, title) {
   if (title && title !== url) return `${title} refresh`;
   const adapter = detectSourceAdapter(url);
   if (adapter.sourceType === "github" && safePathname(url) === "/notifications") return "GitHub notifications";
-  if (adapter.sourceType === "github" && isGithubIssueSearchUrl(url)) return githubIssueSearchTitle(url);
   if (adapter.sourceType === "jira") return "Jira filter";
   return "List refresh";
 }
@@ -1583,8 +1569,18 @@ async function importLinkedItemsFromList(input) {
     ? "webdriver"
     : input.fetchMode === "webdriver" ? "webdriver" : input.fetchMode === "fetch" ? "fetch" : resolvedRefreshFetchMode({}, adapter);
 
+  // Leave headroom under the job timeout: whatever does not fit is picked up by the next run
+  // (unchanged items are skipped by updated time), instead of failing the whole list.
+  const childBudgetMs = (adapter.sourceType === "teams" ? TEAMS_REFRESH_JOB_TIMEOUT_MS : REFRESH_JOB_TIMEOUT_MS) - 45 * 1000;
+  const childStartedAt = Date.now();
+  let deferredCount = 0;
   for (const link of links) {
     const contentUrl = normalizeContentFetchUrl(link.href, adapter);
+    if (Date.now() - childStartedAt > childBudgetMs) {
+      deferredCount += 1;
+      skippedItems.push({ key: link.key || link.number || "", url: contentUrl, reason: "deferred-time-budget" });
+      continue;
+    }
     try {
       const listUpdatedAt = cleanText(link.updatedAt || link.updated || "");
       const fetched = fetchMode === "webdriver"
@@ -3627,20 +3623,12 @@ async function runRefreshJob(job, options = {}) {
   }
 }
 
-function refreshJobTimeoutMs(job) {
-  const adapter = detectSourceAdapter(job.url || "");
-  if (adapter.sourceType === "teams") return TEAMS_REFRESH_JOB_TIMEOUT_MS;
-  // List jobs open one page per changed child; give them room, and they stop early on their own.
-  if (job.pageKind === "list" || inferPageKind(job.url || "", adapter) === "list") return LIST_REFRESH_JOB_TIMEOUT_MS;
-  return REFRESH_JOB_TIMEOUT_MS;
-}
-
 async function withRefreshJobTimeout(job, run, task) {
   let timer;
   let timedOut = false;
   const controller = new AbortController();
   if (run) run.abortController = controller;
-  const timeoutMs = refreshJobTimeoutMs(job);
+  const timeoutMs = detectSourceAdapter(job.url || "").sourceType === "teams" ? TEAMS_REFRESH_JOB_TIMEOUT_MS : REFRESH_JOB_TIMEOUT_MS;
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(async () => {
       timedOut = true;
@@ -3787,15 +3775,12 @@ async function refreshListJob(job, refreshContext = null) {
 
   // Leave headroom under the job timeout: whatever does not fit is picked up by the next run
   // (unchanged items are skipped by updated time), instead of failing the whole list.
-  const childBudgetMs = refreshJobTimeoutMs(job) - 45 * 1000;
+  const childBudgetMs = (adapter.sourceType === "teams" ? TEAMS_REFRESH_JOB_TIMEOUT_MS : REFRESH_JOB_TIMEOUT_MS) - 45 * 1000;
   const childStartedAt = Date.now();
   let deferredCount = 0;
-  let slowestChildMs = 0;
-  const trackMembership = listFetched.membershipComplete !== undefined;
   for (const link of links) {
     const contentUrl = normalizeContentFetchUrl(link.href, adapter);
-    // Stop before a child that would likely overrun the job timeout.
-    if (Date.now() - childStartedAt + slowestChildMs > childBudgetMs) {
+    if (Date.now() - childStartedAt > childBudgetMs) {
       deferredCount += 1;
       skippedItems.push({ key: link.key || link.number || "", url: contentUrl, reason: "deferred-time-budget" });
       continue;
@@ -3803,10 +3788,6 @@ async function refreshListJob(job, refreshContext = null) {
     try {
       const existing = await findItemByUrl(contentUrl);
       const listUpdatedAt = cleanText(link.updatedAt || link.updated || "");
-      if (shouldSkipByListFingerprint(existing, link.fingerprint)) {
-        skippedItems.push({ key: link.key || "", itemId: existing.id, url: existing.url, reason: "unchanged-list-row" });
-        continue;
-      }
       if (shouldSkipContentRefresh(existing, listUpdatedAt, adapter)) {
         skippedItems.push({
           key: link.key || link.number || "",
@@ -3817,10 +3798,8 @@ async function refreshListJob(job, refreshContext = null) {
         });
         continue;
       }
-      const childStarted = Date.now();
       const contentFetched = await fetchForRefreshJob(contentUrl, { ...job, pageKind: "content" }, adapter, refreshContext);
       assertRefreshActive(refreshContext);
-      slowestChildMs = Math.max(slowestChildMs, Date.now() - childStarted);
       const contentItem = await upsertFetchedItem({
         title: contentFetched.title || link.title || link.key || contentUrl,
         sourceType: adapter.sourceType,
@@ -3838,13 +3817,6 @@ async function refreshListJob(job, refreshContext = null) {
         parentUrl: listUrl,
         deferIndex: true
       });
-      if (link.fingerprint || trackMembership) {
-        await store.writeMetadata(contentItem.metadata.id, {
-          ...contentItem.metadata,
-          ...(link.fingerprint ? { listFingerprint: link.fingerprint } : {}),
-          ...(trackMembership ? { listMembership: membershipPatch(MEMBERSHIP_MEMBER, listUrl) } : {})
-        });
-      }
       const contentResult = {
         key: link.key || link.number || "",
         title: contentItem.metadata.title,
@@ -3866,17 +3838,11 @@ async function refreshListJob(job, refreshContext = null) {
     }
   }
 
-  const membership = trackMembership
-    ? await updateListMembership(listUrl, listCapture, Boolean(listFetched.membershipComplete) && !listCapture.coverage.truncatedByLimit, adapter)
-    : { left: [], returned: [] };
   await rebuildIndexes();
   return {
     id: job.id,
     sourceType: adapter.sourceType,
     listItemId: listItem.metadata.id,
-    leftItemCount: membership.left.length,
-    leftItems: membership.left.map((item) => ({ itemId: item.id, title: item.title, url: item.url })),
-    returnedItemCount: membership.returned.length,
     listUrl,
     linkCount: links.length,
     updatedItemCount: updatedItems.length,
@@ -3889,45 +3855,6 @@ async function refreshListJob(job, refreshContext = null) {
     completeness: deferredCount ? "partial" : listCapture.completeness,
     coverage: listCapture.coverage
   };
-}
-
-async function listChildItems(listUrl) {
-  const key = normalizeUrlForMatch(listUrl);
-  return store.list({ predicate: (metadata) => metadata.pageKind !== "list" && normalizeUrlForMatch(metadata.parentUrl || "") === key });
-}
-
-async function updateListMembership(listUrl, listCapture, complete, adapter) {
-  const currentKeys = new Set((listCapture.links || []).map((link) => normalizeUrlForMatch(normalizeContentFetchUrl(link.href, adapter))));
-  const children = await listChildItems(listUrl);
-  const diff = diffListMembership({ children, currentKeys, complete, normalize: normalizeUrlForMatch });
-  const now = new Date().toISOString();
-  for (const child of diff.left) await patchItemMetadata(child.id, (metadata) => ({ listMembership: membershipPatch(MEMBERSHIP_LEFT, listUrl, now, metadata.listMembership) }));
-  for (const child of diff.returned) await patchItemMetadata(child.id, () => ({ listMembership: membershipPatch(MEMBERSHIP_MEMBER, listUrl, now) }));
-  return diff;
-}
-
-async function patchItemMetadata(id, buildPatch) {
-  const existing = await readItem(id);
-  return withItemUrlMutationLock(existing.metadata.url || "", async () => {
-    const fresh = await readItem(id);
-    await store.writeMetadata(id, { ...fresh.metadata, ...(buildPatch(fresh.metadata) || {}) });
-  });
-}
-
-// The person decides what happens to items that dropped out of a filtered list.
-async function resolveLeftListItems({ itemIds = [], action }) {
-  if (!["keep", "delete"].includes(action)) throw new Error("action 需要是 keep 或 delete。");
-  const resolved = [];
-  for (const id of itemIds) {
-    const item = await readItem(id);
-    const status = item.metadata.listMembership?.status;
-    if (status !== MEMBERSHIP_LEFT && status !== MEMBERSHIP_KEPT) continue;
-    if (action === "delete") await deleteItem(id);
-    else await patchItemMetadata(id, (metadata) => ({ listMembership: membershipPatch(MEMBERSHIP_KEPT, metadata.listMembership?.listUrl || metadata.parentUrl || "", new Date().toISOString(), metadata.listMembership) }));
-    resolved.push(id);
-  }
-  await rebuildIndexes();
-  return resolved;
 }
 
 async function refreshContentJob(job, refreshContext = null) {
@@ -4121,7 +4048,6 @@ async function fetchUrlWithWebdriverForRefresh(url, job, adapter = detectSourceA
     run: refreshContext?.run || null,
     teamsConversationTitle: adapter.sourceType === "teams" ? teamsConversationTitleForJob(job) : "",
     maxGithubExpansionPasses: resolvePageKind(url, job.pageKind || "auto") === "content" ? 12 : 0,
-    maxItems: job.maxItems,
     existingGithubComments
   };
   try {
@@ -4194,8 +4120,6 @@ async function readExistingGithubComments(url, adapter = detectSourceAdapter(url
 
 function resolvedRefreshFetchMode(job, adapter) {
   if (adapter.sourceType === "teams" && hasTeamsGraphCredentials(adapter)) return "fetch";
-  // Issue search pages render client-side; only a token can use the search API instead.
-  if (adapter.sourceType === "github" && isGithubIssueSearchUrl(job.url || "")) return settings.sources?.[adapter.hostname]?.token ? "fetch" : "webdriver";
   if (requiresWebdriverExpansion(adapter)) return "webdriver";
   if (
     adapter.sourceType === "github"
@@ -4651,31 +4575,8 @@ async function fetchConfluenceFromApi(url, adapter, options = {}) {
 
 async function fetchGithubFromApi(url, adapter, options = {}) {
   const profile = settings.sources?.[adapter.hostname] || {};
-  if (!profile.token && profile.authMode !== "basic") return null;
+  if (!profile.token && profile.authMode !== "cookie" && profile.authMode !== "basic") return null;
   const origin = `https://${adapter.hostname}`;
-  if (isGithubIssueSearchUrl(url)) {
-    const apiUrl = buildGithubIssueSearchApiUrl(url, origin, options.maxItems || 100);
-    const result = await requestSourceJson(apiUrl, adapter, options);
-    const entries = githubIssueRowsToEntries((result.data?.items || []).map((issue) => ({
-      href: cleanText(issue.html_url || ""),
-      repository: cleanText(String(issue.repository_url || "").split("/repos/")[1] || ""),
-      number: String(issue.number || ""),
-      title: cleanText(issue.title || ""),
-      times: [cleanText(issue.updated_at || "")].filter(Boolean),
-      updatedAt: cleanText(issue.updated_at || ""),
-      commentCount: Number(issue.comments ?? 0),
-      labels: (issue.labels || []).map((label) => cleanText(label.name || "")).filter(Boolean)
-    })));
-    const total = Number(result.data?.total_count ?? entries.length);
-    const title = githubIssueSearchTitle(url);
-    return {
-      raw: JSON.stringify(result.data || {}, null, 2), title, text: renderGithubIssueSearchText(title, url, `${adapter.id}-api`, entries), comments: [],
-      url, fetchMethod: "github-rest", entries,
-      completeness: total > entries.length || result.data?.incomplete_results ? "partial" : "complete",
-      coverage: { observedCount: entries.length, expectedCount: total },
-      membershipComplete: total <= entries.length && !result.data?.incomplete_results
-    };
-  }
   if (safePathname(url) === "/notifications") {
     const parsed = new URL(url);
     const apiUrl = new URL(`${origin}/api/v3/notifications`);
@@ -4811,9 +4712,6 @@ async function fetchUrlWithWebdriverInSession(url, options = {}) {
       await navigateWebdriverPage(page, navigationUrl, adapter);
     }
     await ensureWebdriverPageAuthenticated(page, navigationUrl, adapter);
-    if (adapter.sourceType === "github" && isGithubIssueSearchUrl(url)) {
-      return await fetchGithubIssueSearchWithWebdriver(page, url, adapter, options);
-    }
     await waitForJiraIssueNavigator(page, adapter, options.pageKind || "auto");
     await expandGithubDynamicContent(page, adapter, options.pageKind || "auto", {
       maxPasses: options.maxGithubExpansionPasses,
@@ -4849,69 +4747,6 @@ async function fetchUrlWithWebdriverInSession(url, options = {}) {
       fetchMethod: "webdriver"
     };
   } finally {}
-}
-
-async function fetchGithubIssueSearchWithWebdriver(page, url, adapter, options = {}) {
-  const maxItems = Math.max(1, Number(options.maxItems) || 100);
-  const maxPages = Math.min(10, Math.ceil(maxItems / 25) + 1);
-  const rows = [];
-  const seen = new Set();
-  let pageUrl = url;
-  let pageIndex = 1;
-  let emptyConfirmed = false;
-  let exhausted = false;
-  let totalText = "";
-  let expectedCount = null;
-  while (pageIndex <= maxPages) {
-    if (pageIndex > 1) {
-      await navigateWebdriverPage(page, pageUrl, adapter);
-      await ensureWebdriverPageAuthenticated(page, pageUrl, adapter);
-    }
-    await page.waitForFunction(() => {
-      const text = document.body?.innerText || "";
-      return Boolean(document.querySelector("a[href*='/issues/'], a[href*='/pull/']"))
-        || /No results|No (open |closed )?(issues|pull requests)|didn't match any|没有结果/i.test(text);
-    }, null, { timeout: 30000 }).catch(() => {});
-    await page.waitForTimeout(800);
-    const collected = await page.evaluate(collectGithubIssueRows, page.url() || pageUrl);
-    totalText = totalText || collected.totalText;
-    if (pageIndex === 1) expectedCount = collected.expectedCount ?? null;
-    if (pageIndex === 1 && collected.emptyConfirmed) emptyConfirmed = true;
-    let added = 0;
-    for (const row of collected.rows) {
-      const key = row.href.toLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-      rows.push(row);
-      added += 1;
-    }
-    if (rows.length >= maxItems) break;
-    // Follow the page's own "next" link; otherwise try ?page=N while it keeps yielding new rows.
-    const next = collected.nextHref || (added > 0 && collected.rows.length >= 20 ? githubIssueSearchPageUrl(url, pageIndex + 1) : "");
-    if (!next || added === 0) { exhausted = true; break; }
-    pageUrl = next;
-    pageIndex += 1;
-  }
-  const entries = githubIssueRowsToEntries(rows.slice(0, maxItems));
-  const title = githubIssueSearchTitle(url);
-  // The page's own count ("Open 7") must agree before anything can be judged as gone.
-  const countAgrees = expectedCount === null || rows.length >= expectedCount;
-  const complete = (exhausted && rows.length <= maxItems && countAgrees) || emptyConfirmed;
-  // Nothing recognized and no explicit "no results": keep the page so the layout can be diagnosed.
-  const diagnosticHtml = !rows.length && !emptyConfirmed ? String(await page.content().catch(() => "")).slice(0, 400000) : undefined;
-  return {
-    raw: JSON.stringify({ url, pages: pageIndex, totalText, rows, diagnosticHtml }, null, 2),
-    title,
-    text: renderGithubIssueSearchText(title, url, adapter.id, entries, totalText ? `Count: ${totalText}` : ""),
-    comments: [],
-    url,
-    fetchMethod: "webdriver",
-    entries,
-    completeness: complete ? "complete" : "partial",
-    coverage: { observedCount: entries.length, expectedCount, pageCount: pageIndex, totalText },
-    // Only a fully observed list may mark earlier items as having left it.
-    membershipComplete: complete && (entries.length > 0 || emptyConfirmed)
-  };
 }
 
 function isAuthenticationRequiredError(error) {
@@ -5461,7 +5296,6 @@ function isKnownListUrl(url, adapter = detectSourceAdapter(url)) {
   const search = safeSearch(url);
   if (adapter.sourceType === "jira" && (pathname === "/issues/" || pathname === "/issues") && /[?&]filter=\d+/i.test(search)) return true;
   if (adapter.sourceType === "github" && pathname === "/notifications") return true;
-  if (adapter.sourceType === "github" && isGithubIssueSearchUrl(url)) return true;
   return false;
 }
 
