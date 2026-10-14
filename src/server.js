@@ -1279,8 +1279,13 @@ async function withItemUrlMutationLock(url, task) {
 }
 
 function shouldSkipContentRefresh(existingMetadata, listUpdatedAt, adapter = detectSourceAdapter(existingMetadata?.url || "")) {
-  if (adapter.sourceType === "github") return false;
   if (!existingMetadata || !listUpdatedAt || !existingMetadata.sourceUpdatedAt) return false;
+  if (adapter.sourceType === "github") {
+    // GitHub HTML lists only give relative times ("2 days ago"); trust exact API timestamps only.
+    const isoPattern = /^\d{4}-\d{2}-\d{2}T/;
+    if (!isoPattern.test(listUpdatedAt) || !isoPattern.test(existingMetadata.sourceUpdatedAt)) return false;
+    return Date.parse(existingMetadata.sourceUpdatedAt) >= Date.parse(listUpdatedAt);
+  }
   if (isSameRelativeSourceDay(existingMetadata.sourceUpdatedAt, existingMetadata.lastFetchedAt, listUpdatedAt)) return true;
   const existingTime = parseSourceUpdatedAt(existingMetadata.sourceUpdatedAt, existingMetadata.lastFetchedAt);
   const listTime = Date.parse(listUpdatedAt);
@@ -1564,8 +1569,18 @@ async function importLinkedItemsFromList(input) {
     ? "webdriver"
     : input.fetchMode === "webdriver" ? "webdriver" : input.fetchMode === "fetch" ? "fetch" : resolvedRefreshFetchMode({}, adapter);
 
+  // Leave headroom under the job timeout: whatever does not fit is picked up by the next run
+  // (unchanged items are skipped by updated time), instead of failing the whole list.
+  const childBudgetMs = (adapter.sourceType === "teams" ? TEAMS_REFRESH_JOB_TIMEOUT_MS : REFRESH_JOB_TIMEOUT_MS) - 45 * 1000;
+  const childStartedAt = Date.now();
+  let deferredCount = 0;
   for (const link of links) {
     const contentUrl = normalizeContentFetchUrl(link.href, adapter);
+    if (Date.now() - childStartedAt > childBudgetMs) {
+      deferredCount += 1;
+      skippedItems.push({ key: link.key || link.number || "", url: contentUrl, reason: "deferred-time-budget" });
+      continue;
+    }
     try {
       const listUpdatedAt = cleanText(link.updatedAt || link.updated || "");
       const fetched = fetchMode === "webdriver"
@@ -3758,8 +3773,18 @@ async function refreshListJob(job, refreshContext = null) {
   const skippedItems = [];
   const errors = [];
 
+  // Leave headroom under the job timeout: whatever does not fit is picked up by the next run
+  // (unchanged items are skipped by updated time), instead of failing the whole list.
+  const childBudgetMs = (adapter.sourceType === "teams" ? TEAMS_REFRESH_JOB_TIMEOUT_MS : REFRESH_JOB_TIMEOUT_MS) - 45 * 1000;
+  const childStartedAt = Date.now();
+  let deferredCount = 0;
   for (const link of links) {
     const contentUrl = normalizeContentFetchUrl(link.href, adapter);
+    if (Date.now() - childStartedAt > childBudgetMs) {
+      deferredCount += 1;
+      skippedItems.push({ key: link.key || link.number || "", url: contentUrl, reason: "deferred-time-budget" });
+      continue;
+    }
     try {
       const existing = await findItemByUrl(contentUrl);
       const listUpdatedAt = cleanText(link.updatedAt || link.updated || "");
@@ -3822,11 +3847,12 @@ async function refreshListJob(job, refreshContext = null) {
     linkCount: links.length,
     updatedItemCount: updatedItems.length,
     skippedItemCount: skippedItems.length,
+    deferredItemCount: deferredCount,
     errorCount: errors.length,
     updatedItems,
     skippedItems,
     errors,
-    completeness: listCapture.completeness,
+    completeness: deferredCount ? "partial" : listCapture.completeness,
     coverage: listCapture.coverage
   };
 }
@@ -4566,7 +4592,8 @@ async function fetchGithubFromApi(url, adapter, options = {}) {
     if (result.notModified) {
       return { notModified: true, url, fetchMethod: "github-rest-304", httpValidators: options.validators || {} };
     }
-    const notifications = (result.data || []).map((item) => ({
+    const reasonFilter = (parsed.searchParams.get("query") || "").match(/reason:([\w-]+)/i)?.[1]?.toLowerCase() || "";
+    const notifications = (result.data || []).filter((item) => !reasonFilter || String(item.reason || "").toLowerCase() === reasonFilter).map((item) => ({
       id: String(item.id || ""), title: cleanText(item.subject?.title || ""), href: cleanText(item.subject?.url || "").replace(`${origin}/api/v3/repos/`, `${origin}/`).replace(/\/(issues|pulls)\/(\d+)$/, "/$1/$2").replace("/pulls/", "/pull/"),
       repository: cleanText(item.repository?.full_name || ""), updatedAt: cleanText(item.updated_at || ""), status: item.unread ? "unread" : "read"
     }));
