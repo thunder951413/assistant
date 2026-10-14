@@ -12,7 +12,7 @@ export function parseTimeOfDay(value, fallback) {
 }
 
 export function normalizeWebdriverWindowMode(value) {
-  return ["normal", "compact", "minimized"].includes(value) ? value : "compact";
+  return ["normal", "compact", "minimized", "background"].includes(value) ? value : "compact";
 }
 
 export function defaultDoNotDisturbSettings() {

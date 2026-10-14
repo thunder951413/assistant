@@ -37,7 +37,7 @@ import { defaultDoNotDisturbSettings, defaultNotificationSettings, defaultProces
 import { buildKnowledgeContext, buildLocalKnowledgeAnswer, buildOpenAIContext, buildVectorKnowledgeContext, chunkMaterialForEmbedding, cosineSimilarity, diversifyKnowledgeResults, mergeKnowledgeResults, parseOpenAIStreamPayloads, scoreKnowledgeMatch, toPublicKnowledgeSource, tokenizeQuery } from "./retrieval.js";
 import { classifyItemLocally, classifyItemsLocally, cleanGeneratedTitle, normalizeBatchTagRecommendations, normalizeClassificationCategories, normalizeItemClassification, normalizeRecommendedTags, normalizeSingleClassification, parseJsonObjectFromText, parseTagsFromAiText, recommendBatchTagsLocally, recommendTagsLocally, recommendTitleLocally } from "./ai-local.js";
 import { assertFetchedPageIsAuthenticated, confluenceHtmlToMarkdown, detectAuthenticationPage, extractContentLinksFromList, extractContentPage, extractFilterId, extractJiraIssues, extractListPage, extractTitle, htmlToText, inferTitle, looksLikeHtml } from "./sources/html-extractors.js";
-import { activateTeamsChatArea, clickTeamsConversationById, clickTeamsConversationCandidate, closeTeamsChatListFilter, currentTeamsConversationTitle, extractTeamsConversationId, extractTeamsDeepPath, extractTeamsFromPage, filterTeamsChatList, isTeamsWebAppReady, renderTeamsTextFromComments, scrollTeamsMessages, teamsConversationTitleForJob, validateTeamsExtraction, waitForTeamsConversation, waitForTeamsConversationTitle } from "./sources/teams-page.js";
+import { activateTeamsChatArea, clickTeamsConversationById, clickTeamsConversationCandidate, closeTeamsChatListFilter, currentTeamsConversationTitle, extractTeamsConversationId, extractTeamsDeepPath, extractTeamsFromPage, filterTeamsChatList, isTeamsWebAppReady, openTeamsConversationFromUi, renderTeamsTextFromComments, scrollTeamsMessages, teamsConversationTitleForJob, validateTeamsExtraction, waitForTeamsConversation, waitForTeamsConversationTitle, waitForTeamsReady } from "./sources/teams-page.js";
 import { clickGithubLoadMore, githubPageGrowthSnapshot } from "./sources/github-page.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -76,6 +76,9 @@ const refreshHistory = createRunHistory(path.join(configDir, "runtime", "refresh
 
 const FETCH_TIMEOUT_MS = 45 * 1000;
 const REFRESH_JOB_TIMEOUT_MS = 4 * 60 * 1000;
+// Teams may need extra scrolling to close a gap since the previous capture.
+const TEAMS_REFRESH_JOB_TIMEOUT_MS = 7 * 60 * 1000;
+const TEAMS_GAP_SCROLL_DEADLINE_MS = 3 * 60 * 1000;
 const REFRESH_RUN_RETENTION_MS = 6 * 60 * 60 * 1000;
 const TEAMS_LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const SNAPSHOT_RETENTION_COUNT = 20;
@@ -3110,7 +3113,7 @@ async function createRefreshGroupContext(group, run = null) {
     autoClose: false,
     headed: group.sourceType === "teams",
     manual: group.sourceType === "teams",
-    windowMode: group.sourceType === "teams" || group.sourceType === "jira" ? "normal" : undefined
+    windowMode: group.sourceType === "teams" ? "background" : group.sourceType === "jira" ? "normal" : undefined
   });
   const page = await ensureSessionPage(session);
   session.page = page;
@@ -3122,13 +3125,6 @@ async function createRefreshGroupContext(group, run = null) {
     webdriverPage: page,
     closeWhenDone: group.sourceType === "teams" ? false : !session.manual
   };
-  if (group.sourceType === "teams") {
-    session.teamsUserConfirmedAt = "";
-    if (run) {
-      run.teamsReadyConfirmed = false;
-      run.teamsReadyConfirmedAt = "";
-    }
-  }
   if (run) updateRefreshRun(run, { refreshContext });
 
   if (group.sourceType === "teams") {
@@ -3269,45 +3265,102 @@ function jiraLoginUrl(returnUrl, adapter) {
   }
 }
 
-async function prepareTeamsRefreshGroup(page, adapter, run = null, session = null) {
-  const homeUrl = `https://${adapter.hostname}`;
-  const currentUrl = page.url();
-  const alreadyInMicrosoftFlow = /(?:^|\.)microsoft(?:online)?\.com$/i.test(safeHostname(currentUrl))
-    || /(?:^|\.)microsoft\.com$/i.test(safeHostname(currentUrl));
-  if (!alreadyInMicrosoftFlow) {
-    await page.goto(homeUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+// Brings the Teams WebDriver window on screen (only when the user has to sign in)
+// or parks it off screen again. Rendering keeps running off screen because sessions
+// are launched with the occlusion/background throttling switches disabled.
+async function setWebdriverWindowOnScreen(page, onScreen) {
+  let cdp;
+  try {
+    cdp = await page.context().newCDPSession(page);
+    const { windowId } = await cdp.send("Browser.getWindowForTarget");
+    await cdp.send("Browser.setWindowBounds", { windowId, bounds: { windowState: "normal" } });
+    await cdp.send("Browser.setWindowBounds", { windowId, bounds: onScreen
+      ? { left: 80, top: 80, width: 1200, height: 820 }
+      : { left: -2600, top: 80, width: 1200, height: 820 } });
+    if (onScreen) await page.bringToFront();
+  } catch {
+    // Window placement is best effort; capture does not depend on it.
+  } finally {
+    await cdp?.detach().catch(() => {});
   }
-
-  if (session?.teamsUserConfirmedAt && await isTeamsWebAppReady(page)) return;
-
-  if (!run) {
-    throw new Error("Teams 抓取需要先从订阅刷新启动 WebDriver，并在应用页面确认聊天窗口已就绪。");
-  }
-
-  updateRefreshRun(run, {
-    status: "waiting_for_teams_confirmation",
-    currentJobId: "",
-    currentJobName: "请在 WebDriver 中进入 Teams 聊天窗口，然后回到应用确认"
-  });
-
-  await waitForTeamsUserConfirmation(page, { run, session });
 }
 
-async function waitForTeamsUserConfirmation(page, options = {}) {
-  const deadline = Date.now() + Number(options.timeoutMs || TEAMS_LOGIN_TIMEOUT_MS);
-  while (Date.now() < deadline) {
-    if (options.run?.cancelRequested || page.isClosed()) {
+async function teamsNeedsSignIn(page) {
+  if (!page || page.isClosed()) return false;
+  if (/(^|\.)(login\.microsoftonline\.com|login\.live\.com|login\.microsoft\.com)$/i.test(safeHostname(page.url()))) return true;
+  return page.evaluate(() => Boolean(document.querySelector("input[type='email'], input[name='loginfmt'], input[name='passwd'], input[type='password']"))).catch(() => false);
+}
+
+// Teams sometimes shows "Use the web app instead" / "Continue on this browser".
+async function clickTeamsUseWebApp(page) {
+  if (!page || page.isClosed()) return false;
+  return page.evaluate(() => {
+    const labels = /use the web app|continue on this browser|使用 ?web ?应用|使用网页版|在此浏览器中继续/i;
+    const target = [...document.querySelectorAll("a, button, [role='button']")]
+      .find((element) => labels.test(String(element.innerText || element.getAttribute("aria-label") || "")));
+    if (!target) return false;
+    target.click();
+    return true;
+  }).catch(() => false);
+}
+
+// Waits until the Teams web app is usable and continues automatically. The user is
+// only involved when Teams actually needs a sign-in: the window is brought on screen,
+// the run says so, and capture resumes by itself once the chat UI is ready.
+async function prepareTeamsRefreshGroup(page, adapter, run = null, session = null) {
+  const host = safeHostname(page.url());
+  const onTeams = /(^|\.)teams\.(microsoft\.com|cloud\.microsoft)$/i.test(host);
+  const inSignIn = /(^|\.)(microsoftonline\.com|microsoft\.com|live\.com)$/i.test(host);
+  if (!onTeams && !inSignIn) {
+    await page.goto(`https://${adapter.hostname}`, { waitUntil: "domcontentloaded", timeout: 60000 });
+  }
+  const assertActive = () => {
+    if (run?.cancelRequested || page.isClosed()) {
       const error = new Error("Teams 登录等待已取消。");
       error.code = "REFRESH_ABORTED";
       throw error;
     }
-    if (options.run?.teamsReadyConfirmed && options.session?.teamsUserConfirmedAt) return;
-    await page.waitForTimeout(1000);
+  };
+  let surfaced = false;
+  const ready = await waitForTeamsReady({
+    isReady: async () => { assertActive(); return isTeamsWebAppReady(page); },
+    needsUserAction: () => teamsNeedsSignIn(page),
+    tryContinueInBrowser: () => clickTeamsUseWebApp(page),
+    wait: (ms) => page.waitForTimeout(ms),
+    signal: run?.abortController?.signal,
+    timeoutMs: TEAMS_LOGIN_TIMEOUT_MS,
+    onLoginRequired: async () => {
+      surfaced = true;
+      await setWebdriverWindowOnScreen(page, true);
+      if (run) {
+        updateRefreshRun(run, {
+          status: "waiting_for_teams_confirmation",
+          currentJobId: "",
+          currentJobName: "Teams 需要登录：请在弹出的浏览器窗口中完成登录，登录后会自动继续"
+        });
+      }
+      await sendSystemNotification("Teams 需要登录", "请在弹出的浏览器窗口中完成登录，登录后刷新会自动继续。").catch(() => {});
+    },
+    onReady: async () => {
+      const readyAt = new Date().toISOString();
+      if (session) session.teamsUserConfirmedAt = readyAt;
+      if (surfaced) await setWebdriverWindowOnScreen(page, false);
+      if (run) {
+        updateRefreshRun(run, {
+          teamsReadyConfirmed: true,
+          teamsReadyConfirmedAt: readyAt,
+          status: "running",
+          currentJobName: "Teams 已就绪，准备定位目标对话"
+        });
+      }
+    }
+  });
+  if (!ready) {
+    throw new Error([
+      "等待 Teams 登录超时，已停止抓取。",
+      "浏览器窗口会继续保留；登录完成后下一次刷新会自动继续。"
+    ].join(" "));
   }
-  throw new Error([
-    "等待 Teams 页面确认超时，已停止抓取。",
-    "WebDriver 窗口会继续保留；请确认聊天窗口可见后重新刷新。"
-  ].join(" "));
 }
 
 async function confirmTeamsRefreshReady(runId) {
@@ -3565,16 +3618,17 @@ async function withRefreshJobTimeout(job, run, task) {
   let timedOut = false;
   const controller = new AbortController();
   if (run) run.abortController = controller;
+  const timeoutMs = detectSourceAdapter(job.url || "").sourceType === "teams" ? TEAMS_REFRESH_JOB_TIMEOUT_MS : REFRESH_JOB_TIMEOUT_MS;
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(async () => {
       timedOut = true;
       controller.abort();
-      const error = new Error(`刷新任务超时：${job.name || job.id} 超过 ${Math.round(REFRESH_JOB_TIMEOUT_MS / 60000)} 分钟未完成。`);
+      const error = new Error(`刷新任务超时：${job.name || job.id} 超过 ${Math.round(timeoutMs / 60000)} 分钟未完成。`);
       error.code = "REFRESH_JOB_TIMEOUT";
       if (run) updateRefreshRun(run, { error: error.message });
       await closeRefreshRunContext(run);
       reject(error);
-    }, REFRESH_JOB_TIMEOUT_MS);
+    }, timeoutMs);
   });
   try {
     return await Promise.race([task(controller.signal), timeout]);
@@ -3833,6 +3887,11 @@ async function refreshContentJob(job, refreshContext = null) {
     httpValidators: fetched.httpValidators || {},
     integrityStatus: adapter.sourceType === "teams" ? "verified" : undefined,
     integrityReason: adapter.sourceType === "teams" ? "" : undefined,
+    // Persist what the capture actually covered (scroll stop reason, gaps, identity
+    // evidence) so the UI can say when history between captures is missing.
+    completeness: fetched.completeness,
+    coverage: fetched.coverage,
+    identityEvidence: fetched.identityEvidence,
     fetchedAt,
     pageKind: "content",
     fetchMode: resolvedRefreshFetchMode(job, adapter)
@@ -4582,7 +4641,7 @@ async function fetchUrlWithWebdriver(url, options = {}) {
     headed: adapter.sourceType === "teams" ? true : Boolean(options.headed),
     manual: adapter.sourceType === "teams",
     autoClose: adapter.sourceType === "teams" ? false : options.keepSession !== true,
-    windowMode: adapter.sourceType === "teams" ? "normal" : undefined
+    windowMode: adapter.sourceType === "teams" ? "background" : undefined
   });
   const ownsSession = !options.session && !existingSession;
   session.activeOperations = Number(session.activeOperations || 0) + 1;
@@ -4605,7 +4664,7 @@ async function fetchUrlWithWebdriverInSession(url, options = {}) {
       ? options.page
       : await ensureSessionPage(session);
     session.page = page;
-    if (adapter.sourceType === "teams" && !session.teamsUserConfirmedAt) {
+    if (adapter.sourceType === "teams" && !(session.teamsUserConfirmedAt && await isTeamsWebAppReady(page))) {
       await prepareTeamsRefreshGroup(page, adapter, options.run || null, session);
     }
     const navigationUrl = url;
@@ -4621,8 +4680,8 @@ async function fetchUrlWithWebdriverInSession(url, options = {}) {
       teamsLocation = await openTeamsConversationFromUi(page, {
         title: options.teamsConversationTitle,
         url,
-        run: options.run || null,
-        signal: options.signal
+        signal: options.signal || options.run?.abortController?.signal,
+        onProgress: (text) => { if (options.run) updateRefreshRun(options.run, { status: "running", currentJobName: text }); }
       });
     } else {
       await navigateWebdriverPage(page, navigationUrl, adapter);
@@ -4736,6 +4795,8 @@ async function fetchTeamsWithWebdriver(page, url, adapter, options = {}) {
   const previousComments = await readExistingTeamsComments(stableUrl);
   const observedMessages = await scrollTeamsMessages(page, {
     maxScrolls: 18,
+    extendedMaxScrolls: 150,
+    deadlineMs: TEAMS_GAP_SCROLL_DEADLINE_MS,
     previousMessages: previousComments,
     minScrollsBeforeOverlapStop: 2,
     expectedTitle: options.expectedTitle,
@@ -4767,73 +4828,6 @@ async function fetchTeamsWithWebdriver(page, url, adapter, options = {}) {
   };
 }
 
-async function openTeamsConversationFromUi(page, options = {}) {
-  if (options.signal?.aborted || options.run?.abortController?.signal.aborted) throw new DOMException("Capture canceled", "AbortError");
-  const targetTitle = cleanText(options.title || "");
-  const conversationId = extractTeamsConversationId(options.url || "");
-  if (!targetTitle && !conversationId) {
-    throw new Error("Teams 任务缺少可用于页面定位的对话名称。请把订阅名称改为 Teams 中显示的聊天名称后重试。");
-  }
-
-  if (options.run) {
-    updateRefreshRun(options.run, {
-      status: "running",
-      currentJobName: `正在 Teams 中定位：${targetTitle}`
-    });
-  }
-
-  const currentTitle = await currentTeamsConversationTitle(page);
-  if (!conversationId && currentTitle && targetTitle && areCaptureTitlesConsistent(targetTitle, currentTitle)) {
-    return { title: currentTitle, conversationId: "", identityVerifiedById: false };
-  }
-
-  await activateTeamsChatArea(page);
-  const directIdMatch = conversationId ? await clickTeamsConversationById(page, conversationId) : null;
-  if (directIdMatch?.clicked) {
-    if (!await waitForTeamsConversationTitle(page, directIdMatch.title)) {
-      throw new Error(`Teams 会话 ID 已命中，但聊天标题未切换到“${directIdMatch.title}”。已停止抓取。`);
-    }
-    await waitForTeamsConversation(page);
-    await closeTeamsChatListFilter(page);
-    return {
-      title: await currentTeamsConversationTitle(page),
-      conversationId,
-      identityVerifiedById: true
-    };
-  }
-  if (!conversationId && await clickTeamsConversationCandidate(page, targetTitle)) {
-    if (await waitForTeamsConversationTitle(page, targetTitle)) {
-      return { title: targetTitle, conversationId: "", identityVerifiedById: false };
-    }
-  }
-
-  if (targetTitle && await filterTeamsChatList(page, targetTitle)) {
-    const filteredIdMatch = conversationId ? await clickTeamsConversationById(page, conversationId) : null;
-    if (filteredIdMatch?.clicked) {
-      if (!await waitForTeamsConversationTitle(page, filteredIdMatch.title)) {
-        throw new Error(`Teams 筛选结果命中会话 ID，但聊天标题未切换到“${filteredIdMatch.title}”。已停止抓取。`);
-      }
-      await waitForTeamsConversation(page);
-      await closeTeamsChatListFilter(page);
-      return {
-        title: await currentTeamsConversationTitle(page),
-        conversationId,
-        identityVerifiedById: true
-      };
-    }
-    if (!conversationId && await clickTeamsConversationCandidate(page, targetTitle)
-      && await waitForTeamsConversationTitle(page, targetTitle)) {
-      await closeTeamsChatListFilter(page);
-      return { title: targetTitle, conversationId: "", identityVerifiedById: false };
-    }
-  }
-
-  throw new Error([
-    `无法在 Teams 页面中定位目标对话“${targetTitle}”。`,
-    "已停止抓取且没有打开深链接或新窗口。",
-    "请确认订阅名称与 Teams 聊天列表中显示的名称一致。"
-  ].join(" "));
-}
 
 async function readExistingTeamsComments(url) {
   const existing = await findItemByUrl(canonicalizeMaterialUrl(url) || url);
@@ -4936,6 +4930,10 @@ async function ensureWebdriverSession(hostname, url, options = {}) {
     viewport: windowPlacement.size,
     args: [
       "--disable-blink-features=AutomationControlled",
+      // Keep rendering and timers running while the window is off screen or covered.
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
+      "--disable-background-timer-throttling",
       `--disk-cache-size=${BROWSER_DISK_CACHE_BYTES}`,
       `--window-size=${windowPlacement.size.width},${windowPlacement.size.height}`,
       `--window-position=${windowPlacement.position.x},${windowPlacement.position.y}`,
@@ -5003,6 +5001,15 @@ function describeWebdriverSession(hostname, session) {
 }
 
 function webdriverWindowPlacement(mode, manual) {
+  // Full-size window parked off screen: Teams needs a real viewport to render its
+  // virtualized message list, but should not cover the user's work.
+  if (mode === "background") {
+    return {
+      size: { width: 1200, height: 820 },
+      position: { x: -2600, y: 80 },
+      args: []
+    };
+  }
   if (mode === "normal") {
     return {
       size: manual ? { width: 1000, height: 720 } : { width: 900, height: 640 },

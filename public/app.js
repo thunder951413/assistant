@@ -1214,6 +1214,8 @@ function coverageSummary(coverage) {
   if (coverage.observedCount != null) parts.push(`已读取 ${coverage.observedCount} 条`);
   if (coverage.expectedCount != null) parts.push(`预期 ${coverage.expectedCount} 条`);
   if (coverage.timeRange) parts.push(String(coverage.timeRange));
+  if (coverage.gap) parts.push(`⚠ 未能接上上次抓取的位置，${coverage.oldestObservedAt ? `${String(coverage.oldestObservedAt).slice(0, 10)} 之前` : "较早"}可能有消息缺失`);
+  else if (coverage.stoppedBy === "no-more-history") parts.push("已到会话开头");
   return parts.join("，") || "";
 }
 

@@ -28,24 +28,26 @@ describe("server regression guards", () => {
     const source = await readServerSource();
     assert.match(source, /closeWhenDone:\s*group\.sourceType === "teams" \? false : !session\.manual/);
     assert.match(source, /autoClose:\s*adapter\.sourceType === "teams" \? false : options\.keepSession !== true/);
-    assert.match(source, /session\.teamsUserConfirmedAt = confirmedAt/);
   });
 
-  it("waits for explicit Teams confirmation and locates conversations inside the current page", async () => {
+  it("continues Teams refreshes automatically and locates conversations inside the current page", async () => {
     const [serverSource, appSource] = await Promise.all([
       readServerSource(),
       fs.readFile(path.join(root, "public", "app.js"), "utf8")
     ]);
+    // No manual confirmation gate: readiness is detected, sign-in surfaces the window.
+    assert.doesNotMatch(serverSource, /waitForTeamsUserConfirmation/);
+    assert.doesNotMatch(serverSource, /session\.teamsUserConfirmedAt = "";/);
+    assert.match(serverSource, /await waitForTeamsReady\(\{/);
+    assert.match(serverSource, /setWebdriverWindowOnScreen\(page, true\)/);
     assert.match(serverSource, /status:\s*"waiting_for_teams_confirmation"/);
-    assert.match(serverSource, /await waitForTeamsUserConfirmation\(page, \{ run, session \}\)/);
     assert.match(serverSource, /headed:\s*group\.sourceType === "teams"/);
     assert.match(serverSource, /manual:\s*group\.sourceType === "teams"/);
+    assert.match(serverSource, /--disable-backgrounding-occluded-windows/);
     assert.match(serverSource, /await openTeamsConversationFromUi\(page,/);
     assert.match(serverSource, /data-fui-tree-item-value/);
     assert.match(serverSource, /async function filterTeamsChatList/);
     assert.doesNotMatch(serverSource, /function normalizeTeamsNavigationUrl/);
-    assert.doesNotMatch(serverSource, /async function searchTeamsConversation/);
     assert.match(appSource, /run\.status === "waiting_for_teams_confirmation"/);
-    assert.match(appSource, /\/teams-ready/);
   });
 });

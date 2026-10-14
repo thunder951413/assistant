@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Material Organizer - Teams Auto Capture
 // @namespace    https://github.com/thunder951413/assistant
-// @version      0.2.0
+// @version      0.3.0
 // @description  Periodically capture the current Microsoft Teams web conversation into the local Material Organizer app.
 // @match        https://teams.microsoft.com/*
 // @match        https://teams.cloud.microsoft/*
@@ -168,6 +168,16 @@
   // Keep this self-contained extractor synchronized with src/capture-policy.js.
   function extractTeamsMessagesFromDocument(document = globalThis.document) {
   const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  // Message bodies keep their line breaks (logs, steps, code); only runs of spaces
+  // and blank lines are tidied. Identity keys normalize whitespace separately.
+  const cleanBody = (value) => String(value || "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[^\S\n]+/g, " ")
+    .split("\n").map((line) => line.trim()).join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  // Teams message ids are the server arrival time in epoch milliseconds.
+  const timeFromId = (id) => /^\d{13}$/.test(id) ? new Date(Number(id)).toISOString() : "";
   const pickTitle = () => {
     for (const selector of ["[data-tid='channel-name']", "[data-tid='chat-title']", "[data-tid='conversation-header-title']", "h1", "[role='heading']"]) {
       const text = clean(document.querySelector(selector)?.textContent);
@@ -190,9 +200,12 @@
     const attachmentText = [...bodyNode.querySelectorAll("img, a[href]")]
       .map((element) => clean(element.getAttribute("alt") || element.textContent) || (element.tagName === "IMG" ? "图片" : "附件"))
       .filter(Boolean).map((text) => `[${text}]`).filter((text, index, values) => values.indexOf(text) === index).join(" ");
-    const body = clean(bodyNode.innerText || bodyNode.textContent) || attachmentText;
+    // The content node excludes reactions, quoted-reply cards and the read receipt
+    // that Teams renders inside the same message group.
+    const contentNode = bodyNode.querySelector("[data-message-content]") || bodyNode;
+    const body = cleanBody(contentNode.innerText || contentNode.textContent) || attachmentText;
     const id = clean(bodyNode.getAttribute("data-mid") || bodyNode.getAttribute("data-message-id") || "");
-    return { id, author, createdAt, body, links: [...node.querySelectorAll("a[href]")].map((link) => ({ text: clean(link.textContent), href: link.href })).filter((link) => link.href) };
+    return { id, author, createdAt: createdAt || timeFromId(id), body, links: [...node.querySelectorAll("a[href]")].map((link) => ({ text: clean(link.textContent), href: link.href })).filter((link) => link.href) };
   };
   const stableNodes = [...document.querySelectorAll("[data-mid], [data-message-id]")]
     .filter((node) => clean(node.getAttribute("data-mid") || node.getAttribute("data-message-id")));

@@ -10,7 +10,14 @@ export function areCaptureTitlesConsistent(expected, actual) {
   const a = normalizeComparableTitle(expected);
   const b = normalizeComparableTitle(actual);
   if (!a || !b) return true;
-  return a === b || a.startsWith(b) || b.startsWith(a);
+  if (a === b) return true;
+  // A prefix only counts when the shorter title was visibly truncated by Teams
+  // ("Samsung 项目 CXD6866ER…"); otherwise "BM Test" must not match "BM Test 2".
+  const truncated = (value) => /(?:…|\.\.\.)$/.test(value);
+  const stem = (value) => value.replace(/(?:…|\.\.\.)$/, "").trim();
+  if (truncated(a) && stem(a) && b.startsWith(stem(a))) return true;
+  if (truncated(b) && stem(b) && a.startsWith(stem(b))) return true;
+  return false;
 }
 
 export function paginate(values, page = 1, pageSize = values.length || 1) {

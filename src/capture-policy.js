@@ -66,6 +66,16 @@ export function shouldCloseOwnedWebdriverSession(session, ownsSession) {
 
 export function extractTeamsMessagesFromDocument(document = globalThis.document) {
   const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  // Message bodies keep their line breaks (logs, steps, code); only runs of spaces
+  // and blank lines are tidied. Identity keys normalize whitespace separately.
+  const cleanBody = (value) => String(value || "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[^\S\n]+/g, " ")
+    .split("\n").map((line) => line.trim()).join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  // Teams message ids are the server arrival time in epoch milliseconds.
+  const timeFromId = (id) => /^\d{13}$/.test(id) ? new Date(Number(id)).toISOString() : "";
   const pickTitle = () => {
     for (const selector of ["[data-tid='channel-name']", "[data-tid='chat-title']", "[data-tid='conversation-header-title']", "h1", "[role='heading']"]) {
       const text = clean(document.querySelector(selector)?.textContent);
@@ -88,9 +98,12 @@ export function extractTeamsMessagesFromDocument(document = globalThis.document)
     const attachmentText = [...bodyNode.querySelectorAll("img, a[href]")]
       .map((element) => clean(element.getAttribute("alt") || element.textContent) || (element.tagName === "IMG" ? "图片" : "附件"))
       .filter(Boolean).map((text) => `[${text}]`).filter((text, index, values) => values.indexOf(text) === index).join(" ");
-    const body = clean(bodyNode.innerText || bodyNode.textContent) || attachmentText;
+    // The content node excludes reactions, quoted-reply cards and the read receipt
+    // that Teams renders inside the same message group.
+    const contentNode = bodyNode.querySelector("[data-message-content]") || bodyNode;
+    const body = cleanBody(contentNode.innerText || contentNode.textContent) || attachmentText;
     const id = clean(bodyNode.getAttribute("data-mid") || bodyNode.getAttribute("data-message-id") || "");
-    return { id, author, createdAt, body, links: [...node.querySelectorAll("a[href]")].map((link) => ({ text: clean(link.textContent), href: link.href })).filter((link) => link.href) };
+    return { id, author, createdAt: createdAt || timeFromId(id), body, links: [...node.querySelectorAll("a[href]")].map((link) => ({ text: clean(link.textContent), href: link.href })).filter((link) => link.href) };
   };
   const stableNodes = [...document.querySelectorAll("[data-mid], [data-message-id]")]
     .filter((node) => clean(node.getAttribute("data-mid") || node.getAttribute("data-message-id")));
@@ -107,7 +120,8 @@ export function mergeTeamsCaptureMessages(messages = []) {
     const message = normalizeTeamsMessage(value);
     if (!message.body) continue;
     const key = teamsCaptureMessageIdentity(message);
-    if (!byKey.has(key) || hasStableTeamsMessageId(message.id)) byKey.set(key, message);
+    if (!byKey.has(key)) byKey.set(key, message);
+    else if (hasStableTeamsMessageId(message.id)) byKey.set(key, mergeTeamsFields(byKey.get(key), message));
   }
   return [...byKey.values()].sort((a, b) => `${a.createdAt}\n${a.id}\n${a.body}`.localeCompare(`${b.createdAt}\n${b.id}\n${b.body}`));
 }
@@ -119,9 +133,16 @@ export function teamsCaptureMessageKeys(message) {
 }
 
 export async function collectVirtualTeamsMessages(options = {}) {
-  const maxScrolls = Math.max(0, Number(options.maxScrolls ?? 18));
+  const baseScrolls = Math.max(0, Number(options.maxScrolls ?? 18));
+  // When earlier messages are stored but not reached, keep scrolling (bounded by
+  // extendedMaxScrolls and a deadline) so the gap between captures is filled
+  // instead of silently skipped; an unclosed gap is reported in coverage.
+  const extendedMaxScrolls = Math.max(baseScrolls, Number(options.extendedMaxScrolls ?? baseScrolls));
+  const deadline = Number(options.deadlineMs) > 0 ? Date.now() + Number(options.deadlineMs) : Infinity;
+  const now = options.now || (() => Date.now());
   const minScrollsBeforeOverlapStop = Math.max(1, Number(options.minScrollsBeforeOverlapStop ?? 2));
   const previous = new Set((options.previousMessages || []).flatMap(teamsCaptureMessageKeys));
+  const hasPrevious = previous.size > 0;
   const observed = [];
   const remember = async () => { observed.push(...((await options.readVisible())?.messages || [])); };
   const ensureActive = () => {
@@ -133,7 +154,13 @@ export async function collectVirtualTeamsMessages(options = {}) {
   ensureActive();
   let stableRounds = 0;
   let stoppedBy = "limit";
-  for (let index = 0; index < maxScrolls; index += 1) {
+  let reachedPrevious = false;
+  let scrolls = 0;
+  for (let index = 0; ; index += 1) {
+    const budget = hasPrevious && !reachedPrevious ? extendedMaxScrolls : baseScrolls;
+    if (index >= budget) break;
+    if (index >= baseScrolls && now() > deadline) { stoppedBy = "deadline"; break; }
+    scrolls = index + 1;
     ensureActive();
     const before = mergeTeamsCaptureMessages(observed);
     const moved = await options.scrollOlder();
@@ -144,6 +171,7 @@ export async function collectVirtualTeamsMessages(options = {}) {
     ensureActive();
     const after = mergeTeamsCaptureMessages(observed);
     const hasOverlap = after.some((message) => teamsCaptureMessageKeys(message).some((key) => previous.has(key)));
+    if (hasOverlap) reachedPrevious = true;
     if (index + 1 >= minScrollsBeforeOverlapStop && hasOverlap) { stoppedBy = "previous-overlap"; break; }
     stableRounds = moved || after.length > before.length ? 0 : stableRounds + 1;
     if (stableRounds >= 3) { stoppedBy = "no-more-history"; break; }
@@ -154,7 +182,16 @@ export async function collectVirtualTeamsMessages(options = {}) {
   await remember();
   ensureActive();
   const messages = mergeTeamsCaptureMessages(observed);
-  return { messages, completeness: "partial", coverage: { observedCount: messages.length, maxScrolls, minScrollsBeforeOverlapStop, stoppedBy } };
+  if (!reachedPrevious && hasPrevious) reachedPrevious = messages.some((message) => teamsCaptureMessageKeys(message).some((key) => previous.has(key)));
+  // A gap exists when stored history was never reached and the scroll did not hit
+  // the start of the conversation.
+  const gap = hasPrevious && !reachedPrevious && stoppedBy !== "no-more-history";
+  const oldestObservedAt = messages.find((message) => message.createdAt)?.createdAt || "";
+  return {
+    messages,
+    completeness: "partial",
+    coverage: { observedCount: messages.length, scrolls, maxScrolls: baseScrolls, extendedMaxScrolls, minScrollsBeforeOverlapStop, stoppedBy, reachedPrevious, gap, oldestObservedAt }
+  };
 }
 
 export function mergeTeamsCommentsByIdentity(existing = [], observed = []) {
@@ -208,13 +245,49 @@ function parseTime(value, fallback) {
   return { hours: Math.min(23, Math.max(0, rawHours || 0)), minutes: Math.min(59, Math.max(0, rawMinutes || 0)) };
 }
 
+export function normalizeTeamsBody(value) {
+  return String(value || "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[^\S\n]+/g, " ")
+    .split("\n").map((line) => line.trim()).join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+// Teams message ids (data-mid / chatsvc id) are the arrival time in epoch ms.
+export function teamsTimeFromMessageId(id) {
+  const value = canonicalTeamsMessageId(id);
+  if (!/^\d{13}$/.test(value)) return "";
+  const time = new Date(Number(value));
+  return Number.isNaN(time.getTime()) ? "" : time.toISOString();
+}
+
 function normalizeTeamsMessage(value = {}) {
+  const id = String(value.id || "").trim();
   return {
-    id: String(value.id || "").trim(),
+    id,
     author: String(value.author || "").replace(/\s+/g, " ").trim(),
-    createdAt: String(value.createdAt || "").replace(/\s+/g, " ").trim(),
-    body: String(value.body || "").replace(/\s+/g, " ").trim(),
+    createdAt: String(value.createdAt || "").replace(/\s+/g, " ").trim() || teamsTimeFromMessageId(id),
+    body: normalizeTeamsBody(value.body),
     links: Array.isArray(value.links) ? value.links : []
+  };
+}
+
+const collapse = (value) => String(value || "").replace(/\s+/g, " ").trim();
+
+// Later observations win for the body (edits), but never erase a field an earlier
+// observation had: a scrolled-in fragment of a grouped message may lack author/time.
+function mergeTeamsFields(previous, next) {
+  if (!previous) return next;
+  return {
+    ...previous,
+    ...next,
+    id: hasStableTeamsMessageId(next.id) ? next.id : (previous.id || next.id),
+    author: next.author || previous.author,
+    createdAt: next.createdAt || previous.createdAt,
+    body: next.body || previous.body,
+    links: next.links?.length ? next.links : (previous.links || []),
+    ...(next.url || previous.url ? { url: next.url || previous.url } : {})
   };
 }
 
@@ -225,7 +298,7 @@ function hasStableTeamsMessageId(id) {
 
 function teamsCaptureMessageIdentity(message) {
   if (hasStableTeamsMessageId(message.id)) return `id:${canonicalTeamsMessageId(message.id)}`;
-  return `observed:${message.author}\n${message.createdAt}\n${message.body}`;
+  return `observed:${message.author}\n${message.createdAt}\n${collapse(message.body)}`;
 }
 
 function addComment(target, value, replace) {
@@ -234,16 +307,18 @@ function addComment(target, value, replace) {
   const stable = stableMessageId(comment.id);
   // A DOM row ordinal is not an identity.  Use content identity only as a
   // conservative de-duplication key for captures without a server message id.
-  const key = stable ? `id:${stable}` : `observed:${comment.author}\n${comment.createdAt}\n${comment.body}`;
-  if (!target.has(key) || replace) target.set(key, comment);
+  const key = stable ? `id:${stable}` : `observed:${comment.author}\n${comment.createdAt}\n${collapse(comment.body)}`;
+  if (!target.has(key)) target.set(key, comment);
+  else if (replace) target.set(key, mergeTeamsFields(target.get(key), comment));
 }
 
 function normalizeComment(value = {}) {
+  const id = String(value.id || "").trim();
   return {
-    id: String(value.id || "").trim(),
+    id,
     author: String(value.author || "").trim(),
-    createdAt: String(value.createdAt || "").trim(),
-    body: String(value.body || "").trim(),
+    createdAt: String(value.createdAt || "").trim() || teamsTimeFromMessageId(id),
+    body: normalizeTeamsBody(value.body),
     links: Array.isArray(value.links) ? value.links : [],
     url: String(value.url || "").trim()
   };

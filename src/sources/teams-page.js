@@ -61,7 +61,9 @@ export async function clickTeamsConversationById(page, conversationId) {
         const style = window.getComputedStyle(element);
         return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
       });
-    const target = candidates.length === 1 ? candidates[0] : null;
+    // Every candidate carries exactly this id; a chat pinned to Favorites is also
+    // listed under Chats, so take the first visible entry.
+    const target = candidates[0] || null;
     if (!target) return { clicked: false, title: "" };
     const title = clean(target.innerText || target.textContent);
     if (!title) return { clicked: false, title: "" };
@@ -135,40 +137,137 @@ export async function clickTeamsConversationCandidate(page, targetTitle) {
   }, targetTitle).catch(() => false);
 }
 
+// The chat-list filter box. The global search box (#ms-searchux-input) and the
+// message composer are deliberately excluded.
+const TEAMS_FILTER_INPUT_SELECTORS = [
+  "input[aria-label='Filter by person, chat or channel name']",
+  "input[placeholder='Filter by person, chat or channel name']",
+  "input[aria-label*='Filter' i]:not(#ms-searchux-input)",
+  "input[placeholder*='Filter' i]:not(#ms-searchux-input)",
+  "input[aria-label*='筛选']:not(#ms-searchux-input)",
+  "input[placeholder*='筛选']:not(#ms-searchux-input)"
+];
+
+async function focusedTextInput(page) {
+  return page.evaluate(() => {
+    const element = document.activeElement;
+    if (!element || element.id === "ms-searchux-input" || element.getAttribute("data-tid") === "ckeditor") return false;
+    return element.tagName === "INPUT" && !["checkbox", "radio", "button"].includes(element.type);
+  }).catch(() => false);
+}
+
 export async function filterTeamsChatList(page, targetTitle) {
-  const inputSelectors = [
-    "input[aria-label='Filter by person, chat or channel name']",
-    "input[placeholder='Filter by person, chat or channel name']"
-  ];
-  let filterInput = await firstVisibleTeamsLocator(page, inputSelectors);
+  let filterInput = await firstVisibleTeamsLocator(page, TEAMS_FILTER_INPUT_SELECTORS);
   if (!filterInput) {
     const buttonSelectors = [
       "button[aria-label^='Show filter text box']",
-      "button[title^='Show filter text box']"
+      "button[title^='Show filter text box']",
+      "button[aria-label^='显示筛选']",
+      "button[title^='显示筛选']"
     ];
     const filterButton = await firstVisibleTeamsLocator(page, buttonSelectors);
     if (!filterButton) return false;
     await filterButton.click({ timeout: 3000 });
-    await page.waitForTimeout(500);
-    filterInput = await firstVisibleTeamsLocator(page, inputSelectors);
+    await page.waitForTimeout(600);
+    filterInput = await firstVisibleTeamsLocator(page, TEAMS_FILTER_INPUT_SELECTORS);
+    // Teams focuses the filter box it just opened; fall back to that when its
+    // label is not one we know (localized or renamed UI).
+    if (!filterInput && await focusedTextInput(page)) {
+      await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A").catch(() => {});
+      await page.keyboard.insertText(targetTitle);
+      await page.waitForTimeout(1200);
+      return true;
+    }
   }
   if (!filterInput) return false;
   await filterInput.fill(targetTitle, { timeout: 5000 });
-  await page.waitForTimeout(1000);
+  await page.waitForTimeout(1200);
   return true;
 }
 
 export async function closeTeamsChatListFilter(page) {
-  const input = await firstVisibleTeamsLocator(page, [
-    "input[aria-label='Filter by person, chat or channel name']",
-    "input[placeholder='Filter by person, chat or channel name']"
-  ]);
+  const input = await firstVisibleTeamsLocator(page, TEAMS_FILTER_INPUT_SELECTORS);
   if (input) await input.fill("").catch(() => {});
   const closeButton = await firstVisibleTeamsLocator(page, [
     "button[aria-label^='Close filter text box']",
-    "button[title^='Close filter text box']"
+    "button[title^='Close filter text box']",
+    "button[aria-label^='关闭筛选']"
   ]);
   if (closeButton) await closeButton.click({ timeout: 2000 }).catch(() => {});
+}
+
+// Waits briefly for a chat-list entry with this conversation id to render (the list
+// is virtualized and filtering is asynchronous), then clicks it.
+export async function clickTeamsConversationByIdWhenReady(page, conversationId, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  let result = { clicked: false, title: "" };
+  do {
+    result = await clickTeamsConversationById(page, conversationId);
+    if (result.clicked) return result;
+    await page.waitForTimeout(400);
+  } while (Date.now() < deadline);
+  return result;
+}
+
+// Last resort for chats that are not in the recent list: the global "go to chat"
+// search box. Only a suggestion whose visible text equals the title is opened, and the
+// caller must still verify the conversation id afterwards.
+export async function openTeamsConversationViaSearch(page, targetTitle) {
+  const search = await firstVisibleTeamsLocator(page, ["#ms-searchux-input", "input[data-tid='AUTOSUGGEST_INPUT']"]);
+  if (!search || !targetTitle) return false;
+  try {
+    await search.click({ timeout: 3000 });
+    await search.fill(targetTitle, { timeout: 5000 });
+  } catch {
+    return false;
+  }
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(500);
+    const clicked = await page.evaluate((expected) => {
+      const clean = (value) => String(value || "").replace(/\s+/g, " ").trim().toLocaleLowerCase();
+      const want = clean(expected);
+      const options = [...document.querySelectorAll("[role='listbox'] [role='option'], [role='option']")]
+        .filter((element) => element instanceof HTMLElement && element.getBoundingClientRect().height > 0);
+      const exact = options.filter((element) => {
+        const texts = [element.innerText, element.getAttribute("aria-label"), ...[...element.querySelectorAll("span, div")].map((node) => node.childElementCount === 0 ? node.textContent : "")];
+        return texts.some((text) => clean(text) === want);
+      });
+      if (exact.length !== 1) return false;
+      exact[0].click();
+      return true;
+    }, targetTitle).catch(() => false);
+    if (clicked) {
+      await page.waitForTimeout(1500);
+      return true;
+    }
+  }
+  await search.fill("").catch(() => {});
+  await page.keyboard.press("Escape").catch(() => {});
+  return false;
+}
+
+// Waits until the Teams web app is usable. Returns true when ready; calls
+// onLoginRequired once if a sign-in or "use the web app" screen is showing, and keeps
+// waiting (up to timeoutMs) so the user can sign in, then continues automatically.
+export async function waitForTeamsReady({ isReady, needsUserAction, onLoginRequired, onReady, tryContinueInBrowser, wait, signal, now = () => Date.now(), graceMs = 45000, timeoutMs = 10 * 60 * 1000 }) {
+  const start = now();
+  let loginRequested = false;
+  while (true) {
+    if (signal?.aborted) throw new DOMException("Teams capture canceled.", "AbortError");
+    if (await isReady()) {
+      await onReady?.({ loginRequested });
+      return true;
+    }
+    await tryContinueInBrowser?.();
+    const elapsed = now() - start;
+    if (!loginRequested && (elapsed >= graceMs || await needsUserAction?.())) {
+      loginRequested = true;
+      await onLoginRequired?.();
+    }
+    if (elapsed >= timeoutMs) return false;
+    await wait(1000);
+  }
 }
 
 export async function firstVisibleTeamsLocator(page, selectors) {
@@ -311,6 +410,8 @@ export function renderTeamsTextFromComments(title, url, adapter, comments) {
 export async function scrollTeamsMessages(page, options = {}) {
   const captured = await collectVirtualTeamsMessages({
     maxScrolls: options.maxScrolls || 18,
+    extendedMaxScrolls: options.extendedMaxScrolls,
+    deadlineMs: options.deadlineMs,
     minScrollsBeforeOverlapStop: options.minScrollsBeforeOverlapStop || 2,
     previousMessages: options.previousMessages || [],
     signal: options.signal,
@@ -560,4 +661,97 @@ export async function extractTeamsFromPage(page, url, adapter, observedMessages 
     completeness: observedMessages?.completeness || "partial",
     coverage: observedMessages?.coverage || { observedCount: comments.length, stoppedBy: "visible-window" }
   };
+}
+
+const defaultLocatorDeps = {
+  currentTeamsConversationTitle: (...args) => currentTeamsConversationTitle(...args),
+  activateTeamsChatArea: (...args) => activateTeamsChatArea(...args),
+  clickTeamsConversationByIdWhenReady: (...args) => clickTeamsConversationByIdWhenReady(...args),
+  waitForTeamsConversationTitle: (...args) => waitForTeamsConversationTitle(...args),
+  waitForTeamsConversation: (...args) => waitForTeamsConversation(...args),
+  filterTeamsChatList: (...args) => filterTeamsChatList(...args),
+  closeTeamsChatListFilter: (...args) => closeTeamsChatListFilter(...args),
+  clickTeamsConversationCandidate: (...args) => clickTeamsConversationCandidate(...args),
+  openTeamsConversationViaSearch: (...args) => openTeamsConversationViaSearch(...args)
+};
+
+// Opens the target conversation inside the running Teams web app, never through a
+// deep link. With a conversation id, success always means the chat-list entry carrying
+// that id was clicked; a title is only used to make that entry render (filter/search).
+// Without an id (legacy jobs) the header title must match exactly.
+export async function openTeamsConversationFromUi(page, options = {}, deps = defaultLocatorDeps) {
+  const ensureActive = () => {
+    if (options.signal?.aborted) throw new DOMException("Capture canceled", "AbortError");
+  };
+  ensureActive();
+  const targetTitle = String(options.title || "").replace(/\s+/g, " ").trim();
+  const conversationId = extractTeamsConversationId(options.url || "");
+  if (!targetTitle && !conversationId) {
+    throw new Error("Teams 任务缺少可用于页面定位的对话名称。请把订阅名称改为 Teams 中显示的聊天名称后重试。");
+  }
+  const progress = (text) => options.onProgress?.(text);
+  progress(`正在 Teams 中定位：${targetTitle || conversationId}`);
+
+  const verifiedById = async (match) => {
+    if (!match?.clicked) return null;
+    if (!await deps.waitForTeamsConversationTitle(page, match.title)) {
+      throw new Error(`Teams 会话 ID 已命中，但聊天标题未切换到“${match.title}”。已停止抓取。`);
+    }
+    await deps.waitForTeamsConversation(page);
+    return { title: await deps.currentTeamsConversationTitle(page) || match.title, conversationId, identityVerifiedById: true, locatedBy: match.locatedBy };
+  };
+
+  if (!conversationId) {
+    const currentTitle = await deps.currentTeamsConversationTitle(page);
+    if (currentTitle && areCaptureTitlesConsistent(targetTitle, currentTitle)) {
+      return { title: currentTitle, conversationId: "", identityVerifiedById: false, locatedBy: "current" };
+    }
+  }
+
+  await deps.activateTeamsChatArea(page);
+  ensureActive();
+
+  // 1. Recent chats already rendered in the list.
+  if (conversationId) {
+    const located = await verifiedById({ ...(await deps.clickTeamsConversationByIdWhenReady(page, conversationId, 1500)), locatedBy: "chat-list" });
+    if (located) return located;
+  } else if (await deps.clickTeamsConversationCandidate(page, targetTitle) && await deps.waitForTeamsConversationTitle(page, targetTitle)) {
+    return { title: targetTitle, conversationId: "", identityVerifiedById: false, locatedBy: "chat-list-title" };
+  }
+  ensureActive();
+
+  // 2. Chat-list filter: renders older chats so the id entry can be found.
+  if (targetTitle && await deps.filterTeamsChatList(page, targetTitle)) {
+    try {
+      if (conversationId) {
+        const located = await verifiedById({ ...(await deps.clickTeamsConversationByIdWhenReady(page, conversationId, 6000)), locatedBy: "chat-filter" });
+        if (located) return located;
+      } else if (await deps.clickTeamsConversationCandidate(page, targetTitle) && await deps.waitForTeamsConversationTitle(page, targetTitle)) {
+        return { title: targetTitle, conversationId: "", identityVerifiedById: false, locatedBy: "chat-filter-title" };
+      }
+    } finally {
+      await deps.closeTeamsChatListFilter(page);
+    }
+  }
+  ensureActive();
+
+  // 3. Global search. Opening a chat moves it to the top of the recent list, where
+  //    its id entry is then required before anything is captured.
+  if (targetTitle && await deps.openTeamsConversationViaSearch(page, targetTitle)) {
+    if (conversationId) {
+      await deps.activateTeamsChatArea(page);
+      const located = await verifiedById({ ...(await deps.clickTeamsConversationByIdWhenReady(page, conversationId, 6000)), locatedBy: "search" });
+      if (located) return located;
+      throw new Error(`已通过搜索打开“${targetTitle}”，但无法确认它就是目标会话（ID 不匹配或未出现在聊天列表）。已停止抓取。`);
+    }
+    if (await deps.waitForTeamsConversationTitle(page, targetTitle)) {
+      return { title: targetTitle, conversationId: "", identityVerifiedById: false, locatedBy: "search-title" };
+    }
+  }
+
+  throw new Error([
+    `无法在 Teams 页面中定位目标对话“${targetTitle || conversationId}”。`,
+    "已尝试聊天列表、列表筛选和全局搜索，均未找到，已停止抓取。",
+    "请确认订阅名称与 Teams 中显示的聊天名称一致。"
+  ].join(" "));
 }

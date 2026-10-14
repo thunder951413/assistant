@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { JSDOM } from "jsdom";
-import { collectVirtualTeamsMessages, extractTeamsMessagesFromDocument, mergeTeamsCaptureMessages } from "../src/capture-policy.js";
+import { collectVirtualTeamsMessages, extractTeamsMessagesFromDocument, mergeTeamsCaptureMessages, mergeTeamsCommentsByIdentity, teamsTimeFromMessageId } from "../src/capture-policy.js";
 
 describe("Teams capture extraction", () => {
   it("extracts short messages and never promotes data-tid to a stable id", () => {
@@ -108,5 +108,69 @@ describe("Teams capture extraction", () => {
       signal: controller.signal
     }), /Teams capture canceled/);
     assert.equal(scrolls, 1);
+  });
+
+  it("keeps line breaks of logs and steps, and reads only the message content node", () => {
+    const dom = new JSDOM(`<!doctype html><div data-tid="chat-pane-item"><span data-tid="message-author-name">Jing</span><time datetime="2026-06-18T11:26:00Z"></time>
+      <div data-mid="1781781960000" data-tid="chat-pane-message"><div id="content-1781781960000" data-message-content="">step 1: make\n06-18 19:11:19 dmx0 input:demod\n\n\n\nstep 2:   flash</div><div data-tid="diverse-reaction-summary">👍 2</div></div></div>`);
+    const element = dom.window.document.querySelector("[data-message-content]");
+    Object.defineProperty(element, "innerText", { get: () => element.textContent });
+    const [message] = extractTeamsMessagesFromDocument(dom.window.document).messages;
+    assert.equal(message.body, "step 1: make\n06-18 19:11:19 dmx0 input:demod\n\nstep 2: flash");
+    assert.doesNotMatch(message.body, /👍/);
+  });
+
+  it("derives the time of system messages from the Teams message id", () => {
+    const dom = new JSDOM(`<!doctype html><div data-tid="chat-pane-item"><div data-tid="control-message-renderer" data-mid="1784195389360">Yan Yan added Xiaoming Sui to the chat.</div></div>`);
+    const [message] = extractTeamsMessagesFromDocument(dom.window.document).messages;
+    assert.equal(message.createdAt, "2026-07-16T09:49:49.360Z");
+    assert.equal(teamsTimeFromMessageId("message-body-1784195389360"), "2026-07-16T09:49:49.360Z");
+    assert.equal(teamsTimeFromMessageId("chat-pane-item"), "");
+  });
+
+  it("never erases a known author or time when a later fragment lacks them", () => {
+    const merged = mergeTeamsCaptureMessages([
+      { id: "1790669890276", author: "Ada", createdAt: "2026-09-29T08:18:10.276Z", body: "first" },
+      { id: "1790669890276", author: "", createdAt: "", body: "first (edited)" }
+    ]);
+    assert.equal(merged.length, 1);
+    assert.deepEqual([merged[0].author, merged[0].createdAt, merged[0].body], ["Ada", "2026-09-29T08:18:10.276Z", "first (edited)"]);
+    const stored = mergeTeamsCommentsByIdentity(
+      [{ id: "1790669890276", author: "Ada", createdAt: "2026-09-29T08:18:10.276Z", body: "first" }],
+      [{ id: "1790669890276", author: "", createdAt: "", body: "first" }, { id: "1784195389360", body: "system" }]
+    );
+    assert.equal(stored.find((c) => c.id === "1790669890276").author, "Ada");
+    assert.equal(stored.find((c) => c.id === "1784195389360").createdAt, "2026-07-16T09:49:49.360Z");
+  });
+
+  it("matches unstable-id messages regardless of whitespace changes", () => {
+    const stored = mergeTeamsCommentsByIdentity(
+      [{ author: "Ada", createdAt: "t", body: "line one line two" }],
+      [{ author: "Ada", createdAt: "t", body: "line one\nline two" }]
+    );
+    assert.equal(stored.length, 1);
+    assert.equal(stored[0].body, "line one\nline two");
+  });
+
+  it("keeps scrolling past the normal budget to reach stored history, and reports an unclosed gap", async () => {
+    const history = Array.from({ length: 40 }, (_, i) => ({ id: String(1790000000000 + i), body: `m${i}`, createdAt: new Date(1790000000000 + i).toISOString() }));
+    const run = async (stored, extendedMaxScrolls) => {
+      let position = history.length - 3;
+      return collectVirtualTeamsMessages({
+        maxScrolls: 5, extendedMaxScrolls, minScrollsBeforeOverlapStop: 1,
+        previousMessages: stored,
+        readVisible: async () => ({ messages: history.slice(Math.max(0, position), position + 3) }),
+        scrollOlder: async () => { const moved = position > 0; position = Math.max(0, position - 2); return moved; }
+      });
+    };
+    const closed = await run([history[10]], 30);
+    assert.equal(closed.coverage.stoppedBy, "previous-overlap");
+    assert.equal(closed.coverage.gap, false);
+    assert.ok(closed.messages.some((m) => m.id === history[11].id), "messages between captures were collected");
+    const open = await run([history[2]], 5);
+    assert.equal(open.coverage.gap, true);
+    assert.equal(open.coverage.reachedPrevious, false);
+    const first = await run([], 30);
+    assert.equal(first.coverage.gap, false, "a first capture has no previous position to miss");
   });
 });
