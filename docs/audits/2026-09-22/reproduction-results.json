@@ -1,0 +1,48 @@
+{
+  "teamsPartial": {
+    "before": 12,
+    "incoming": 4,
+    "after": 12,
+    "newMessageSaved": false
+  },
+  "captureTrust": {
+    "integrityStatus": "verified"
+  },
+  "staleReset": {
+    "before": true,
+    "after": false
+  },
+  "embedding": {
+    "filter": "nonexistent-tag",
+    "returned": [
+      {
+        "title": "QUARANTINED_AUDIT",
+        "tags": [
+          "excluded"
+        ],
+        "integrity": "quarantined"
+      },
+      {
+        "title": "Audit stale",
+        "tags": [],
+        "integrity": ""
+      },
+      {
+        "title": "Unverified wrong title",
+        "tags": [],
+        "integrity": "verified"
+      },
+      {
+        "title": "Audit room",
+        "tags": [],
+        "integrity": "verified"
+      },
+      {
+        "title": "审计测试资料",
+        "tags": [],
+        "integrity": ""
+      }
+    ],
+    "quarantinedSentToEmbedding": true
+  }
+}

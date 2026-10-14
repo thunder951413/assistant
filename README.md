@@ -254,6 +254,20 @@ knowledge-base/
 6. 在“资料整理”里搜索、筛选、编辑标签或批量处理。
 7. 在“AI 对话”里基于本地资料库提问。
 
+## 在 Codex 中使用项目
+
+项目网页和 Codex 是同一套资料工具的两个操作入口：网页用按钮和表单，Codex 用自然语言。项目内置 [assistant-knowledge-base skill](.agents/skills/assistant-knowledge-base/SKILL.md)，让 Codex 复用同一后端和当前知识库，完成抓取、更新、资料整理和问答。在本项目的 Codex 对话中可以调用：
+
+```text
+$assistant-knowledge-base 搜索 Samsung 的 Tizen、eCODE、代码下载、编译和 BM test 指南，抓到资料库。
+$assistant-knowledge-base 更新 Teams 的 BM Test 订阅，并说明新增内容。
+$assistant-knowledge-base 基于已有资料整理 T6D 下载与编译步骤，注明来源。
+```
+
+Codex 会先确认页面使用的后端地址，并通过 `/api/agent-config` 获取实际资料库目录；创建、刷新和编辑通过同一后端 API 完成。写入后重新加载项目页面即可看到，页面新增的资料也可直接供 Codex 检索。两个对话入口的消息历史和使用的模型各自独立。
+
+开发服务与 Electron 应用可能使用不同端口和存储目录，不能仅凭仓库中存在 `knowledge-base/` 就认定它是当前资料库。skill 还包含 Confluence 页面 ID 去重、代码块保留，以及 Teams 异步刷新与登录确认的操作说明。
+
 ## Webdriver 登录抓取
 
 对于需要登录、SSO 或动态渲染的页面，可以使用 Webdriver 抓取：

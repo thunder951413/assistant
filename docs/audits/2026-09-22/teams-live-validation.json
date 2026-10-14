@@ -1,0 +1,42 @@
+{
+  "group": "Roku Announced",
+  "checkedAt": "2026-09-22T04:15:55.119Z",
+  "initialVisible": 28,
+  "captured": 82,
+  "uniqueIds": 82,
+  "missingAuthors": 9,
+  "missingTimes": 9,
+  "coverage": {
+    "observedCount": 82,
+    "maxScrolls": 18,
+    "minScrollsBeforeOverlapStop": 2,
+    "stoppedBy": "limit"
+  },
+  "durationMs": 26557,
+  "stored": 82,
+  "repeatedCaptureUpdated": false,
+  "completeness": "partial",
+  "firstTime": "2026-04-24T09:23:50.323Z",
+  "lastTime": "2026-09-20T13:11:04.418Z",
+  "incremental": {
+    "group": "Roku Announced",
+    "checkedAt": "2026-09-22T04:16:45.267Z",
+    "initialVisible": 28,
+    "captured": 36,
+    "uniqueIds": 36,
+    "missingAuthors": 1,
+    "missingTimes": 1,
+    "coverage": {
+      "observedCount": 36,
+      "maxScrolls": 18,
+      "minScrollsBeforeOverlapStop": 2,
+      "stoppedBy": "previous-overlap"
+    },
+    "durationMs": 7058,
+    "stored": 82,
+    "repeatedCaptureUpdated": false,
+    "completeness": "partial",
+    "firstTime": "2026-09-15T01:01:24.727Z",
+    "lastTime": "2026-09-20T13:11:04.418Z"
+  }
+}

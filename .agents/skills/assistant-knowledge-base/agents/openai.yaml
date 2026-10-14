@@ -1,0 +1,4 @@
+interface:
+  display_name: "Assistant 资料库协作"
+  short_description: "在 Codex 中抓取、更新和查询 Assistant 资料，与项目页面共用同一知识库"
+  default_prompt: "使用 $assistant-knowledge-base 连接项目当前资料库，完成我指定的抓取、更新或问答，并核对页面和 Codex 使用同一套数据。"
