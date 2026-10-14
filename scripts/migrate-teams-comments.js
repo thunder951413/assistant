@@ -29,8 +29,11 @@ const itemsDir = path.join(kbDir, "items");
 const store = createItemStore(() => ({ itemsDir, tagsDir: path.join(kbDir, "tags"), indexesDir: path.join(kbDir, "indexes") }));
 
 const STABLE_ID = /^(?:message-body-)?\d{13}$/;
-const DATE_DIVIDER = /^(?:(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),? )?(?:(?:January|February|March|April|May|June|July|August|September|October|November|December) \d{1,2}(?:, \d{4})?|Today|Yesterday|昨天|今天|\d{4}年\d{1,2}月\d{1,2}日.*|\d{1,2}月\d{1,2}日.*|星期.)$/i;
-const ROW_TIME = String.raw`\d{1,2}/\d{1,2}(?:/\d{2,4})?(?:,)? \d{1,2}:\d{2}(?::\d{2})?\s?(?:AM|PM|上午|下午)?`;
+const WEEKDAY = "Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday";
+const DATE_DIVIDER = new RegExp(`^(?:(?:${WEEKDAY})|(?:(?:${WEEKDAY}),? )?(?:(?:January|February|March|April|May|June|July|August|September|October|November|December) \\d{1,2}(?:, \\d{4})?)|Today|Yesterday|昨天|今天|\\d{4}年\\d{1,2}月\\d{1,2}日.*|\\d{1,2}月\\d{1,2}日.*|星期.)$`, "i");
+// Row header time as Teams printed it: "7/29/2025 10:21 AM", "6/8 10:08 AM",
+// "Wednesday 3:00 PM", "Yesterday 9:12 AM" or just "3:00 PM".
+const ROW_TIME = String.raw`(?:\d{1,2}/\d{1,2}(?:/\d{2,4})?,? |(?:${WEEKDAY}|Yesterday|Today|昨天|今天) )?\d{1,2}:\d{2}(?::\d{2})?\s?(?:AM|PM|上午|下午)?`;
 const collapse = (value) => String(value || "").replace(/\s+/g, " ").trim();
 const escapeRe = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 

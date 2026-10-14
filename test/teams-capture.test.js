@@ -173,4 +173,12 @@ describe("Teams capture extraction", () => {
     const first = await run([], 30);
     assert.equal(first.coverage.gap, false, "a first capture has no previous position to miss");
   });
+
+  it("drops a legacy generic-id row once the same message arrives with its real id", () => {
+    const stored = mergeTeamsCommentsByIdentity(
+      [{ id: "chat-pane-item", author: "Linyang Li", createdAt: "2026-07-15T07:28:12.559Z", body: "legacy row" }],
+      [{ id: "1784100492559", author: "Linyang Li", createdAt: "2026-07-15T07:28:12.559Z", body: "clean text" }]
+    );
+    assert.deepEqual(stored.map((c) => c.id), ["1784100492559"]);
+  });
 });

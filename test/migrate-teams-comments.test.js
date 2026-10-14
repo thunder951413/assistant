@@ -5,6 +5,9 @@ import { migrateComments, restoreLegacyBody } from "../scripts/migrate-teams-com
 it("restores bodies, drops date dividers and legacy duplicates, never real Teams ids", () => {
   assert.equal(restoreLegacyBody({ author: "Shaohua Huang", body: "前面调不了... by Shaohua Huang Shaohua Huang 7/3 9:36 AM Translate 前面调不了是什么原因" }), "前面调不了是什么原因");
   assert.equal(restoreLegacyBody({ author: "Changwen Dai", body: "ok by Changwen Dai Changwen Dai 7/29/2025 10:21 AM ok" }), "ok");
+  assert.equal(restoreLegacyBody({ author: "yahui han", body: "可以分成两步... by yahui han yahui han Wednesday 3:30 PM Edited Translate 可以分成两步来处理" }), "可以分成两步来处理");
+  assert.equal(restoreLegacyBody({ author: "Ada", body: "hi by Ada Ada 3:30 PM hi there" }), "hi there");
+  assert.equal(migrateComments([{ id: "chat-pane-item", author: "", body: "Wednesday" }]).comments.length, 0);
   const { comments, stats } = migrateComments([
     { id: "chat-pane-item", author: "", createdAt: "", body: "Friday, December 5, 2025" },
     { id: "chat-pane-item", author: "Hao Zhao", createdAt: "2026-06-08T02:08:27.469Z", body: "x... by Hao Zhao Hao Zhao 6/8 10:08 AM Translate full text" },

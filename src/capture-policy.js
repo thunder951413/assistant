@@ -198,6 +198,14 @@ export function mergeTeamsCommentsByIdentity(existing = [], observed = []) {
   const merged = new Map();
   for (const comment of existing) addComment(merged, comment, false);
   for (const comment of observed) addComment(merged, comment, true);
+  // Rows stored by older extractors under a generic id are superseded once the same
+  // message (same author and exact time) is stored under its real Teams id.
+  const stableAt = new Set([...merged.entries()]
+    .filter(([key, comment]) => key.startsWith("id:") && comment.author && comment.createdAt)
+    .map(([, comment]) => `${collapse(comment.author)}\n${comment.createdAt}`));
+  for (const [key, comment] of merged) {
+    if (!key.startsWith("id:") && comment.createdAt && stableAt.has(`${collapse(comment.author)}\n${comment.createdAt}`)) merged.delete(key);
+  }
   return [...merged.values()].sort(compareComments);
 }
 
