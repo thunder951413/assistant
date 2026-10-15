@@ -94,7 +94,7 @@ const port = Number(process.env.PORT || 8020);
 const host = process.env.HOST || "127.0.0.1";
 
 await ensureKnowledgeBase();
-await rebuildIndexes();
+await store.rebuildIndexes();
 await migrateMisclassifiedListUrls();
 await syncContentRefreshJobsFromItems();
 await reconcileStaleRunningRefreshJobs();
@@ -366,6 +366,7 @@ api.post("/api/ask-context", async ({ req, res }) => {
 });
 
 api.get("/api/agent-config", async ({ res }) => {
+  await flushIndexRebuild();
   sendJson(res, 200, {
     rootDir: kbDir,
     guidePath: path.join(kbDir, "AGENTS.md")
@@ -1306,16 +1307,9 @@ function mergeCapturedComments(existing = [], observed = []) {
 }
 
 async function findItemByUrl(url) {
-  const normalized = normalizeUrlForMatch(url);
-  if (!normalized) return null;
-  const dirs = await safeReaddir(itemsDir);
-  for (const id of dirs) {
-    const metadataPath = path.join(itemsDir, id, "metadata.json");
-    if (!(await exists(metadataPath))) continue;
-    const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
-    if (normalizeUrlForMatch(metadata.url) === normalized) return metadata;
-  }
-  return null;
+  const found = await store.findByUrl(url, normalizeUrlForMatch);
+  // Callers may extend the result; hand out a copy of the cached metadata.
+  return found ? { ...found } : null;
 }
 
 async function withItemUrlMutationLock(url, task) {
@@ -2797,8 +2791,24 @@ async function writeManualTags(tags) {
   await fs.writeFile(path.join(indexesDir, "tags-manual.json"), `${JSON.stringify({ tags: normalizeTags(tags) }, null, 2)}\n`, "utf8");
 }
 
-async function rebuildIndexes() {
-  return store.rebuildIndexes();
+// indexes/*.json are for external tools (Codex, AGENTS.md); the server never reads
+// them. Coalesce bursts of writes into one rebuild instead of one per item.
+let indexRebuildTimer = null;
+function rebuildIndexes() {
+  clearTimeout(indexRebuildTimer);
+  indexRebuildTimer = setTimeout(() => {
+    indexRebuildTimer = null;
+    store.rebuildIndexes().catch((error) => console.warn("Index rebuild failed:", error.message || error));
+  }, 1500);
+  indexRebuildTimer.unref?.();
+  return Promise.resolve();
+}
+
+async function flushIndexRebuild() {
+  if (!indexRebuildTimer) return;
+  clearTimeout(indexRebuildTimer);
+  indexRebuildTimer = null;
+  await store.rebuildIndexes();
 }
 
 function startRefreshScheduler() {
@@ -3991,6 +4001,8 @@ const topicMaterialCache = new Map();
 async function loadTopicMaterials() {
   const list = await listItems({ includeLists: false });
   const materials = [];
+  const live = new Set(list.map((metadata) => metadata.id));
+  for (const id of topicMaterialCache.keys()) if (!live.has(id)) topicMaterialCache.delete(id);
   for (const metadata of list) {
     if (!isStreamCandidate(metadata)) continue;
     const key = [metadata.lastFetchedAt, metadata.updatedAt, metadata.processedAt, metadata.processedStale].join("|");
@@ -6139,6 +6151,7 @@ async function importSettingsBundle(payload) {
 }
 
 async function exportDataBundle() {
+  await flushIndexRebuild();
   await ensureKnowledgeBase();
   const bundle = await store.runExclusive(() => exportBundle(kbDir));
   return { ...bundle, documentRootName: path.basename(kbDir), fileCount: bundle.files.length };

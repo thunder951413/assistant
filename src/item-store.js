@@ -132,6 +132,9 @@ export function createItemStore(getDirs) {
   // Parsed item files keyed by id, validated against file inode/size/mtime so that
   // edits made outside the store (an editor, a sync tool) are still picked up.
   const readCache = new Map();
+  // metadata.json only, keyed by id and validated by file stamp: lookups by URL
+  // need one stat per item instead of reading and parsing every file.
+  const metadataCache = new Map();
   const derivedCache = new WeakMap();
   let operationTail = Promise.resolve();
   const diagnostics = [];
@@ -221,6 +224,38 @@ export function createItemStore(getDirs) {
     return withRecoveredStoreLock(async () => {
       return readNow(id);
     });
+  }
+
+  async function allMetadataNow() {
+    const result = [];
+    const seen = new Set();
+    for (const id of await safeReaddir(itemsDir())) {
+      if (id.startsWith(".")) continue;
+      const file = path.join(itemsDir(), id, "metadata.json");
+      let stamp;
+      try { stamp = await fileStamp(file); } catch { continue; }
+      if (stamp === "-") continue;
+      seen.add(id);
+      const cached = metadataCache.get(id);
+      if (cached?.stamp === stamp) { result.push(cached.metadata); continue; }
+      try {
+        const metadata = Object.freeze(JSON.parse(await fs.readFile(file, "utf8")));
+        metadataCache.set(id, { stamp, metadata });
+        result.push(metadata);
+      } catch (error) {
+        metadataCache.delete(id);
+        recordDiagnostic({ id, error: `metadata.json: ${error.message}`, observedAt: new Date().toISOString() });
+      }
+    }
+    for (const id of metadataCache.keys()) if (!seen.has(id)) metadataCache.delete(id);
+    return result;
+  }
+
+  // First item whose URL matches under the caller's normalization (read-only view).
+  function findByUrl(url, normalize = (value) => value) {
+    const target = normalize(url);
+    if (!target) return Promise.resolve(null);
+    return withRecoveredStoreLock(async () => (await allMetadataNow()).find((metadata) => normalize(metadata.url || "") === target) || null);
   }
 
   // Returns a shared, read-only view of one item. Callers must not mutate it.
@@ -548,6 +583,7 @@ export function createItemStore(getDirs) {
   }
 
   return {
+    findByUrl,
     read,
     readAll,
     derived,
