@@ -207,3 +207,77 @@ export function appendSourceList(text, refs) {
   const lines = refs.map((ref) => `- [${ref.index}] ${ref.title}${ref.url ? ` — ${ref.url}` : ""}`);
   return `${String(text || "").trim()}\n\n## 出处\n\n${lines.join("\n")}\n`;
 }
+
+// Drop quoted reply lines ("> ...") so the preview shows what was actually said.
+export function previewText(body, limit = 160) {
+  const lines = String(body || "").split("\n");
+  const own = lines.filter((line) => !/^\s*>/.test(line)).join(" ");
+  return clip(own.trim() ? own : lines.join(" "), limit);
+}
+
+// Capture preambles ("Source: …", "Page ID: …", refresh notes) are not content.
+const PREAMBLE_LINE = /^\s*(Source:|Adapter:|URL:|Page ID|Space:|Version:|Fetched|Captured|Labels:|Latest Refresh|Previous length|Current length|Delta|Length delta|Last updated|Updated:|Source updated|No comments captured|_No |Comments:|Page version|Ancestors|Author:|State:|Status:|-{3,}|\|)/i;
+
+export function pageExcerpt(body, limit = 160) {
+  const lines = String(body || "").split("\n")
+    .filter((line) => !/^\s*#\s/.test(line))
+    .map((line) => line
+      .replace(/^\s*\\?#+\s*/, "")
+      .replace(/!?\[(?:图片|image|附件)[^\]]*\]\([^)]*\)/gi, "")
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
+      .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+      .replace(/^\s*[-*>]\s+/, "").replace(/[*_`]/g, "").trim())
+    .filter((line) => line && !PREAMBLE_LINE.test(line) && !/^https?:\/\/\S+$/.test(line) && !/^Content$/i.test(line));
+  return clip(lines.join(" "), limit);
+}
+
+// Calls, reactions and other system lines ("[通话]", "[👍]") are not worth previewing.
+export function isMeaningfulMessage(comment) {
+  const text = String(comment?.body || "").trim();
+  if (!text || !comment?.author) return false;
+  return !/^\[[^\]\n]{1,12}\]$/.test(text);
+}
+
+/**
+ * Inbox-style preview per item: the newest message and how many arrived since
+ * the person last read it. Items without messages get no entry (the client
+ * falls back to the page excerpt).
+ */
+export function latestMessagePreviews(items) {
+  const previews = {};
+  for (const item of items) {
+    const metadata = item.metadata || {};
+    if (!isStreamCandidate(metadata)) continue;
+    let newest = null;
+    let newestMeaningful = null;
+    let total = 0;
+    let newCount = 0;
+    const readAt = parseEventTime(metadata.updateAcknowledgedAt);
+    const unread = Boolean(metadata.contentUpdatedAt || metadata.pendingContentUpdatedAt);
+    for (const comment of item.comments || []) {
+      const at = parseEventTime(comment.createdAt);
+      if (!Number.isFinite(at) || !String(comment.body || "").trim()) continue;
+      total += 1;
+      if (unread && (!Number.isFinite(readAt) || at > readAt)) newCount += 1;
+      if (!newest || at > newest.at) newest = { at, comment };
+      if (isMeaningfulMessage(comment) && (!newestMeaningful || at > newestMeaningful.at)) newestMeaningful = { at, comment };
+    }
+    if (!newest) {
+      // Pages without messages: the first real sentences of the content.
+      const text = pageExcerpt(item.processedBody && !metadata.processedStale ? item.processedBody : item.body);
+      if (text) previews[metadata.id] = { kind: "page", author: "", at: "", text, total: 0, newCount: null };
+      continue;
+    }
+    const shown = newestMeaningful || newest;
+    previews[metadata.id] = {
+      author: shown.comment.author || "",
+      at: new Date(shown.at).toISOString(),
+      kind: "message",
+      text: previewText(shown.comment.body),
+      total,
+      // Without a read mark every message would count as new; show just "新" then.
+      newCount: Number.isFinite(readAt) ? newCount : null
+    };
+  }
+  return previews;
+}

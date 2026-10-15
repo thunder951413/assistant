@@ -55,6 +55,7 @@
                   <button type="button" role="tab" data-feed-mode="topic" aria-selected="true">按话题</button>
                   <button type="button" role="tab" data-feed-mode="time" aria-selected="false">按时间</button>
                 </div>
+                <button id="feedPreviewToggle" class="preview-toggle" type="button" aria-pressed="true" title="在每条下面显示最新消息">预览</button>
                 <button id="homeMarkAllReadButton" class="quiet-button" type="button" hidden>全部标为已读</button>
               </div>
               <div id="streamFilters" class="stream-filters" hidden></div>
@@ -119,7 +120,10 @@
               </details>
             </div>
             <div id="listScope" class="list-scope" hidden></div>
-            <p id="resultCount" class="list-count">准备载入</p>
+            <div class="list-count-row">
+              <p id="resultCount" class="list-count">准备载入</p>
+              <button id="listPreviewToggle" class="preview-toggle" type="button" aria-pressed="true" title="在每条下面显示最新消息">预览</button>
+            </div>
             <div id="itemList" class="item-list"></div>
           </section>
           <article id="detailPanel" class="reader" aria-label="资料内容">

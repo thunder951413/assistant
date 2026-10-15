@@ -64,3 +64,19 @@ test("overview input prefers a current organized version and keeps Markdown line
   assert.doesNotMatch(input.user, /旧整理版/);
   assert.match(appendSourceList("正文", input.refs), /## 出处\n\n- \[1\]/);
 });
+
+test("previews: newest meaningful message, new count only with a read mark, page excerpts skip preambles", async () => {
+  const { latestMessagePreviews, pageExcerpt } = await import("../src/topics.js");
+  const chat = item("chat", { contentUpdatedAt: "2026-10-14T05:00:00Z", updateAcknowledgedAt: "2026-10-14T01:30:00Z", comments: [
+    { id: "1", author: "A", createdAt: "2026-10-14T01:00:00Z", body: "old" },
+    { id: "2", author: "B", createdAt: "2026-10-14T02:00:00Z", body: "> quoted reply\n真正的回复" },
+    { id: "3", author: "", createdAt: "2026-10-14T03:00:00Z", body: "[通话]" }
+  ] });
+  const neverRead = item("never", { contentUpdatedAt: "2026-10-14T05:00:00Z", comments: [{ id: "1", author: "A", createdAt: "2026-10-14T01:00:00Z", body: "hi" }] });
+  const page = { ...item("page", { source: "confluence" }), body: "# page\n## Content\nSource: https://x\nSource updated: 2026\n正文第一句。" };
+  const previews = latestMessagePreviews([chat, neverRead, page]);
+  assert.deepEqual([previews.chat.author, previews.chat.text, previews.chat.newCount], ["B", "真正的回复", 2]);
+  assert.equal(previews.never.newCount, null);
+  assert.deepEqual([previews.page.kind, previews.page.text], ["page", "正文第一句。"]);
+  assert.equal(pageExcerpt("###### 1.步骤\n![img](x.png) [链接](http://a)"), "1.步骤 链接");
+});

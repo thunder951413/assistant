@@ -42,7 +42,7 @@ import { assertFetchedPageIsAuthenticated, confluenceHtmlToMarkdown, detectAuthe
 import { activateTeamsChatArea, clickTeamsConversationById, clickTeamsConversationCandidate, closeTeamsChatListFilter, currentTeamsConversationTitle, extractTeamsConversationId, extractTeamsDeepPath, extractTeamsFromPage, filterTeamsChatList, isTeamsWebAppReady, openTeamsConversationFromUi, renderTeamsTextFromComments, scrollTeamsMessages, teamsConversationTitleForJob, validateTeamsExtraction, waitForTeamsConversation, waitForTeamsConversationTitle, waitForTeamsReady } from "./sources/teams-page.js";
 import { clickGithubLoadMore, githubPageGrowthSnapshot } from "./sources/github-page.js";
 import { buildGithubIssueSearchApiUrls, collectGithubIssueRows, githubIssueRowsToEntries, githubIssueSearchPageUrl, githubIssueSearchTitle, isGithubIssueSearchUrl, renderGithubIssueSearchText } from "./sources/github-issue-search.js";
-import { ALL_FAVORITES, appendSourceList, buildOverviewInput, buildRecentInput, collectStream, isStreamCandidate, itemMatchesTopic, normalizeFavoriteTags } from "./topics.js";
+import { ALL_FAVORITES, appendSourceList, buildOverviewInput, buildRecentInput, collectStream, isStreamCandidate, itemMatchesTopic, latestMessagePreviews, normalizeFavoriteTags } from "./topics.js";
 import { MEMBERSHIP_KEPT, MEMBERSHIP_LEFT, MEMBERSHIP_MEMBER, diffListMembership, membershipPatch, shouldSkipByListFingerprint } from "./list-membership.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -215,6 +215,11 @@ api.get("/api/stream", async ({ url, res }) => {
     limit: Math.min(1000, Math.max(1, Number(url.searchParams.get("limit")) || 300))
   });
   sendJson(res, 200, { ...result, days });
+});
+
+// Inbox-style previews: newest message per item and the count since last read.
+api.get("/api/previews", async ({ res }) => {
+  sendJson(res, 200, { previews: latestMessagePreviews(await loadTopicMaterials()) });
 });
 
 api.get("/api/topics", async ({ res }) => {
