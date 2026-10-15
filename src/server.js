@@ -5286,22 +5286,45 @@ async function saveWebdriverCookies(url, hostname) {
   };
 }
 
+// One launch per profile at a time: concurrent callers for the same site share it
+// (two persistent contexts on one profile directory would fight over its lock).
+const webdriverLaunches = new Map();
+
 async function ensureWebdriverSession(hostname, url, options = {}) {
+  const key = hostname || safeHostname(url) || "default";
+  while (webdriverLaunches.has(key)) await webdriverLaunches.get(key).catch(() => {});
+  const launch = ensureWebdriverSessionUnshared(key, url, options);
+  webdriverLaunches.set(key, launch);
+  try {
+    return await launch;
+  } finally {
+    if (webdriverLaunches.get(key) === launch) webdriverLaunches.delete(key);
+  }
+}
+
+async function waitForWebdriverIdle(session, timeoutMs = 120000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Number(session.activeOperations || 0) > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+}
+
+async function ensureWebdriverSessionUnshared(key, url, options = {}) {
   const normalizedOptions = typeof options === "boolean" ? { headed: options } : options;
   const headed = Boolean(normalizedOptions.headed);
   const manual = Boolean(normalizedOptions.manual);
-  const key = hostname || safeHostname(url) || "default";
   const profile = settings.sources?.[key] || {};
   const headless = headed ? false : Boolean(profile.webdriverHeadless);
   const autoClose = Boolean(normalizedOptions.autoClose && !manual);
   const windowMode = normalizeWebdriverWindowMode(normalizedOptions.windowMode || profile.webdriverWindowMode);
   const existing = webdriverSessions.get(key);
   if (existing) {
-    if ((headed && existing.headless) || (manual && !existing.manual) || existing.windowMode !== windowMode) {
-      await existing.context.close();
-    } else {
-      return existing;
-    }
+    const needsRelaunch = (headed && existing.headless) || (manual && !existing.manual);
+    const inUse = Number(existing.activeOperations || 0) > 0;
+    // A different window placement alone is not worth interrupting work in progress.
+    if (!needsRelaunch && (existing.windowMode === windowMode || inUse)) return existing;
+    if (inUse) await waitForWebdriverIdle(existing);
+    await existing.context.close().catch(() => {});
   }
 
   await fs.mkdir(webdriverRoot, { recursive: true });
@@ -5340,7 +5363,9 @@ async function ensureWebdriverSession(hostname, url, options = {}) {
   };
   if (/teams/i.test(key)) recordChatsvcAuth(context, session);
   webdriverSessions.set(key, session);
-  context.on("close", () => webdriverSessions.delete(key));
+  context.on("close", () => {
+    if (webdriverSessions.get(key) === session) webdriverSessions.delete(key);
+  });
   return session;
 }
 
