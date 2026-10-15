@@ -36,17 +36,36 @@
 ```text
 .
 ├── src/
-│   ├── server.js            # HTTP 服务入口、API 路由、抓取/刷新编排、AI 调用与设置管理
-│   ├── item-store.js        # 资料读写、事务提交、带缓存的批量读取、索引重建
+│   ├── server.js            # 组合根：配置、ctx 依赖对象、各服务工厂的装配、API 路由与启动
+│   ├── item-service.js      # 资料的新增、更新、去重与列表/详情视图
+│   ├── item-store.js        # 资料读写、事务提交（硬链接暂存）、带缓存的批量读取与按 URL 查找、索引重建
+│   ├── refresh-jobs.js      # 订阅（刷新任务）的增删改、列表子项清理、凭据可用性判断
+│   ├── refresh-runner.js    # 刷新调度、并发与运行状态
+│   ├── refresh-capture.js   # 单次刷新抓取：选择 API 或 WebDriver、合并与写入
+│   ├── list-membership.js   # 列表/搜索订阅的成员跟踪
+│   ├── knowledge-search.js  # 知识库检索与问答上下文
+│   ├── ai-actions.js / ai-processing.js            # AI 整理、摘要等动作与批处理
+│   ├── tags-service.js / topics-service.js / topics.js # 标签、主题（关注标签）、主题摘要与预览
+│   ├── supplemental.js      # 补充资料（术语表、笔记等）
+│   ├── settings-service.js / settings-store.js     # 设置读写；配置与运行时任务状态分文件、合并写入
+│   ├── settings-schema.js   # 设置、刷新任务、来源配置的默认值与规范化
+│   ├── source-urls.js / data-maintenance.js        # 来源 URL 识别与启动时的数据迁移
+│   ├── app-bundle.js        # 拼接 public/app/ 前端脚本，并为 index.html 生成内容哈希版本号
 │   ├── retrieval.js         # 检索分词、关键词打分、结果多样化、向量与上下文片段
 │   ├── storage-maintenance.js # 快照压缩与裁剪、WebDriver 浏览器缓存清理
-│   ├── settings-schema.js   # 设置、刷新任务、来源配置的默认值与规范化
 │   ├── ai-client.js / ai-policy.js / ai-local.js  # 模型请求、出站策略、无模型时的本地兜底
 │   ├── capture-policy.js / capture-utils.js        # 抓取完整性、Teams 合并、调度时间窗
 │   ├── atomic-files.js / bundle-store.js           # 原子写入、数据导入导出
 │   ├── api-security.js / router.js / http-utils.js # 本机接口校验、路由、响应工具
 │   ├── text-helpers.js / fs-helpers.js / utils.js  # 通用文本与文件工具
+│   ├── webdriver/
+│   │   ├── sessions.js      # 浏览器会话的启动、复用与并发保护
+│   │   ├── auth.js          # 登录状态检测与登录流程
+│   │   └── fetch.js         # 通过 WebDriver 抓取页面
 │   └── sources/
+│       ├── api-fetch.js          # GitHub / Jira 等 API 抓取
+│       ├── github-issue-search.js # GitHub issue 搜索订阅
+│       ├── teams-chatsvc.js      # Teams 消息接口
 │       ├── html-extractors.js    # Jira、Confluence、GitHub、通用网页的 HTML 解析
 │       ├── confluence-comments.js # Confluence 评论分页与回复
 │       ├── github-pull.js        # GitHub PR 评论、review、行内 review 评论
@@ -60,6 +79,7 @@
 │   └── main.js          # Electron 桌面应用入口
 ├── scripts/
 │   ├── service.js       # 后台服务启停脚本
+│   ├── check.mjs        # npm run check：所有脚本及拼接后前端的语法检查
 │   └── install-playwright-browsers.js
 ├── test/                # node:test 测试：工具函数、存储、检索、抓取适配、HTTP 行为、UI 流程
 ├── test-support/        # 测试专用预加载脚本
