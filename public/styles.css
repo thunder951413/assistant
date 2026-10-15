@@ -847,8 +847,8 @@ progress { width: 100%; accent-color: var(--accent); }
 .topic-tabs { margin-bottom: 16px; }
 .topic-body { display: grid; gap: 14px; }
 .digest-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-radius: 8px; background: var(--surface-2); }
-.digest-bar p { margin: 0; }
-.digest-bar .primary-button { flex-shrink: 0; }
+.digest-bar p { flex: 1; margin: 0; }
+.digest-bar button { flex-shrink: 0; }
 .digest { max-width: 82ch; }
 .digest h2 { margin-top: 22px; font-size: 16px; }
 .digest h2:first-child { margin-top: 0; }

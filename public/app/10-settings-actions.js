@@ -93,22 +93,7 @@ async function toggleDoNotDisturb() {
 async function downloadExport(path) {
   importExportStatus.textContent = "正在生成导出文件...";
   try {
-    const response = await fetch(path);
-    if (!response.ok) {
-      const payload = await response.json().catch(() => ({}));
-      throw new Error(payload.error || `导出失败：${response.status}`);
-    }
-    const blob = await response.blob();
-    const filename = filenameFromDisposition(response.headers.get("Content-Disposition"))
-      || (path.includes("settings") ? "assistant-settings.json" : "assistant-data.json");
-    const href = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = href;
-    link.download = filename;
-    document.body.append(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(href);
+    const filename = await downloadFile(path, path.includes("settings") ? "assistant-settings.json" : "assistant-data.json");
     importExportStatus.textContent = `已导出 ${filename}。`;
   } catch (error) {
     importExportStatus.textContent = error.message;

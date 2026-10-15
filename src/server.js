@@ -15,7 +15,7 @@ import { paginate } from "./capture-utils.js";
 import { createItemStore } from "./item-store.js";
 import { computeSourceHealth, createRunHistory } from "./reliability.js";
 import { exists, resolveWritableDir } from "./fs-helpers.js";
-import { readBody, securityHeaders, sendJson, sendJsonDownload, withResponseCancellation } from "./http-utils.js";
+import { readBody, securityHeaders, sendJson, sendJsonDownload, sendTextDownload, withResponseCancellation } from "./http-utils.js";
 import { collectStream, latestMessagePreviews, normalizeFavoriteTags } from "./topics.js";
 import { createKnowledgeSearch } from "./knowledge-search.js";
 import { createTagsService } from "./tags-service.js";
@@ -26,6 +26,7 @@ import { createSettingsService } from "./settings-service.js";
 import { createSourceUrls } from "./source-urls.js";
 import { createDataMaintenance } from "./data-maintenance.js";
 import { createItemService } from "./item-service.js";
+import { itemExportMarkdown, topicDigestExportMarkdown } from "./markdown-export.js";
 import { createRefreshJobs } from "./refresh-jobs.js";
 import { createRefreshRunner } from "./refresh-runner.js";
 import { createRefreshCapture } from "./refresh-capture.js";
@@ -271,6 +272,11 @@ api.get("/api/items/:id", async ({ params, res }) => {
   sendJson(res, 200, { item });
 });
 
+api.get("/api/items/:id/export.md", async ({ params, res }) => {
+  const { filename, content } = itemExportMarkdown(await readItem(params.id));
+  sendTextDownload(res, filename, content);
+});
+
 api.get("/api/items/:id/diff", async ({ params, res }) => {
   sendJson(res, 200, { diff: await itemLatestDiff(params.id) });
 });
@@ -347,6 +353,13 @@ api.post("/api/topics/favorites", async ({ req, res }) => {
 
 api.get("/api/topics/:tag/digest", async ({ params, res }) => {
   sendJson(res, 200, { digest: await readTopicDigest(params.tag) });
+});
+
+api.get("/api/topics/:tag/digest/export.md", async ({ params, url, res }) => {
+  const mode = url.searchParams.get("mode") === "recent" ? "recent" : "overview";
+  const days = Math.min(90, Math.max(1, Number(url.searchParams.get("days")) || 7));
+  const { filename, content } = topicDigestExportMarkdown(params.tag, await readTopicDigest(params.tag), { mode, days });
+  sendTextDownload(res, filename, content);
 });
 
 api.post("/api/topics/:tag/digest", async ({ params, req, res }) => {

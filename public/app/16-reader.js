@@ -166,11 +166,13 @@ function renderDetail(item) {
         </div>
         <div class="toolbar-spacer"></div>
         ${metadata.url ? `<button id="refreshButton" type="button">检查更新</button>` : ""}
+        ${mode === "processed" && hasProcessed ? `<button id="exportItemButton" type="button" class="quiet-button">导出 Markdown</button>` : ""}
         <button id="processItemButton" type="button" ${quarantined ? "disabled" : ""}>${escapeHtml(processLabel)}</button>
         <details class="menu">
           <summary class="icon-button" aria-label="更多操作">⋯</summary>
           <div class="menu-panel">
             <button id="diffItemButton" type="button">对比上次的变化</button>
+            ${hasProcessed ? `<button id="exportItemMenuButton" type="button">把整理版导出为 Markdown</button>` : ""}
             <button id="generateTitleButton" type="button" ${quarantined ? "disabled" : ""}>用 AI 生成标题</button>
             ${hasProcessed ? `<button id="fullProcessButton" type="button" ${quarantined ? "disabled" : ""}>完整重新整理</button>` : ""}
             <button id="deleteItemButton" type="button" class="danger-button">删除这条资料</button>
@@ -245,6 +247,10 @@ function bindReaderEvents(item, { mode }) {
   };
   document.querySelector("#processItemButton")?.addEventListener("click", (event) => runProcess(event.currentTarget));
   detailPanel.querySelectorAll("[data-banner-process]").forEach((button) => button.addEventListener("click", () => runProcess(button)));
+  detailPanel.querySelectorAll("#exportItemButton, #exportItemMenuButton").forEach((button) => button.addEventListener("click", () => {
+    button.closest("details")?.removeAttribute("open");
+    exportMarkdown(`/api/items/${encodeURIComponent(metadata.id)}/export.md`, `${metadata.title || "整理"}.md`);
+  }));
   document.querySelector("#fullProcessButton")?.addEventListener("click", (event) => runProcess(event.currentTarget, true));
 
   document.querySelector("#generateTitleButton")?.addEventListener("click", async (event) => {

@@ -32,6 +32,17 @@ export function sendJsonDownload(res, filename, payload) {
   res.end(content);
 }
 
+// Text download with a UTF-8 file name (RFC 5987) and an ASCII fallback.
+export function sendTextDownload(res, filename, content, contentType = "text/markdown; charset=utf-8") {
+  const fallback = filename.replace(/[^\x20-\x7e]+/g, "_").replace(/["\\]/g, "_") || "export";
+  res.writeHead(200, {
+    "Content-Type": contentType,
+    "Content-Disposition": `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+    ...securityHeaders()
+  });
+  res.end(content);
+}
+
 export function startSse(res) {
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",

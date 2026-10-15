@@ -226,6 +226,7 @@ function renderTopicTab(tag, topic) {
     return `
       <div class="digest-bar">
         <p class="muted">${entry ? `生成于 ${escapeHtml(formatDate(entry.generatedAt))}，基于 ${escapeHtml(entry.itemCount)} 条资料${entry.excludedCount ? `（${escapeHtml(entry.excludedCount)} 条按设置不发送给 AI）` : ""}${entry.omitted ? `，另有 ${escapeHtml(entry.omitted)} 条因篇幅未包含` : ""}。` : "把这个专题的所有资料放在一起，让 AI 整理出现状、结论、未解决的问题和进展。"}</p>
+        ${entry && !busy ? `<button type="button" class="quiet-button" data-digest-export="overview">导出 Markdown</button>` : ""}
         <button type="button" class="primary-button" data-digest="overview" ${busy ? "disabled" : ""}>${busy ? "整理中…" : entry ? "重新整理" : "生成总览"}</button>
       </div>
       ${busy ? `<div class="empty-state compact">正在整理 ${escapeHtml(topic.itemCount)} 条资料，可能需要一两分钟。</div>` : renderDigestBlock(entry, "还没有总览。")}`;
@@ -237,6 +238,7 @@ function renderTopicTab(tag, topic) {
       ${daysPicker(state.topicDays, "data-topic-days")}
       <div class="digest-bar">
         <p class="muted">${preview === null ? "" : preview ? `这段时间有 ${escapeHtml(preview)} 条消息、评论或页面更新。` : "这段时间没有新内容。"}${entry ? ` 上次整理：${escapeHtml(formatDate(entry.generatedAt))}。` : ""}</p>
+        ${entry && !busy ? `<button type="button" class="quiet-button" data-digest-export="recent">导出 Markdown</button>` : ""}
         <button type="button" class="primary-button" data-digest="recent" ${busy || preview === 0 ? "disabled" : ""}>${busy ? "整理中…" : entry ? `重新整理这 ${escapeHtml(state.topicDays)} 天` : `整理这 ${escapeHtml(state.topicDays)} 天的更新`}</button>
       </div>
       ${busy ? `<div class="empty-state compact">正在整理最近 ${escapeHtml(state.topicDays)} 天的更新……</div>` : renderDigestBlock(entry, preview ? "点右上角按钮，让 AI 整理这段时间都有哪些更新。" : "选择更长的时间范围试试。")}`;
@@ -291,6 +293,11 @@ function bindTopicTab(tag) {
     setTopicDays(tag, days);
   });
   topicMain.querySelector("[data-digest]")?.addEventListener("click", (event) => generateTopicDigest(tag, event.currentTarget.dataset.digest));
+  topicMain.querySelector("[data-digest-export]")?.addEventListener("click", (event) => {
+    const mode = event.currentTarget.dataset.digestExport;
+    const query = new URLSearchParams({ mode, days: String(state.topicDays) });
+    exportMarkdown(`/api/topics/${encodeURIComponent(tag)}/digest/export.md?${query}`, `${topicLabel(tag)}.md`);
+  });
   const addSearch = topicMain.querySelector("[data-topic-add-search]");
   addSearch?.addEventListener("input", () => {
     state.topicAddQuery = addSearch.value;

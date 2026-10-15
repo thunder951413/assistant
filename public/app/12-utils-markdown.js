@@ -58,6 +58,35 @@ async function api(path, options = {}) {
   return payload;
 }
 
+// Fetches a download endpoint and saves the response under the server's file name.
+async function downloadFile(path, fallbackName) {
+  const response = await fetch(path);
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.error || `下载失败：${response.status}`);
+  }
+  const blob = await response.blob();
+  const filename = filenameFromDisposition(response.headers.get("Content-Disposition")) || fallbackName;
+  const href = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = href;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(href), 1000);
+  return filename;
+}
+
+async function exportMarkdown(path, fallbackName) {
+  try {
+    const filename = await downloadFile(path, fallbackName);
+    notify("已导出 Markdown", filename);
+  } catch (error) {
+    notify("没能导出", error.message, "error");
+  }
+}
+
 async function streamApi(path, body, handlers) {
   const response = await fetch(path, {
     method: "POST",
