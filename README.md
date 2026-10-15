@@ -54,7 +54,7 @@
 │       └── teams-page.js         # Teams 网页会话定位、滚动与消息提取（WebDriver）
 ├── public/
 │   ├── index.html       # 前端页面
-│   ├── app.js           # 前端交互逻辑
+│   ├── app/             # 前端交互逻辑，按功能分成有序的多个文件（01-…20-），服务端按文件名顺序拼成 /app.js
 │   └── styles.css       # 页面样式
 ├── desktop/
 │   └── main.js          # Electron 桌面应用入口

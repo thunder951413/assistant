@@ -3,7 +3,11 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { JSDOM } from "jsdom";
 
-const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+import { fileURLToPath } from "node:url";
+import { readAppSource } from "../src/app-bundle.js";
+
+// The browser receives public/app/*.js joined in order; test exactly that.
+const appSource = await readAppSource(fileURLToPath(new URL("../public", import.meta.url)));
 const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
 
 function deferred() {

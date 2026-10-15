@@ -1,3 +1,4 @@
+import { readAppSource, versionedIndexHtml } from "./app-bundle.js";
 import http from "node:http";
 import { randomBytes } from "node:crypto";
 import { validateApiRequest } from "./api-security.js";
@@ -742,6 +743,18 @@ async function flushIndexRebuild() {
 
 async function serveStatic(req, res, url) {
   const pathname = url.pathname === "/" ? "/index.html" : url.pathname;
+  // The app script is assembled from public/app/*.js; index.html carries content hashes.
+  if (pathname === "/app.js") {
+    res.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "public, max-age=3600", ...securityHeaders() });
+    res.end(await readAppSource(publicDir));
+    return;
+  }
+  if (pathname === "/index.html") {
+    const html = await versionedIndexHtml(publicDir, await fs.readFile(path.join(publicDir, "index.html"), "utf8"));
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache", ...securityHeaders() });
+    res.end(html);
+    return;
+  }
   const filePath = path.normalize(path.join(publicDir, pathname));
 
   if (!filePath.startsWith(publicDir)) {

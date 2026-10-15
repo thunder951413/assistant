@@ -33,7 +33,7 @@ describe("server regression guards", () => {
   it("continues Teams refreshes automatically and locates conversations inside the current page", async () => {
     const [serverSource, appSource] = await Promise.all([
       readServerSource(),
-      fs.readFile(path.join(root, "public", "app.js"), "utf8")
+      import("../src/app-bundle.js").then(({ readAppSource }) => readAppSource(path.join(root, "public")))
     ]);
     // No manual confirmation gate: readiness is detected, sign-in surfaces the window.
     assert.doesNotMatch(serverSource, /waitForTeamsUserConfirmation/);
