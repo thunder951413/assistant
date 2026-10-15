@@ -8,11 +8,21 @@ import {
   openTeamsConversationFromUi, waitForTeamsReady
 } from '../src/sources/teams-page.js';
 
-// fetchTeamsWithWebdriver is orchestration in server.js; it is still evaluated in
-// isolation with injected collaborators.
-const serverSource=await readFile(new URL('../src/server.js',import.meta.url),'utf8');
-function functionSource(name){const start=serverSource.search(new RegExp(`(?:async )?function ${name}\\(`));const end=serverSource.slice(start+1).search(/\n(?:(?:export )?(?:async )?function |const |let |\/\/ )/);return serverSource.slice(start,end<0?undefined:start+1+end);}
-function load(name,dependencies={}){return vm.runInNewContext(`(${functionSource(name)})`,dependencies);}
+// fetchTeamsWithWebdriver and fetchTeamsViaChatsvc are orchestration inside the
+// browser-capture module (a ctx factory); they are evaluated in isolation with
+// injected collaborators, which also stand in for ctx.
+const sources=await Promise.all(['../src/server.js','../src/webdriver/fetch.js'].map((file)=>readFile(new URL(file,import.meta.url),'utf8')));
+function functionSource(name){
+  for(const source of sources){
+    const start=source.search(new RegExp(`(?:async )?function ${name}\\(`));
+    if(start<0)continue;
+    const indent=source.slice(source.lastIndexOf('\n',start)+1,start).match(/^[ ]*/)[0];
+    const end=source.slice(start+1).search(new RegExp(`\\n${indent}(?:(?:export )?(?:async )?function |const |let |\\/\\/ |return \\{)`));
+    return source.slice(start,end<0?undefined:start+1+end);
+  }
+  throw new Error(`function ${name} not found`);
+}
+function load(name,dependencies={}){return vm.runInNewContext(`(${functionSource(name)})`,{...dependencies,ctx:dependencies});}
 const cleanText=v=>String(v||'').trim();
 const CHAT='https://teams.microsoft.com/l/chat/19:g@thread.v2/conversations';
 
