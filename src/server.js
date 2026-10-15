@@ -2797,11 +2797,6 @@ async function runDueRefreshJobs() {
       console.error(`Scheduled refresh failed for ${entry.id}:`, entry.error || "unknown error");
     }
   }
-  for (const entry of result.contentResults || []) {
-    if (entry.status === "failed") {
-      console.error(`Scheduled content refresh failed for ${entry.id}:`, entry.error || "unknown error");
-    }
-  }
 }
 
 function nextDueRefreshSlot(job, now = new Date(), schedule = {}) {
@@ -2924,7 +2919,8 @@ function publicRefreshRunFromRecord(run) {
     finishedAt: run.finishedAt,
     result: run.result,
     error: run.error,
-    jobs: run.jobs || publicRefreshJobs()
+    // Live status of this run's jobs (not the snapshot taken when it started).
+    jobs: publicRefreshJobs().filter((job) => (run.jobIds || []).includes(job.id))
   };
 }
 
@@ -2989,7 +2985,6 @@ async function runRefreshJobsBatch(jobs, options = {}) {
   const jobsToRun = runnableJobs.filter((job) => queuedIds.includes(job.id));
   const groups = await buildRefreshGroups(jobsToRun, options);
   const results = [];
-  const contentResults = [];
   const startedAt = new Date().toISOString();
   const run = options.run || null;
   if (run) updateRefreshRun(run, { totalJobs: jobsToRun.length, queuedJobIds: jobsToRun.map((job) => job.id) });
@@ -3049,9 +3044,11 @@ async function runRefreshJobsBatch(jobs, options = {}) {
     }
     }
 
+    // Jobs that never started (cancel) must not wait for the AI step to become runnable.
+    for (const id of queuedIds) refreshRuntime.queued.delete(id);
     const aiProcessing = await processUpdatedItemsAfterRefresh(results, { signal: run?.abortController?.signal });
     await annotateRefreshResultsWithAiProcessing(results, aiProcessing);
-    const summary = summarizeRefreshBatch(results, startedAt, groups, contentResults, aiProcessing);
+    const summary = summarizeRefreshBatch(results, startedAt, groups, aiProcessing);
     if (run?.cancelRequested) {
       summary.canceled = true;
       summary.errorCount = Number(summary.errorCount || 0) + 1;
@@ -3592,13 +3589,11 @@ async function updateRefreshJobsLastResults(results) {
   await persistSettings({ runtimeOnly: true });
 }
 
-function summarizeRefreshBatch(results, startedAt, groups, contentResults = [], aiProcessing = null) {
+function summarizeRefreshBatch(results, startedAt, groups, aiProcessing = null) {
   const successful = results.filter((entry) => entry.status !== "failed" && entry.status !== "running");
   const failed = results.filter((entry) => entry.status === "failed");
   const running = results.filter((entry) => entry.status === "running");
-  const successfulContent = contentResults.filter((entry) => entry.status !== "failed");
-  const failedContent = contentResults.filter((entry) => entry.status === "failed");
-  const updatedContent = successfulContent.filter((entry) => entry.updated);
+  const sum = (field, fallback) => successful.reduce((total, entry) => total + Number(entry.result?.[field] ?? (fallback ? entry.result?.[fallback] : 0) ?? 0), 0);
   const aiProcessedCount = Number(aiProcessing?.processedCount || 0);
   const aiProcessErrorCount = Number(aiProcessing?.errorCount || 0);
   return {
@@ -3607,21 +3602,18 @@ function summarizeRefreshBatch(results, startedAt, groups, contentResults = [], 
     finishedAt: new Date().toISOString(),
     groupCount: groups.length,
     jobCount: results.length,
-    contentItemCount: contentResults.length,
     successCount: successful.length,
     runningCount: running.length,
-    contentSuccessCount: successfulContent.length,
-    failureCount: failed.length + failedContent.length,
-    linkCount: successful.reduce((sum, entry) => sum + Number(entry.result?.linkCount ?? entry.result?.issueCount ?? 0), 0) + contentResults.length,
-    updatedItemCount: successful.reduce((sum, entry) => sum + Number(entry.result?.updatedItemCount ?? entry.result?.updatedIssueCount ?? 0), 0) + updatedContent.length,
-    newItemCount: successful.reduce((sum, entry) => sum + Number(entry.result?.updatedItemCount ?? entry.result?.updatedIssueCount ?? 0), 0) + updatedContent.length,
+    failureCount: failed.length,
+    linkCount: sum("linkCount", "issueCount"),
+    updatedItemCount: sum("updatedItemCount", "updatedIssueCount"),
+    newItemCount: sum("updatedItemCount", "updatedIssueCount"),
     aiProcessedCount,
     aiProcessErrorCount,
     aiProcessing: aiProcessing || { requestedCount: 0, processedCount: 0, skippedCount: 0, errorCount: 0, processedItems: [], errors: [] },
-    skippedItemCount: successful.reduce((sum, entry) => sum + Number(entry.result?.skippedItemCount || 0), 0) + (successfulContent.length - updatedContent.length),
-    errorCount: failed.length + failedContent.length + successful.reduce((sum, entry) => sum + Number(entry.result?.errorCount || 0), 0),
-    results,
-    contentResults
+    skippedItemCount: sum("skippedItemCount"),
+    errorCount: failed.length + sum("errorCount"),
+    results
   };
 }
 

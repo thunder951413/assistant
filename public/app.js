@@ -2734,13 +2734,18 @@ async function monitorSubscriptionRefreshRun(run, initialMessage = "刷新中") 
   const timeoutAt = Date.now() + 10 * 60 * 1000;
   let pollErrors = 0;
   return new Promise((resolve) => {
-    state.activeRefreshRun.pollTimer = setInterval(async () => {
+    // Chained timeouts: the next poll starts only after this one finished.
+    const schedule = () => {
+      if (state.activeRefreshRun.id === run.id) state.activeRefreshRun.pollTimer = setTimeout(tick, 1000);
+    };
+    const tick = async () => {
       try {
         const { run: latest } = await api(`/api/refresh-runs/${encodeURIComponent(run.id)}`);
-        if (!latest) return;
+        if (!latest) { schedule(); return; }
         syncTeamsReadyDialog(latest);
         pollErrors = 0;
-        state.refreshJobs = latest.jobs || state.refreshJobs;
+        const live = new Map((latest.jobs || []).map((job) => [job.id, job]));
+        state.refreshJobs = (state.refreshJobs || []).map((job) => live.get(job.id) || job);
         renderRefreshJobs(state.refreshJobs);
         const completed = Number(latest.completedJobs || 0);
         const total = Number(latest.totalJobs || 0);
@@ -2765,6 +2770,8 @@ async function monitorSubscriptionRefreshRun(run, initialMessage = "刷新中") 
           stopActiveRefreshRunPolling();
           refreshJobStatus.textContent = "刷新仍在后台运行，已停止前台等待；稍后会自动同步状态。";
           resolve(latest);
+        } else {
+          schedule();
         }
       } catch (error) {
         pollErrors += 1;
@@ -2774,14 +2781,17 @@ async function monitorSubscriptionRefreshRun(run, initialMessage = "刷新中") 
           stopActiveRefreshRunPolling();
           refreshJobStatus.textContent = "刷新进度同步连续失败，已恢复按钮；后台任务可能仍在运行。";
           resolve(null);
+        } else {
+          schedule();
         }
       }
-    }, 1000);
+    };
+    schedule();
   });
 }
 
 function stopActiveRefreshRunPolling() {
-  if (state.activeRefreshRun.pollTimer) clearInterval(state.activeRefreshRun.pollTimer);
+  if (state.activeRefreshRun.pollTimer) clearTimeout(state.activeRefreshRun.pollTimer);
   state.activeRefreshRun.pollTimer = null;
   state.activeRefreshRun.id = "";
   state.activeRefreshRun.scope = "";
