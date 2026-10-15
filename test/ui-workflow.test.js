@@ -53,7 +53,7 @@ async function boot(handler, localSessions = []) {
     return new Response(JSON.stringify(result ?? {}), { status: 200, headers: { "Content-Type": "application/json" } });
   };
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-  await new AsyncFunction(`${appSource}\nglobalThis.__uiWorkflow = { state, selectItem, sendChatMessage, activateChatSession, checkRefreshJobsForUpdates, renderRefreshJobs, confirmImport, loadChatSessions, saveChatSessions, appendMessage, renderDetail, openSubscriptionDrawer };`)();
+  await new AsyncFunction(`${appSource}\nglobalThis.__uiWorkflow = { state, selectItem, sendChatMessage, activateChatSession, checkRefreshJobsForUpdates, renderRefreshJobs, confirmImport, loadChatSessions, saveChatSessions, appendMessage, renderDetail, openSubscriptionDrawer, renderStreamList, switchView };`)();
   const ui = globalThis.__uiWorkflow;
   clearInterval(ui.state.refreshMonitorTimer);
   return {
@@ -306,5 +306,49 @@ test("issue search subscriptions show items that left the filter and resolve the
     section.querySelector("[data-left-keep-all]").click();
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.deepEqual(posts[0], { itemIds: ["i2"], action: "keep" });
+  } finally { app.cleanup(); }
+});
+
+test("stream list groups by day and collapses long runs from one conversation", async () => {
+  const app = await boot((path) => defaultApi(path));
+  try {
+    const base = Date.parse("2026-10-14T10:00:00Z");
+    const events = [0, 1, 2, 3, 4].map((offset) => ({ itemId: "chat", itemTitle: "BM Test", sourceType: "teams", kind: "message", messageId: String(offset), at: new Date(base - offset * 60000).toISOString(), author: "A", text: `m${offset}`, isNew: offset === 0 }))
+      .concat([{ itemId: "page", itemTitle: "Guide", sourceType: "confluence", kind: "update", messageId: "", at: new Date(base - 3600000).toISOString(), author: "", text: "页面内容有更新", isNew: false }]);
+    const host = document.createElement("div");
+    host.innerHTML = app.ui.renderStreamList(events);
+    assert.equal(host.querySelectorAll(".stream-day").length, 1);
+    assert.equal(host.querySelectorAll(".stream-list > .stream-row").length, 3, "two from the run plus the page update");
+    assert.match(host.querySelector(".stream-more").textContent, /BM Test 还有 3 条/);
+    assert.equal(host.querySelectorAll(".stream-hidden .stream-row").length, 3);
+    assert.equal(host.querySelectorAll(".stream-row.is-new").length, 1);
+  } finally { app.cleanup(); }
+});
+
+test("topics view lists followed tags and asks the server for a recent-days digest", async () => {
+  const posts = [];
+  const topics = {
+    favorites: [{ tag: "bm-test", itemCount: 3, unreadCount: 2, weekEventCount: 5, sources: ["teams", "github"], lastActivityAt: "2026-10-14T00:00:00Z" }],
+    all: null,
+    tags: [{ tag: "bm-test", count: 3, favorite: true }, { tag: "t6d", count: 1, favorite: false }]
+  };
+  const app = await boot((path, options = {}) => {
+    if (path === "/api/topics") return topics;
+    if (path.startsWith("/api/stream")) return { events: [], total: 4, days: 7 };
+    if (path === "/api/topics/bm-test/digest" && options.method === "POST") {
+      posts.push(JSON.parse(options.body));
+      return { digest: { tag: "bm-test", recent: { 7: { text: "## 概况\n有进展 [1]", generatedAt: "2026-10-15T00:00:00Z", refs: [{ index: 1, itemId: "x", title: "BM Test" }] } } } };
+    }
+    if (path === "/api/topics/bm-test/digest") return { digest: { tag: "bm-test", overview: null, recent: {} } };
+    return defaultApi(path);
+  });
+  try {
+    await app.ui.switchView("topics");
+    assert.match(document.querySelector("#topicList").textContent, /bm-test/);
+    assert.match(document.querySelector("#topicMain").textContent, /这段时间有 4 条/);
+    document.querySelector('[data-digest="recent"]').click();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(posts[0], { mode: "recent", days: 7 });
+    assert.ok(document.querySelector('#topicMain .cite[data-cite-item="x"]'), "citations become links to the item");
   } finally { app.cleanup(); }
 });
