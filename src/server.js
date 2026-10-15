@@ -99,6 +99,7 @@ const host = process.env.HOST || "127.0.0.1";
 await ensureKnowledgeBase();
 await store.rebuildIndexes();
 await migrateMisclassifiedListUrls();
+await pruneListChildJobs();
 await syncContentRefreshJobsFromItems();
 await reconcileStaleRunningRefreshJobs();
 startRefreshScheduler();
@@ -697,19 +698,12 @@ async function createItemUnlocked(input) {
       sourceType,
       fetchMode: metadata.fetchMode || "auto"
     });
-    const linkedImport = await importLinkedItemsFromList({
-      url: metadata.url,
-      raw: rawContent,
-      tags,
-      fetchMode: metadata.fetchMode,
-      maxItems: input.maxItems || 50,
-      parentUrl: metadata.url
-    });
-    if (linkedImport.linkCount) {
-      metadata.listImport = linkedImport;
-      await store.commit(id, { metadata, body: extractedContent, summary });
-    }
-  } else if (metadata.subscribe !== false && metadata.url) {
+    // The subscription captures the list's items (with skipping, fingerprints and
+    // membership tracking); start its first run in the background.
+    startRefreshRunByIds([metadata.refreshJob.id], { force: true, sourceType: "all" })
+      .catch((error) => console.warn(`First run of ${metadata.refreshJob.id} failed to start:`, error.message || error));
+  } else if (metadata.subscribe !== false && metadata.url && !metadata.parentUrl) {
+    // Items captured from a list are refreshed by that list's subscription.
     metadata.refreshJob = await ensureRefreshJobForContentUrl(metadata.url, {
       title,
       sourceType,
@@ -1496,6 +1490,25 @@ async function migrateMisclassifiedListUrls() {
   if (itemsChanged || jobsChanged) console.log(`Migrated ${jobsChanged} subscription(s) and ${itemsChanged} item(s) from page to list.`);
 }
 
+// Older versions created a (disabled) subscription for every item captured from a
+// list. The list's subscription already refreshes them; drop the disabled ones.
+// Enabled ones were switched on by the person and stay.
+async function pruneListChildJobs() {
+  const listUrls = new Set((settings.refreshJobs || []).filter((job) => job.pageKind === "list").map((job) => normalizeUrlForMatch(job.url || "")));
+  if (!listUrls.size) return 0;
+  const items = await listItems({ includeLists: true });
+  const childUrls = new Set(items
+    .filter((item) => item.url && item.parentUrl && listUrls.has(normalizeUrlForMatch(item.parentUrl)))
+    .map((item) => normalizeUrlForMatch(item.url)));
+  const before = settings.refreshJobs || [];
+  const kept = before.filter((job) => !(job.pageKind === "content" && !job.enabled && job.managedBy !== "content-page" && childUrls.has(normalizeUrlForMatch(job.url || ""))));
+  if (kept.length === before.length) return 0;
+  settings = { ...settings, refreshJobs: kept };
+  await persistSettings();
+  console.log(`Removed ${before.length - kept.length} disabled subscription(s) for items that their list already refreshes.`);
+  return before.length - kept.length;
+}
+
 async function syncContentRefreshJobsFromItems() {
   const items = await listItems({ includeLists: true });
   const itemsByUrl = new Map(items
@@ -1666,61 +1679,6 @@ function hasGithubToken(adapter) {
 function requiresWebdriverExpansion(adapter) {
   // With a token the REST API returns the full issue and comments; no page needed.
   return adapter.sourceType === "github" && adapter.hostname === "github.ecodesamsung.com" && !hasGithubToken(adapter);
-}
-
-async function importLinkedItemsFromList(input) {
-  const adapter = detectSourceAdapter(input.url);
-  const links = extractContentLinksFromList(input.raw || "", input.url, adapter)
-    .slice(0, Math.max(1, Number(input.maxItems) || 50));
-  const imported = [];
-  const errors = [];
-  const fetchMode = requiresWebdriverExpansion(adapter)
-    ? "webdriver"
-    : input.fetchMode === "webdriver" ? "webdriver" : input.fetchMode === "fetch" ? "fetch" : resolvedRefreshFetchMode({}, adapter);
-
-  for (const link of links) {
-    const contentUrl = normalizeContentFetchUrl(link.href, adapter);
-    try {
-      const listUpdatedAt = cleanText(link.updatedAt || link.updated || "");
-      const fetched = fetchMode === "webdriver"
-        ? await fetchUrlWithWebdriver(contentUrl, { pageKind: "content" })
-        : await fetchUrl(contentUrl, { pageKind: "content" });
-      const item = await upsertFetchedItem({
-        title: fetched.title || link.title || link.key || contentUrl,
-        sourceType: adapter.sourceType,
-        url: fetched.url ? normalizeContentFetchUrl(fetched.url, adapter) : contentUrl,
-        tags: normalizeTags(input.tags || []),
-        raw: fetched.raw,
-        text: fetched.text,
-        comments: fetched.comments || [],
-        sourceUpdatedAt: listUpdatedAt || fetched.sourceUpdatedAt,
-        fetchedAt: new Date().toISOString(),
-        pageKind: "content",
-        fetchMode,
-        managedBy: "subscription",
-        parentUrl: input.parentUrl || input.url,
-        deferIndex: true
-      });
-      imported.push({
-        key: link.key || link.number || "",
-        title: item.metadata.title,
-        itemId: item.metadata.id,
-        url: item.metadata.url,
-        sourceUpdatedAt: item.metadata.sourceUpdatedAt || "",
-        sourceUrl: link.href
-      });
-    } catch (error) {
-      errors.push({ key: link.key || link.number || "", url: contentUrl, error: error.message || String(error) });
-    }
-  }
-
-  return {
-    linkCount: links.length,
-    importedCount: imported.length,
-    errorCount: errors.length,
-    imported,
-    errors
-  };
 }
 
 async function updateTags(id, tags) {
@@ -4261,71 +4219,6 @@ function validateTeamsConversationIdentity(job, fetched, adapter = detectSourceA
   if (!expected || !actual) return;
   if (areCaptureTitlesConsistent(expected, actual)) return;
   throw new Error(`Teams 会话校验失败：目标“${expected}”，页面实际为“${actual}”。已阻止写入，避免会话串线。`);
-}
-
-async function refreshJiraFilterJob(job) {
-  const adapter = detectSourceAdapter(job.url);
-  if (adapter.sourceType !== "jira") {
-    throw new Error("当前批量刷新任务先支持 Jira filter。");
-  }
-
-  const fetchedAt = new Date().toISOString();
-  const listFetched = await fetchUrlWithWebdriver(job.url, { pageKind: "list" });
-  const listUrl = listFetched.url || job.url;
-  const tags = normalizeTags(job.tags || []);
-  const listItem = await upsertFetchedItem({
-    title: listFetched.title,
-    sourceType: "jira",
-    url: listUrl,
-    tags,
-    raw: listFetched.raw,
-    text: listFetched.text,
-    comments: [],
-    fetchedAt,
-    pageKind: "list",
-    fetchMode: "webdriver"
-  });
-
-  const issues = extractJiraIssues(listFetched.raw, listUrl).slice(0, Math.max(1, Number(job.maxItems) || 50));
-  const updatedIssues = [];
-  const errors = [];
-
-  for (const issue of issues) {
-    try {
-      const issueFetched = await fetchUrlWithWebdriver(issue.href, { pageKind: "content" });
-      const issueItem = await upsertFetchedItem({
-        title: issueFetched.title || `${issue.key} ${issue.summary || ""}`.trim(),
-        sourceType: "jira",
-        url: issueFetched.url || issue.href,
-        tags: normalizeTags(job.tags || []),
-        raw: issueFetched.raw,
-        text: issueFetched.text,
-        comments: issueFetched.comments || [],
-        fetchedAt: new Date().toISOString(),
-        pageKind: "content",
-        fetchMode: "webdriver",
-        managedBy: "subscription",
-        parentUrl: listUrl
-      });
-      if (issueItem.refreshChanged) {
-        updatedIssues.push({ key: issue.key, itemId: issueItem.metadata.id, url: issueItem.metadata.url });
-      }
-    } catch (error) {
-      errors.push({ key: issue.key, url: issue.href, error: error.message || String(error) });
-    }
-  }
-
-  await rebuildIndexes();
-  return {
-    id: job.id,
-    listItemId: listItem.metadata.id,
-    listUrl,
-    issueCount: issues.length,
-    updatedIssueCount: updatedIssues.length,
-    errorCount: errors.length,
-    updatedIssues,
-    errors
-  };
 }
 
 async function fetchForRefreshJob(url, job, adapter = detectSourceAdapter(url), refreshContext = null) {
