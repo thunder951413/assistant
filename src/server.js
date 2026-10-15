@@ -3,6 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { validateApiRequest } from "./api-security.js";
 import { atomicWriteFile } from "./atomic-files.js";
 import { exportBundle, importBundle } from "./bundle-store.js";
+import { applyClientJobEdits, createSettingsWriter, isRuntimeOnlyPatch, readSettingsFiles } from "./settings-store.js";
 import { assertModelMaterials, canUseMaterial, matchesMaterialFilters, normalizeChatHistory } from "./ai-policy.js";
 import { createChatSessionStore } from "./chat-session-store.js";
 import { promises as fs, readFileSync } from "node:fs";
@@ -53,9 +54,12 @@ const rootDir = path.resolve(__dirname, "..");
 const publicDir = path.join(rootDir, "public");
 const configDir = resolveWritableDir(process.env.ASSISTANT_CONFIG_DIR, path.join(rootDir, ".config"));
 const settingsPath = path.join(configDir, "settings.json");
+const runtimeJobsPath = path.join(configDir, "runtime", "jobs-state.json");
 const webdriverRoot = path.join(configDir, "webdriver");
 const captureToken = await loadCaptureToken();
 let settings = await loadSettings();
+// Every settings write goes through this queue and writes the latest state.
+const persistSettings = createSettingsWriter({ settingsPath, runtimePath: runtimeJobsPath, getSettings: () => settings });
 const ai = createAiClient(() => settings, { authorize: (materials, purpose) => assertModelMaterials(materials, settings, purpose) });
 const chatSessionStore = createChatSessionStore(path.join(configDir, "chat-sessions.json"));
 let kbDir = resolveDocumentRoot(settings.documentRoot);
@@ -67,7 +71,6 @@ const itemUrlMutationLocks = new Map();
 const pendingItemIds = new Set();
 let itemIdReservationQueue = Promise.resolve();
 const embeddingBuilds = new Map();
-let settingsWriteQueue = Promise.resolve();
 let libraryMaintenance = false;
 let activeApiOperations = 0;
 const refreshRuntime = {
@@ -229,8 +232,7 @@ api.get("/api/topics", async ({ res }) => {
 api.post("/api/topics/favorites", async ({ req, res }) => {
   const body = await readBody(req);
   settings = { ...settings, favoriteTags: normalizeFavoriteTags(body.tags) };
-  await fs.mkdir(configDir, { recursive: true });
-  await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await persistSettings();
   sendJson(res, 200, await topicOverview());
 });
 
@@ -408,7 +410,6 @@ api.post("/api/supplemental-context/suggest", async ({ req, res }) => {
 
 // Settings -----------------------------------------------------
 api.get("/api/settings", async ({ res }) => {
-  await syncContentRefreshJobsFromItems();
   sendJson(res, 200, { settings: publicSettings() });
 });
 
@@ -484,7 +485,6 @@ api.post("/api/storage-cleanup-browser", async ({ res }) => {
 
 // Refresh jobs -------------------------------------------------
 api.get("/api/refresh-jobs", async ({ res }) => {
-  await syncContentRefreshJobsFromItems();
   await reconcileStaleRunningRefreshJobs();
   sendJson(res, 200, { jobs: publicRefreshJobs() });
 });
@@ -499,6 +499,18 @@ api.post("/api/refresh-jobs", async ({ req, res }) => {
     : await ensureRefreshJobForContentUrl(url, body);
   startRefreshScheduler();
   sendJson(res, 201, { job, jobs: publicRefreshJobs() });
+});
+
+// Edit one subscription; only user-editable fields are accepted.
+api.patch("/api/refresh-jobs/:id", async ({ params, req, res }) => {
+  const body = await readBody(req);
+  if (!(settings.refreshJobs || []).some((job) => job.id === params.id)) {
+    const error = new Error("订阅不存在，可能已被删除。"); error.statusCode = 404; throw error;
+  }
+  settings = { ...settings, refreshJobs: applyClientJobEdits(settings.refreshJobs || [], [{ ...body, id: params.id }]) };
+  await persistSettings();
+  startRefreshScheduler();
+  sendJson(res, 200, { job: publicRefreshJobs().find((job) => job.id === params.id), jobs: publicRefreshJobs() });
 });
 
 api.post("/api/refresh-jobs/run-batch", async ({ url, req, res }) => {
@@ -1385,8 +1397,7 @@ async function ensureRefreshJobForListUrl(url, options = {}) {
     ...settings,
     refreshJobs: mergeRefreshJobs(settings.refreshJobs || [], [job])
   };
-  await fs.mkdir(configDir, { recursive: true });
-  await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await persistSettings();
 
   return {
     id: job.id,
@@ -1439,8 +1450,7 @@ async function ensureRefreshJobForContentUrl(url, options = {}) {
     ...settings,
     refreshJobs: mergeRefreshJobs(settings.refreshJobs || [], [job])
   };
-  await fs.mkdir(configDir, { recursive: true });
-  await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await persistSettings();
 
   return {
     id: job.id,
@@ -1480,8 +1490,7 @@ async function migrateMisclassifiedListUrls() {
   });
   if (jobsChanged) {
     settings = { ...settings, refreshJobs };
-    await fs.mkdir(configDir, { recursive: true });
-    await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    await persistSettings();
   }
   if (itemsChanged) await rebuildIndexes();
   if (itemsChanged || jobsChanged) console.log(`Migrated ${jobsChanged} subscription(s) and ${itemsChanged} item(s) from page to list.`);
@@ -1556,8 +1565,7 @@ async function syncContentRefreshJobsFromItems() {
     ...settings,
     refreshJobs: mergeRefreshJobs(settings.refreshJobs || [], jobsToAdd)
   };
-  await fs.mkdir(configDir, { recursive: true });
-  await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await persistSettings();
   return jobsToAdd.length;
 }
 
@@ -3181,8 +3189,7 @@ async function reconcileStaleRunningRefreshJobs() {
       };
     })
   };
-  await fs.mkdir(configDir, { recursive: true });
-  await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await persistSettings({ runtimeOnly: true });
   return staleJobs.length;
 }
 
@@ -3638,8 +3645,7 @@ async function updateRefreshJobsLastResults(results) {
       byId.has(job.id) ? { ...job, lastResult: byId.get(job.id) } : job
     ))
   };
-  await fs.mkdir(configDir, { recursive: true });
-  await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await persistSettings({ runtimeOnly: true });
 }
 
 function summarizeRefreshBatch(results, startedAt, groups, contentResults = [], aiProcessing = null) {
@@ -4441,8 +4447,7 @@ async function updateRefreshJobState(id, patch) {
       job.id === id ? { ...job, ...patch } : job
     ))
   };
-  await fs.mkdir(configDir, { recursive: true });
-  await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await persistSettings({ runtimeOnly: isRuntimeOnlyPatch(patch) });
 }
 
 async function deleteRefreshJob(id) {
@@ -4456,8 +4461,7 @@ async function deleteRefreshJob(id) {
     ...settings,
     refreshJobs: nextJobs
   };
-  await fs.mkdir(configDir, { recursive: true });
-  await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await persistSettings();
   return publicRefreshJobs();
 }
 
@@ -4542,8 +4546,7 @@ async function deleteRefreshSourceItems(sourceType) {
         : job
     ))
   };
-  await fs.mkdir(configDir, { recursive: true });
-  await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await persistSettings();
   await rebuildIndexes();
   return {
     sourceType: source,
@@ -5397,8 +5400,7 @@ async function saveWebdriverCookies(url, hostname) {
       }
     }
   };
-  await fs.mkdir(configDir, { recursive: true });
-  await atomicWriteFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await persistSettings();
 
   return {
     hostname: adapter.hostname,
@@ -6129,7 +6131,7 @@ async function loadSettings() {
     return defaults;
   }
 
-  const saved = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+  const saved = await readSettingsFiles({ settingsPath, runtimePath: runtimeJobsPath });
   await fs.chmod(settingsPath, 0o600).catch(() => {});
   return mergeSettings(defaults, saved);
 }
@@ -6144,10 +6146,9 @@ async function importSettingsBundle(payload) {
   if (!imported || typeof imported !== "object" || Array.isArray(imported)) {
     throw new Error("设置导入文件格式不正确。");
   }
-  const next = mergeSettings(defaultSettings(), imported);
-  await fs.mkdir(configDir, { recursive: true });
-  await atomicWriteFile(settingsPath, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  return next;
+  settings = mergeSettings(defaultSettings(), imported);
+  await persistSettings();
+  return settings;
 }
 
 async function exportDataBundle() {
@@ -6248,17 +6249,15 @@ function validateDataBundlePath(value) {
 }
 
 async function saveSettings(input) {
-  const operation = settingsWriteQueue.then(async () => {
-    const next = await saveSettingsNow(input);
-    settings = next;
-    return next;
-  });
-  settingsWriteQueue = operation.catch(() => {});
-  return operation;
+  // Built from the current in-memory state in one synchronous step, so nothing
+  // that changes while the file is being written can be overwritten.
+  settings = settingsFromInput(input);
+  await persistSettings();
+  return settings;
 }
 
-async function saveSettingsNow(input) {
-  const next = mergeSettings(settings, {
+function settingsFromInput(input) {
+  return mergeSettings({ ...settings, refreshJobs: input.refreshJobs ? applyClientJobEdits(settings.refreshJobs || [], input.refreshJobs) : settings.refreshJobs }, {
     ai: {
       baseUrl: cleanText(input.ai?.baseUrl ?? input.baseUrl ?? settings.ai.baseUrl),
       apiKey: cleanText(input.ai?.apiKey ?? input.apiKey ?? settings.ai.apiKey),
@@ -6283,12 +6282,8 @@ async function saveSettingsNow(input) {
     favoriteTags: normalizeFavoriteTags(input.favoriteTags ?? settings.favoriteTags ?? []),
     documentRoot: cleanText(input.documentRoot ?? settings.documentRoot),
     sources: mergeSourceProfiles(settings.sources, input.sources || {}),
-    refreshJobs: mergeRefreshJobs(settings.refreshJobs || [], input.refreshJobs || settings.refreshJobs || [])
+    refreshJobs: []
   });
-
-  await fs.mkdir(configDir, { recursive: true });
-  await atomicWriteFile(settingsPath, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  return next;
 }
 
 function defaultSettings() {

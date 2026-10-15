@@ -2282,8 +2282,7 @@ async function saveSettings(event) {
           maxStaleDays: Number(settingAutoProcessDays?.value || 7)
         },
         documentRoot: settingDocumentRoot.value,
-        sources: collectSourceProfiles(),
-        refreshJobs: collectRefreshJobs()
+        sources: collectSourceProfiles()
       })
     });
     activeDocumentRoot.textContent = settings.activeDocumentRoot;
@@ -4319,10 +4318,6 @@ function subscriptionMatchesFilters(job) {
   return !query || `${subscriptionDisplayName(job)} ${job.url}`.toLowerCase().includes(query);
 }
 
-function collectRefreshJobs() {
-  return (state.refreshJobs || []).map((job) => ({ ...job, tags: job.tags || [] }));
-}
-
 function refreshJobsForCurrentTab() {
   return (state.refreshJobs || []).filter((job) => job.enabled && subscriptionMatchesFilters(job));
 }
@@ -4444,12 +4439,13 @@ function bindSubscriptionRows() {
   }));
 }
 
+// Sends only this subscription's edited fields; the server ignores everything
+// else, so a save can never overwrite live refresh status or revive a deleted job.
 async function updateSubscription(id, patch, { quiet = false } = {}) {
-  const next = (state.refreshJobs || []).map((job) => job.id === id ? { ...job, ...patch } : job);
   try {
-    const { settings } = await api("/api/settings", { method: "PATCH", body: JSON.stringify({ refreshJobs: next.map((job) => ({ ...job, tags: job.tags || [] })) }) });
-    state.settings = { ...(state.settings || {}), refreshJobs: settings.refreshJobs };
-    renderRefreshJobs(settings.refreshJobs || next);
+    const { jobs } = await api(`/api/refresh-jobs/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(patch) });
+    state.settings = { ...(state.settings || {}), refreshJobs: jobs };
+    renderRefreshJobs(jobs);
     if (!quiet) refreshJobStatus.textContent = patch.enabled === false ? "已暂停自动刷新。" : patch.enabled === true ? "已恢复自动刷新。" : "订阅已保存。";
     return true;
   } catch (error) {
@@ -4460,7 +4456,8 @@ async function updateSubscription(id, patch, { quiet = false } = {}) {
 }
 
 async function saveSubscriptions() {
-  return updateSubscription("", {}, { quiet: false });
+  await loadSettings();
+  renderRefreshJobs(state.refreshJobs);
 }
 
 async function runAllRefreshJobs() {
