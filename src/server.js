@@ -676,7 +676,9 @@ async function createItemUnlocked(input) {
     completeness: normalizeCaptureCompleteness(input.completeness),
     coverage: input.coverage && typeof input.coverage === "object" ? input.coverage : {},
     identityEvidence: input.identityEvidence && typeof input.identityEvidence === "object" ? input.identityEvidence : {},
-    subscribe: input.subscribe !== undefined ? Boolean(input.subscribe) : undefined
+    subscribe: input.subscribe !== undefined ? Boolean(input.subscribe) : undefined,
+    ...(input.listFingerprint !== undefined ? { listFingerprint: input.listFingerprint } : {}),
+    ...(input.listMembership !== undefined ? { listMembership: input.listMembership } : {})
   };
 
   try {
@@ -1137,6 +1139,8 @@ async function upsertFetchedItemUnlocked(input) {
       coverage: input.coverage,
       identityEvidence: input.identityEvidence,
       subscribe: input.subscribe,
+      listFingerprint: input.listFingerprint,
+      listMembership: input.listMembership,
       deferIndex: input.deferIndex
     });
     created.refreshChanged = true;
@@ -1189,6 +1193,8 @@ async function upsertFetchedItemUnlocked(input) {
     httpValidators: input.httpValidators || item.metadata.httpValidators || {},
     integrityStatus: input.integrityStatus !== undefined ? cleanText(input.integrityStatus) : cleanText(item.metadata.integrityStatus || ""),
     integrityReason: input.integrityReason !== undefined ? cleanText(input.integrityReason) : cleanText(item.metadata.integrityReason || ""),
+    ...(input.listFingerprint !== undefined ? { listFingerprint: input.listFingerprint } : {}),
+    ...(input.listMembership !== undefined ? { listMembership: input.listMembership } : {}),
     refreshNote: {
       previousDocumentLength: item.document.length,
       currentDocumentLength: input.text.length,
@@ -2660,28 +2666,7 @@ async function renameTag(from, to) {
     return { oldTag, newTag, touchedItems: [], tags: await listTags() };
   }
 
-  const touchedItems = [];
-  const dirs = await safeReaddir(itemsDir);
-  for (const id of dirs) {
-    const metadataPath = path.join(itemsDir, id, "metadata.json");
-    const documentPath = path.join(itemsDir, id, "document.md");
-    if (!(await exists(metadataPath)) || !(await exists(documentPath))) continue;
-
-    const item = await readItem(id);
-    const previousTags = item.metadata.tags || [];
-    if (!previousTags.includes(oldTag)) continue;
-
-    const nextTags = uniqueValues(previousTags.map((tag) => tag === oldTag ? newTag : tag));
-    const metadata = {
-      ...item.metadata,
-      tags: nextTags,
-      updatedAt: new Date().toISOString()
-    };
-    const body = extractBodyFromDocument(item.document);
-    const summary = extractSummaryFromDocument(item.document);
-    await store.commit(id, { metadata, body, summary });
-    touchedItems.push({ id, title: metadata.title });
-  }
+  const touchedItems = await retagItems((tags) => tags.includes(oldTag) ? uniqueValues(tags.map((tag) => tag === oldTag ? newTag : tag)) : null);
 
   const manualTags = await readManualTags();
   const nextManualTags = uniqueValues(manualTags.map((tag) => tag === oldTag ? newTag : tag));
@@ -2700,6 +2685,28 @@ async function renameTag(from, to) {
   };
 }
 
+// Applies a tag change to every affected item under that item's lock, re-reading
+// the latest version inside it. A damaged item is skipped, not left half-done.
+// nextTagsFor returns the new tag list, or null when the item is unaffected.
+async function retagItems(nextTagsFor) {
+  const touched = [];
+  for (const candidate of await listItems({ includeLists: true })) {
+    if (!nextTagsFor(candidate.tags || [])) continue;
+    try {
+      await withItemUrlMutationLock(candidate.url || "", async () => {
+        const item = await readItem(candidate.id);
+        const nextTags = nextTagsFor(item.metadata.tags || []);
+        if (!nextTags) return;
+        await store.commit(candidate.id, { metadata: { ...item.metadata, tags: nextTags, updatedAt: new Date().toISOString() } });
+        touched.push({ id: candidate.id, title: item.metadata.title });
+      });
+    } catch (error) {
+      console.warn(`Tag change skipped for ${candidate.id}:`, error.message || error);
+    }
+  }
+  return touched;
+}
+
 async function deleteTags(tags) {
   const targetTags = normalizeTags(tags);
   if (!targetTags.length) {
@@ -2707,28 +2714,7 @@ async function deleteTags(tags) {
   }
 
   const targetSet = new Set(targetTags);
-  const touchedItems = [];
-  const dirs = await safeReaddir(itemsDir);
-  for (const id of dirs) {
-    const metadataPath = path.join(itemsDir, id, "metadata.json");
-    const documentPath = path.join(itemsDir, id, "document.md");
-    if (!(await exists(metadataPath)) || !(await exists(documentPath))) continue;
-
-    const item = await readItem(id);
-    const previousTags = item.metadata.tags || [];
-    const nextTags = previousTags.filter((tag) => !targetSet.has(tag));
-    if (nextTags.length === previousTags.length) continue;
-
-    const metadata = {
-      ...item.metadata,
-      tags: nextTags,
-      updatedAt: new Date().toISOString()
-    };
-    const body = extractBodyFromDocument(item.document);
-    const summary = extractSummaryFromDocument(item.document);
-    await store.commit(id, { metadata, body, summary });
-    touchedItems.push({ id, title: metadata.title });
-  }
+  const touchedItems = await retagItems((tags) => tags.some((tag) => targetSet.has(tag)) ? tags.filter((tag) => !targetSet.has(tag)) : null);
 
   const manualTags = await readManualTags();
   await writeManualTags(manualTags.filter((tag) => !targetSet.has(tag)));
@@ -2754,7 +2740,7 @@ async function readManualTags() {
 
 async function writeManualTags(tags) {
   await fs.mkdir(indexesDir, { recursive: true });
-  await fs.writeFile(path.join(indexesDir, "tags-manual.json"), `${JSON.stringify({ tags: normalizeTags(tags) }, null, 2)}\n`, "utf8");
+  await atomicWriteFile(path.join(indexesDir, "tags-manual.json"), `${JSON.stringify({ tags: normalizeTags(tags) }, null, 2)}\n`, "utf8");
 }
 
 // indexes/*.json are for external tools (Codex, AGENTS.md); the server never reads
@@ -3903,15 +3889,12 @@ async function refreshListJob(job, refreshContext = null) {
         fetchMode: resolvedRefreshFetchMode(job, adapter),
         managedBy: "subscription",
         parentUrl: listUrl,
+        // Saved inside the same locked write as the content, so a concurrent
+        // tag edit cannot be overwritten by a later metadata patch.
+        listFingerprint: link.fingerprint || undefined,
+        listMembership: trackMembership ? membershipPatch(MEMBERSHIP_MEMBER, listUrl) : undefined,
         deferIndex: true
       });
-      if (link.fingerprint || trackMembership) {
-        await store.writeMetadata(contentItem.metadata.id, {
-          ...contentItem.metadata,
-          ...(link.fingerprint ? { listFingerprint: link.fingerprint } : {}),
-          ...(trackMembership ? { listMembership: membershipPatch(MEMBERSHIP_MEMBER, listUrl) } : {})
-        });
-      }
       const contentResult = {
         key: link.key || link.number || "",
         title: contentItem.metadata.title,
