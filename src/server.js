@@ -5873,6 +5873,14 @@ async function saveSupplementalEntries(entries) {
   return normalized;
 }
 
+// Stable id for a glossary entry. slugify() keeps only ASCII, so terms such as
+// "机顶盒" would all become "item"; add a short hash of the original text.
+function slugId(text) {
+  const value = cleanText(text);
+  const slug = slugify(value);
+  return /^[\x00-\x7f]*$/.test(value) && slug !== "item" ? slug : `${slug === "item" ? "term" : slug}-${createHash("sha1").update(value).digest("hex").slice(0, 8)}`;
+}
+
 function normalizeSupplementalEntries(entries) {
   const seen = new Set();
   return (entries || [])
