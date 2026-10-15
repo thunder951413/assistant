@@ -58,10 +58,6 @@ export function parseSourceUpdatedAt(value, referenceDate = "") {
   return Number.NaN;
 }
 
-export function mergeTags(...tagLists) {
-  return normalizeTags(tagLists.flat().join(","));
-}
-
 export function sourceTypeLabel(sourceType) {
   const labels = {
     text: "文本",
@@ -129,11 +125,6 @@ export function normalizeComments(comments) {
       url: cleanText(comment.url || "")
     }))
     .filter((comment) => comment.body || comment.author || comment.id);
-}
-
-export function renderJsonLines(values) {
-  const lines = normalizeComments(values).map((value) => JSON.stringify(value));
-  return lines.length ? `${lines.join("\n")}\n` : "";
 }
 
 export function detectUrl(value) {

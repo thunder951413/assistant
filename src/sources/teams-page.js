@@ -374,17 +374,6 @@ export function mergeTeamsMessages(messages) {
   return mergeTeamsCaptureMessages(messages);
 }
 
-export function mergeTeamsComments(comments) {
-  return mergeTeamsMessages(comments).map((comment, index) => ({
-    id: cleanText(comment.id || `teams-message-${index + 1}`),
-    author: cleanText(comment.author || ""),
-    createdAt: cleanText(comment.createdAt || ""),
-    body: cleanText(comment.body || ""),
-    links: Array.isArray(comment.links) ? comment.links : [],
-    url: cleanText(comment.url || "")
-  }));
-}
-
 export function renderTeamsTextFromComments(title, url, adapter, comments) {
   const sourceUpdatedAt = latestTimestampValue(comments.map((comment) => comment.createdAt)) || "";
   const lines = [
@@ -611,26 +600,6 @@ export async function settleTeamsAtBottom(page) {
   } catch {
     return false;
   }
-}
-
-export function teamsMessageKeySet(messages) {
-  const keys = new Set();
-  for (const message of messages || []) {
-    for (const key of teamsMessageKeys(message)) {
-      keys.add(key);
-    }
-  }
-  return keys;
-}
-
-export function hasTeamsMessageOverlap(messages, previousKeys) {
-  if (!previousKeys?.size) return false;
-  for (const message of messages || []) {
-    for (const key of teamsMessageKeys(message)) {
-      if (previousKeys.has(key)) return true;
-    }
-  }
-  return false;
 }
 
 export function teamsMessageKeys(message) {

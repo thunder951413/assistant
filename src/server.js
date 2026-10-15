@@ -6129,18 +6129,6 @@ async function importDataBundle(bundle, options = {}) {
   } finally { libraryMaintenance = false; }
 }
 
-function validateDataBundlePath(value) {
-  const relativePath = String(value || "").replace(/\\/g, "/");
-  if (!relativePath || relativePath.startsWith("/") || relativePath.includes("\0")) {
-    throw new Error(`非法数据文件路径：${value}`);
-  }
-  const normalized = path.posix.normalize(relativePath);
-  if (normalized === "." || normalized.startsWith("../") || normalized.includes("/../")) {
-    throw new Error(`非法数据文件路径：${value}`);
-  }
-  return normalized;
-}
-
 async function saveSettings(input) {
   // Built from the current in-memory state in one synchronous step, so nothing
   // that changes while the file is being written can be overwritten.

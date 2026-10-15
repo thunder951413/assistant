@@ -3,8 +3,6 @@
 //   /issues?q=...  /pulls?q=...    /search?q=...&type=issues
 // The list decides membership; each issue is captured as its own item.
 
-const ISSUE_PATH = /^\/([^/]+)\/([^/]+)\/(issues|pull)\/(\d+)\/?$/i;
-
 export function isGithubIssueSearchUrl(url) {
   let parsed;
   try { parsed = new URL(url); } catch { return false; }
@@ -63,10 +61,6 @@ export function buildGithubIssueSearchApiUrls(url, origin, perPage = 100) {
     apiUrl.searchParams.set("order", "desc");
     return apiUrl;
   });
-}
-
-export function buildGithubIssueSearchApiUrl(url, origin, perPage = 100) {
-  return buildGithubIssueSearchApiUrls(url, origin, perPage)[0];
 }
 
 export function githubIssueSearchPageUrl(url, page) {
@@ -223,10 +217,6 @@ export function renderGithubIssueSearchText(title, url, adapterId, entries, note
 export function githubIssueSearchTitle(url) {
   const scope = githubIssueSearchScope(url);
   return `${scope.repository || "GitHub"} ${scope.kind === "pr" ? "PR" : "issue"} 搜索：${scope.query}`.slice(0, 160);
-}
-
-export function isGithubIssueContentUrl(url) {
-  try { return ISSUE_PATH.test(new URL(url).pathname); } catch { return false; }
 }
 
 function cleanQuery(value) {

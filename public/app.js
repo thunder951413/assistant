@@ -32,22 +32,7 @@ const state = {
   selectedSettingsTags: new Set(),
   supplementalEntries: [],
   updateCount: 0,
-  refreshReloadTimer: null,
   refreshMonitorTimer: null,
-  homeSourceRefresh: {
-    confirmSource: "",
-    runningSource: "",
-    runId: "",
-    requestToken: "",
-    startedAt: "",
-    total: 0,
-    completed: 0,
-    failed: 0,
-    message: "",
-    pollErrorCount: 0,
-    pollTimer: null,
-    timeoutAt: 0
-  },
   activeRefreshRun: {
     id: "",
     scope: "",
@@ -63,7 +48,6 @@ const state = {
   listClassifier: {
     categories: loadStoredListCategories()
   },
-  subscriptionSource: "all",
   subscriptionDirty: false,
   settingsTab: "ai",
   doNotDisturb: false,
@@ -390,22 +374,10 @@ async function loadTags() {
   renderTags();
 }
 
+// The unread count comes from the library index (one request for everything).
 async function loadMaterialUpdateCount() {
-  try {
-    const { items } = await api("/api/items?updates=1");
-    state.updateCount = items?.length || 0;
-    renderMaterialsNewBadge();
-    renderHomeOverview();
-  } catch (error) {
-    console.warn("Failed to load material update count:", error);
-  }
-}
-
-function syncMaterialUpdateCountFromItems(items) {
-  const visibleUpdates = (items || []).filter((item) => item.contentUpdatedAt).length;
-  if (visibleUpdates || !state.sourceType && !state.tag && !state.query) {
-    state.updateCount = visibleUpdates;
-  }
+  await loadLibraryIndex();
+  renderHomeOverview();
 }
 
 async function openWorkbenchSearch(event) {
@@ -1113,35 +1085,6 @@ async function selectItem(id) {
     if (requestId !== state.itemSelectionRequest || state.selectedId !== id) return;
     detailPanel.innerHTML = `<div class="empty-state">${escapeHtml(error.message || "无法打开资料")}</div>`;
   }
-}
-
-function setupDetailTitleMarquee() {
-  const wrap = document.querySelector("#detailTitleWrap");
-  const input = document.querySelector("#detailTitleInput");
-  const marquee = document.querySelector("#detailTitleMarquee");
-  if (!wrap || !input || !marquee) return;
-
-  const update = () => {
-    marquee.textContent = input.value || "Untitled material";
-    wrap.classList.remove("is-overflowing");
-    wrap.style.setProperty("--title-scroll-distance", "0px");
-    requestAnimationFrame(() => {
-      const overflow = marquee.scrollWidth - wrap.clientWidth;
-      if (overflow > 8) {
-        wrap.style.setProperty("--title-scroll-distance", `${overflow + 24}px`);
-        wrap.classList.add("is-overflowing");
-      }
-    });
-  };
-
-  wrap.addEventListener("click", () => input.focus());
-  input.addEventListener("input", update);
-  input.addEventListener("focus", () => wrap.classList.add("is-editing"));
-  input.addEventListener("blur", () => {
-    wrap.classList.remove("is-editing");
-    update();
-  });
-  update();
 }
 
 function setupDetailToc() {
@@ -2029,13 +1972,6 @@ async function saveChatSessions() {
   return state.chatPersistQueue;
 }
 
-async function buildAskContext(question) {
-  return api("/api/ask-context", {
-    method: "POST",
-    body: JSON.stringify({ question })
-  });
-}
-
 async function autoPreviewImport() {
   const content = importContent.value.trim();
   const url = importUrl.value.trim();
@@ -2702,16 +2638,6 @@ function subscriptionSourceLabel(source) {
   }[source] || source;
 }
 
-function formatRefreshStatus(status) {
-  return {
-    idle: "空闲",
-    running: "运行中",
-    failed: "失败",
-    unreachable: "网络不可达",
-    canceled: "已取消"
-  }[status] || status;
-}
-
 async function runRefreshJob(id) {
   const job = state.refreshJobs.find((candidate) => candidate.id === id);
   refreshJobStatus.textContent = "正在启动刷新任务...";
@@ -2868,8 +2794,7 @@ function refreshResultUpdatedCount(result) {
 
 function showRefreshFailureToastFromRun(run) {
   const entries = [
-    ...(run?.result?.results || []),
-    ...(run?.result?.contentResults || [])
+    ...(run?.result?.results || [])
   ].filter((entry) => entry?.status === "failed" || Number(entry?.result?.errorCount || 0) > 0);
   const failures = entries.map((entry) => ({
     sourceType: entry.result?.sourceType || run?.sourceType || "refresh",
@@ -3369,10 +3294,6 @@ function sourceLabel(source) {
   return SOURCE_META[normalizeSourceType(source)]?.label || source || "资料";
 }
 
-function sourceIcon(source) {
-  return SOURCE_META[normalizeSourceType(source)]?.mark || "·";
-}
-
 function sourceMark(source, extraClass = "") {
   const key = SOURCE_META[normalizeSourceType(source)] ? normalizeSourceType(source) : "text";
   return `<span class="source-mark ${extraClass}" data-source="${escapeHtml(key)}" aria-hidden="true">${escapeHtml(SOURCE_META[key].mark)}</span>`;
@@ -3848,6 +3769,20 @@ function applyClientLibraryFilters(items) {
 }
 
 async function loadItems() {
+  if (!state.query && Array.isArray(state.allItems)) {
+    // The full list is already here (loadLibraryIndex); filter it instead of
+    // asking the server again. Only full-text search needs the server.
+    state.items = applyClientLibraryFilters(state.allItems.filter((item) =>
+      (!state.sourceType || item.sourceType === state.sourceType)
+      && (!state.tag || (item.tags || []).includes(state.tag))));
+    state.page = 1;
+    state.totalItems = state.items.length;
+    state.listClassification = null;
+    renderListScope();
+    renderItems();
+    renderMaterialsNewBadge();
+    return;
+  }
   const full = libraryFilterNeedsFullList();
   const { items, total } = await api(`/api/items?${libraryParams(1, full ? 2000 : state.pageSize)}`);
   state.items = full ? applyClientLibraryFilters(items || []) : (items || []);
@@ -4326,10 +4261,6 @@ function subscriptionMatchesFilters(job) {
   if (filter === "paused" && status !== "paused") return false;
   const query = state.subscriptionQuery;
   return !query || `${subscriptionDisplayName(job)} ${job.url}`.toLowerCase().includes(query);
-}
-
-function refreshJobsForCurrentTab() {
-  return (state.refreshJobs || []).filter((job) => job.enabled && subscriptionMatchesFilters(job));
 }
 
 function renderSubscriptionTabs() {
@@ -5120,12 +5051,10 @@ function setShowPreview(on) {
 for (const button of [feedPreviewToggle, listPreviewToggle]) button?.addEventListener("click", () => setShowPreview(!state.showPreview));
 for (const button of [feedPreviewToggle, listPreviewToggle]) button?.setAttribute("aria-pressed", String(state.showPreview));
 
-// Startup runs last so every declaration above is initialized.
-await loadAgentConfig();
-await loadSettings();
+// Startup runs last so every declaration above is initialized. Independent
+// requests run in parallel; the home view renders once they are all in.
+await Promise.all([loadAgentConfig(), loadSettings(), loadLibraryIndex(), loadChatSessions()]);
 startRefreshJobMonitor();
-await loadMaterialUpdateCount();
-await loadHomeOverview();
-await loadChatSessions();
+renderHomeOverview();
 renderView();
 api("/api/topics").then((topics) => { state.topics = topics; renderNavTopicsCount(); }).catch(() => {});
