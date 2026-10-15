@@ -1,6 +1,6 @@
 // HTML parsers for Jira, Confluence, GitHub and generic pages. They turn fetched
 // markup into titles, text, comments and list entries; no network or state access.
-import { latestTimestampValue } from "../text-helpers.js";
+import { escapeRegExp, latestTimestampValue } from "../text-helpers.js";
 import { cleanText, safeHostname, safePathname } from "../utils.js";
 import { Readability } from "@mozilla/readability";
 import { JSDOM } from "jsdom";
@@ -341,7 +341,7 @@ export function extractPageId(url) {
 }
 
 export function extractMetaContent(html, name) {
-  const pattern = new RegExp(`<meta\\\\b[^>]*(?:name|id)=["']${escapeRegExp(name)}["'][^>]*content=["']([^"']*)["'][^>]*>`, "i");
+  const pattern = new RegExp(`<meta\\b[^>]*(?:name|id)=["']${escapeRegExp(name)}["'][^>]*content=["']([^"']*)["'][^>]*>`, "i");
   return decodeHtml(html.match(pattern)?.[1] || "");
 }
 

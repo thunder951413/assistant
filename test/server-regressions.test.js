@@ -9,7 +9,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // Server behaviour is split across src/*.js and src/sources/*.js; guards read all of it.
 async function readServerSource() {
   const files = [];
-  for (const dir of ["src", path.join("src", "sources")]) {
+  for (const dir of ["src", path.join("src", "sources"), path.join("src", "webdriver")]) {
     for (const name of (await fs.readdir(path.join(root, dir))).sort()) {
       if (name.endsWith(".js")) files.push(path.join(root, dir, name));
     }
@@ -49,5 +49,15 @@ describe("server regression guards", () => {
     assert.match(serverSource, /async function filterTeamsChatList/);
     assert.doesNotMatch(serverSource, /function normalizeTeamsNavigationUrl/);
     assert.match(appSource, /run\.status === "waiting_for_teams_confirmation"/);
+  });
+});
+
+describe("html extractor helpers", () => {
+  it("reads meta tags and matches ids containing regex characters", async () => {
+    const { extractMetaContent, extractMetaContentLoose } = await import("../src/sources/html-extractors.js");
+    const html = `<meta name="ajs-page-id" content="690659454"><meta name="ajs-remote-user" content="yan.yan"><meta id="a.b+c" content="x">`;
+    assert.equal(extractMetaContent(html, "ajs-page-id"), "690659454");
+    assert.equal(extractMetaContent(html, "ajs-remote-user"), "yan.yan");
+    assert.equal(extractMetaContentLoose(html, "a.b+c"), "x");
   });
 });
