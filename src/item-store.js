@@ -459,10 +459,10 @@ export function createItemStore(getDirs) {
       const target = path.join(itemsDir(), id);
       await fs.mkdir(staged, { recursive: true });
       try {
-      if (await exists(target)) {
-        await fs.cp(target, staged, { recursive: true, force: true, filter: (source) => source !== path.join(target, "snapshots") });
-        if (await exists(path.join(target, "snapshots"))) await linkTree(path.join(target, "snapshots"), path.join(staged, "snapshots"));
-      }
+      // Every file below is replaced by write-then-rename, never edited in place, so the
+      // staged revision can share unchanged files (raw pages, comments) with the live one
+      // through hard links instead of copying them. linkTree falls back to copying.
+      if (await exists(target)) await linkTree(target, staged);
       let metadata = payload.metadata === undefined ? undefined : { ...payload.metadata };
       if (metadata?.id !== undefined && metadata.id !== id) throw new Error("Metadata id must match item id.");
       if (metadata?.rawFileName !== undefined && !/^raw\.[a-z0-9._-]+$/i.test(String(metadata.rawFileName))) throw new Error("Invalid raw file name.");
